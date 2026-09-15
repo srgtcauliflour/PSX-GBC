@@ -9,6 +9,13 @@
 #include <sys/types.h>
 #include "main.h"
 #include "emu.h"
+// BUG FIX: emu.c calls dozens of ALU/rotate/shift helper functions defined
+// in opcodes.c (INCreg, ADDreg, RLC, ADDWreg, BIT, SET, RES, ...) but never
+// included the header that declares them - same class of bug as the
+// opcodes.c-missing-emu.h issue fixed earlier, just the mirror image. Only
+// ever caught as compiler warnings (implicit int return, unknown parameter
+// types) rather than hard errors, so it went unnoticed; confirmed for real
+// against the actual PS1 MIPS cross-compiler.
 #include "opcodes.h"
 #include "pad.h"
 #include "core_state.h"
@@ -76,6 +83,16 @@ int ROMBANKNUMBER = 1;// Bank register powers on selecting bank 1 (MBC1/2/3/5)
 int RAMBANKNUMBER = 0;
 int MBCMODE = 0;
 int RAMENABLED = 0; // Cart RAM $A000-$BFFF gate: enabled by writing 0x0A to $0000-$1FFF
+// BUG FIX: DIV ($FF04) was a complete no-op stub on both read and write.
+// Real hardware free-runs an internal 16-bit divider at the base clock
+// rate regardless of anything else (TAC/TIMA included) and exposes its
+// upper 8 bits as DIV, incrementing every 256 cycles; any write to DIV
+// resets it to 0 regardless of the value written. Software commonly reads
+// it as a simple hardware counter/pseudo-random source, so a stuck-at-0
+// (or whatever garbage the stub happened to return) DIV can cause
+// spurious failures far removed from anything DIV-related on its face.
+int DIVCOUNTER = 0;
+BYTE DIVREG = 0;
 BYTE SERIALDATA = 0xFF;   // $FF01 SB - Serial transfer data
 BYTE SERIALCONTROL = 0;  // $FF02 SC - Serial transfer control
 // MBC3 Real-Time Clock
@@ -118,7 +135,26 @@ void reset_Z80() {
 		SCRY = 0x00;
 		LCDY = 0x00;
 		LYC = 0x00;
-		VideoCyclesLeft = 100;
+		// BUG FIX: LCDCONTROL/LCDSTATUS/videoMode were never (re-)initialized
+		// here at all, leaving LCDC at 0 (display OFF) instead of the real,
+		// well-documented DMG post-boot-ROM power-up snapshot (LCDC=$91,
+		// STAT=$85 i.e. mode 1/VBlank with the LYC=LY coincidence flag set,
+		// since LY=LYC=0 at that point) - this project skips boot ROM
+		// emulation entirely and starts straight at $0100, so matching that
+        // snapshot exactly is what real cartridge code expects to see.
+		LCDCONTROL = 0x91;
+		LCDSTATUS = 0x85;
+		// Confirmed against the reference core (Peanut-GB)'s exact reset
+		// mechanics: the documented power-up STAT byte ($85, mode=VBlank)
+		// is the functionally real starting mode, not just cosmetic - its
+		// internal scanline counter runs a full LCD_LINE_CYCLES (456)
+		// under that VBlank label before LY ever increments at all, at
+		// which point LY jumps straight to 1 in OAM mode (line 0 is never
+		// separately numbered at boot). Matching that (videoMode=VBLANK,
+		// full VBLANK_CYCLES budget) reproduced the reference's LY
+		// progression far more closely than starting fresh in OAMMODE did.
+		videoMode = VBLANKMODE;
+		VideoCyclesLeft = VBLANK_CYCLES;
 		MAXTIME = 1024;
 		TIMECOUNTER = 0;
 		TIMECNT = 0;
@@ -127,6 +163,8 @@ void reset_Z80() {
 		RTCLATCH = 0xFF;
 		SERIALDATA = 0xFF;
 		SERIALCONTROL = 0x00;
+		DIVREG = 0;
+		DIVCOUNTER = 0;
 		MBCMODE = 0;
 }
 
@@ -300,6 +338,11 @@ void doDMA(BYTE addr) {
 }
 
 void cycleLength(int cycle) {
+	DIVCOUNTER += cycle;
+	while (DIVCOUNTER >= 256) {
+		DIVCOUNTER -= 256;
+		DIVREG++; // wraps naturally as a BYTE
+	}
 	if ((TIMCONT >> 2) & 0x01){
 		TIMECOUNTER += cycle;
 		if (TIMECOUNTER >= MAXTIME){
@@ -325,6 +368,18 @@ void cycleLength(int cycle) {
 			// real frame.
 			if (LCDY >= 154){
 				LCDY = 0;
+			}
+			if (LCDY == 0) {
+				// BUG FIX: previously, wrapping LCDY to 0 left videoMode
+				// stuck at VBLANKMODE - the transition back to OAMMODE for
+				// the new frame's line 0 only happened on the *next* call,
+				// by which point LCDY had already silently ticked to 1,
+				// skipping line 0's OAM-search phase entirely. No hblank()
+				// call here (unlike the LCDY<0x90 branch below) since we're
+				// coming from VBlank, not finishing a rendered scanline.
+				videoMode = OAMMODE;
+				VideoCyclesLeft = OAM_CYCLES;
+				if ((LCDSTATUS >> 5) & 0x01) { IFLAG |= 0x02; }
 			} else if (LCDY < 0x90) {
 				hblank();
 				videoMode = OAMMODE;
@@ -339,17 +394,28 @@ void cycleLength(int cycle) {
 				}
 			}
 			if (LCDY == LYC) { IFLAG |= 0x02; } // 3
+			// BUG FIX: STAT's mode bits (0-1) and LYC-coincidence bit (2)
+			// were never synced with the actual PPU state anywhere - only
+			// ever set by a direct software write to $FF41, which then sat
+			// frozen forever after. Any code polling STAT for raster timing
+			// (very common in real games, and exactly what stricter timing
+			// tests check) would see permanently stale mode/coincidence
+			// bits. Bits 3-7 (interrupt-source enables + unused) are left
+			// exactly as software last set them.
+			LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
 			return;
 		} else {
 			if (videoMode == OAMMODE) {
 				videoMode = TRANSFERMODE;
 				VideoCyclesLeft = TRANSFER_CYCLES; // BUG FIX: see OAM_CYCLES above
 				if ((LCDSTATUS >> 5) & 0x01) { IFLAG |= 0x02; } //3
+				LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
 				return;
 			}
 			if (videoMode == TRANSFERMODE) {
 				videoMode = HBLANKMODE;
 				VideoCyclesLeft = HBLANK_CYCLES; // BUG FIX: see OAM_CYCLES above
+				LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
 				return;
 			}
 		}
@@ -814,7 +880,7 @@ BYTE ReadMEM(WORD loc) {
 				case 0xFF00: return (BYTE)P1; break; // P1 (R/W)
 				case 0xFF01: return (BYTE)SERIALDATA; break; // Serial transfer data (R/W)
 				case 0xFF02: return (BYTE)(SERIALCONTROL | 0x7E); break; // SIO control (R/W), unused bits read as 1
-				case 0xFF04: break; // Divider Register (R/W)
+				case 0xFF04: return DIVREG; break; // Divider Register (R/W)
 				case 0xFF05: return (BYTE)TIMECNT; break;// Timer counter (R/W)
 				case 0xFF06: return (BYTE)TIMEMOD; break;// Timer Modulo (R/W)
 				case 0xFF07: return (BYTE)TIMCONT; break; // Timer Control
@@ -1015,7 +1081,7 @@ void WriteMEM(WORD loc, BYTE b){
 					break;
 			case 0xFF01: SERIALDATA = b; break; // Serial transfer data (R/W)
 			case 0xFF02: SERIALCONTROL = b; onSerialControlWrite(); break; // SIO control (R/W)
-			case 0xFF04: break; // Divider Register (R/W)
+			case 0xFF04: DIVREG = 0; DIVCOUNTER = 0; break; // Any write resets the divider to 0
 			case 0xFF05: TIMECNT = b; break; // Timer counter (R/W)
 			case 0xFF06: TIMEMOD = b; break; // Timer Modulo (R/W)
 			case 0xFF07: TIMCONT = b;
@@ -1059,7 +1125,15 @@ void WriteMEM(WORD loc, BYTE b){
 
 			// VIDEO
 			case 0xFF40: LCDCONTROL = b; break; // LCD Control (R/W)
-			case 0xFF41: LCDSTATUS = b; break; // LCDC Status   (R/W)
+			case 0xFF41:
+				// BUG FIX: bits 0-2 (mode + LYC-coincidence) are read-only,
+				// hardware-maintained status bits on real hardware - only
+				// bits 3-6 (interrupt-source enables) are actually
+				// writable. This previously let software overwrite the
+				// mode/coincidence bits directly, which then never got
+				// corrected by the PPU state machine (see cycleLength).
+				LCDSTATUS = (LCDSTATUS & 0x07) | (b & 0xF8);
+				break; // LCDC Status   (R/W)
 			case 0xFF42: SCRY = b; break; // Scroll Y   (R/W)
 			case 0xFF43: SCRX = b; break; // Scroll X   (R/W)
 			case 0xFF44: LCDY = 0x00; break; // LCDC Y-Coordinate (R)
@@ -1455,7 +1529,11 @@ void OP36(void){ // case  0x36:
 } // 36    LD   (HL),nn
 
 void OP37(void){ // case  0x37:
-	setC(1); //TODO TEST!
+	// BUG FIX: SCF must also clear N and H (Z is left alone) - this only
+	// ever set C, leaking whatever N/H a prior instruction left behind.
+	setC(1);
+	setN(0);
+	setH(0);
 	cycleLength(4);
 } // 37    SCF
 
@@ -1496,7 +1574,8 @@ void OP3E(void){ // case  0x3E:
 } // 3E    LD   A,nn
 
 void OP3F(void){ // case  0x3F:
-setC(!getC()); cycleLength(4); }// 3F    CCF
+// BUG FIX: CCF must also clear N and H (Z is left alone), same leak as SCF.
+setC(!getC()); setN(0); setH(0); cycleLength(4); }// 3F    CCF
 void OP40(void){ // case  0x40:
 cycleLength(4); } // 40    LD   B,B
 void OP41(void){ // case  0x41:
