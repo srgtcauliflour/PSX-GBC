@@ -4,17 +4,9 @@
 
 // includes ////////////////////////////////////////////////////
 #include <stdio.h>
-#include <kernel.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
-#include <sys/file.h>
-#include <malloc.h>
-#include <memory.h>
-#include <libetc.h>
-#include <libgte.h>
-#include <libgpu.h>
-#include <libgs.h>
-#include <libcd.h>
-#include <libapi.h>
 #include "main.h"
 //#include "mem.h"
 #include "emu.h"
@@ -101,6 +93,7 @@ int RAMENABLED = 0; // Cart RAM $A000-$BFFF gate: enabled by writing 0x0A to $00
 // (or whatever garbage the stub happened to return) DIV can cause
 // spurious failures far removed from anything DIV-related on its face.
 int DIVCOUNTER = 0;
+int FRAMECOUNT = 0; // Incremented once per vblank(); used by debug tracing below.
 BYTE DIVREG = 0;
 BYTE SERIALDATA = 0xFF;   // $FF01 SB - Serial transfer data
 BYTE SERIALCONTROL = 0;  // $FF02 SC - Serial transfer control
@@ -153,6 +146,22 @@ void reset_Z80() {
         // snapshot exactly is what real cartridge code expects to see.
 		LCDCONTROL = 0x91;
 		LCDSTATUS = 0x85;
+		// BUG FIX: BGPAL/OBJPAL0/OBJPAL1 (the BGP/OBP0/OBP1 palette
+		// registers) were never initialized here either, defaulting to 0
+		// unless the ROM happened to write to them first. A palette value
+		// of 0 makes every one of the 4 possible tile pixel values map to
+		// shade 0 (white) - the real post-boot-ROM default is BGP=$FC
+		// (the "identity" mapping: color 0->shade0, 1->shade1, 2->shade2,
+		// 3->shade3) and OBP0=OBP1=$FF. Without this, background/window
+		// tiles render as a blank white screen regardless of their actual
+		// pixel data until a game explicitly sets its own palette - which
+		// many simple programs (this project's own Blargg-test-derived
+		// screenshots included) never bother to do, just like real
+		// hardware doesn't require them to, since the boot ROM already
+		// set this up.
+		BGPAL = 0xFC;
+		OBJPAL0 = 0xFF;
+		OBJPAL1 = 0xFF;
 		// Confirmed against the reference core (Peanut-GB)'s exact reset
 		// mechanics: the documented power-up STAT byte ($85, mode=VBlank)
 		// is the functionally real starting mode, not just cosmetic - its
@@ -290,17 +299,26 @@ void interrupt(void){
 }
 
 void Allocate_Memory(void){
-	HIRAM  = (BYTE *)malloc(128 * sizeof(BYTE));
-	VRAM   = (BYTE *)malloc(8 * 1024 * sizeof(BYTE));
-	RAM    = (BYTE *)malloc(8 * 1024 * sizeof(BYTE)); //TODO: Check this out
-	OAMRAM = (BYTE *)malloc(160 * sizeof(BYTE));
+	// BUG FIX: every buffer here was malloc()'d, never zeroed. malloc does
+	// not zero-initialize memory - these came up full of leftover heap
+	// garbage on every fresh load, not the consistent "blank" state real
+	// hardware's own RAM effectively presents at power-on. Confirmed as a
+	// real, visible bug via OAMRAM specifically: garbage sprite-attribute
+	// bytes that happened to look "valid" (non-zero X/Y) caused phantom
+	// sprites to render (compounded by the separate missing-OBJ-enable-
+	// check and pixel-loop bugs fixed alongside this). calloc() zeroes as
+	// it allocates, at the same cost as malloc()+memset().
+	HIRAM  = (BYTE *)calloc(128, sizeof(BYTE));
+	VRAM   = (BYTE *)calloc(8 * 1024, sizeof(BYTE));
+	RAM    = (BYTE *)calloc(8 * 1024, sizeof(BYTE)); //TODO: Check this out
+	OAMRAM = (BYTE *)calloc(160, sizeof(BYTE));
 	// MBC2 has 512x4-bit RAM built into the mapper itself; the cart header's RAMSIZE
 	// byte is 0 for these carts, so without this the buffer below would be 0 bytes
 	// while WriteMEM/ReadMEM still index into it for $A000-$BFFF.
 	if ((CARTTYPE == 0x05) || (CARTTYPE == 0x06)) {
-		EXTRNRAM = (BYTE *)malloc(512 * sizeof(BYTE));
+		EXTRNRAM = (BYTE *)calloc(512, sizeof(BYTE));
 	} else {
-		EXTRNRAM = (BYTE *)malloc((iRAMSIZE ? iRAMSIZE : 1) * 1024 * sizeof(BYTE));
+		EXTRNRAM = (BYTE *)calloc((iRAMSIZE ? iRAMSIZE : 1) * 1024, sizeof(BYTE));
 	}
 }
 
@@ -383,9 +401,20 @@ void cycleLength(int cycle) {
 				// stuck at VBLANKMODE - the transition back to OAMMODE for
 				// the new frame's line 0 only happened on the *next* call,
 				// by which point LCDY had already silently ticked to 1,
-				// skipping line 0's OAM-search phase entirely. No hblank()
-				// call here (unlike the LCDY<0x90 branch below) since we're
-				// coming from VBlank, not finishing a rendered scanline.
+				// skipping line 0's OAM-search phase entirely. FURTHER BUG
+				// FIX: the fix as first written also skipped calling
+				// hblank() for line 0 specifically, reasoning that "we're
+				// coming from VBlank, not finishing a rendered scanline" -
+				// that reasoning was wrong. hblank() is what actually
+				// renders the background/window/sprite pixel data for the
+				// line via DrawBGline() etc; line 0 is a completely normal
+				// visible line like any other and still needs that call,
+				// or its entire row of pixels is silently left blank
+				// forever. Confirmed visually: dumping the emulator's own
+				// rendered framebuffer (not just serial/register state, as
+				// every prior test in this project relied on) showed real
+				// text reduced to a few stray pixels until this was fixed.
+				hblank();
 				videoMode = OAMMODE;
 				VideoCyclesLeft = OAM_CYCLES;
 				if ((LCDSTATUS >> 5) & 0x01) { IFLAG |= 0x02; }
@@ -473,7 +502,13 @@ void hblank(){
 				DrawWINline(LCDY, WINaddr, TILEaddr);
 			}
 		}
-		DrawOBJline(LCDY, 0x8000);
+		// BUG FIX: sprites were rendered unconditionally, with no check of
+		// LCDC bit 1 (OBJ display enable) at all. Real hardware shows no
+		// sprites whatsoever when this bit is clear, regardless of what's
+		// in OAM.
+		if ((LCDCONTROL >> 1) & 0x01) {
+			DrawOBJline(LCDY, 0x8000);
+		}
 	}
 }
 
@@ -484,7 +519,12 @@ void DrawBGline(int line, int BGaddr, int TILEaddr) {
 	int oldtileNo = -1;
  	BYTE B1, B2;
 	bx = SCRX;
-	by = (SCRY + LCDY);
+	// BUG FIX: real hardware treats the background as a wrapping 256x256
+	// pixel plane - (SCRY + LCDY) must wrap modulo 256 before being used
+	// to index the tile map, or scrolling anywhere near the bottom of
+	// that range walks off into unrelated memory (the other tile map at
+	// $9C00, or beyond it) once the sum exceeds 255.
+	by = (SCRY + LCDY) & 0xFF;
 	for (i = 0; i < 160; i++) {
 		if (BGaddr == 0x9C00) {//
 			tileNo = (signed int)ReadMEM(BGaddr + (by/8) * 32 + (i+ bx)/8);
@@ -574,6 +614,27 @@ void DrawOBJline(int line, int TILEaddr) {
 	BYTE B1, B2;
 	int colour;
 	int pos;
+	// BUG FIX (severe): the inner per-pixel loop used the OUTER sprite-index
+	// variable `i` for its own condition/increment instead of `j` - meaning
+	// every iteration of what should have been an independent 0-7 pixel
+	// loop was instead corrupting the outer 0-39 sprite loop's counter
+	// directly. Combined with the missing OBJ-enable check and uninitialized
+	// OAM below, this produced essentially random garbage sprite pixels
+	// wherever OAM happened to contain non-zero bytes - confirmed to be the
+	// real cause of stray/incoherent pixels found while visually verifying
+	// this project's rendering output for the first time this session
+	// (every previous test only ever checked serial output or CPU/flag
+	// state, never the actual rendered pixels).
+	//
+	// Also fixed while rewriting this loop: the "color 1" branch checked
+	// bit position `i` directly instead of `7-i` like the other three
+	// branches - inconsistent with the MSB-first bit ordering every other
+	// tile decoder in this file uses, so it was reading the wrong pixel's
+	// bit for all but one column position.
+	//
+	// Sprite X/Y flipping (iflipx/iflipy, computed above but never actually
+	// applied to the pixel indexing here) remains a known, separate gap -
+	// out of scope for this fix, tracked in STATUS.md.
 	int i, j;
 	for ( i = 0; i < 40; i++) {
 		pos = i * 4;
@@ -591,10 +652,10 @@ void DrawOBJline(int line, int TILEaddr) {
 
 			//Hidden (Priority Bit 7)
 
-			for (j = 0; i < 8; i++) {
+			for (j = 0; j < 8; j++) {
 
-				if (((B1 >> (7-i)) & 0x01) == 0x01) {
-					if (((B2 >> (7-i)) & 0x01) == 0x01) {
+				if (((B1 >> (7-j)) & 0x01) == 0x01) {
+					if (((B2 >> (7-j)) & 0x01) == 0x01) {
 						if (ipal) { // Use OBJPAL1
 								colour = (OBJPAL1 >>6) & 0x3; //3;
 						} else {
@@ -607,7 +668,7 @@ void DrawOBJline(int line, int TILEaddr) {
 								colour = (OBJPAL0 >>4) & 0x3;
 						}
 					}
-				} else if (((B2 >> (i)) & 0x01) == 0x01) {
+				} else if (((B2 >> (7-j)) & 0x01) == 0x01) {
 						if (ipal) { // Use OBJPAL1
 								colour = (OBJPAL1 >>2) & 0x3; //3;
 						} else {
@@ -620,8 +681,8 @@ void DrawOBJline(int line, int TILEaddr) {
 								colour = OBJPAL0  & 0x3;
 						}
 				}
-				if ((bx - 7 + i < 160) && (bx -7 + i >= 0)) {
-					screenBuffer[(line * 160) + bx - 7 + i] = colour;
+				if ((bx - 7 + j < 160) && (bx -7 + j >= 0)) {
+					screenBuffer[(line * 160) + bx - 7 + j] = colour;
 				}
 			}
 		}
@@ -635,6 +696,7 @@ void vblank(void){
 //	curframe--;
 //	if(curframe < 0) {
 //		curframe = frameskip;
+		FRAMECOUNT++;
 		if ((LCDCONTROL >> 7) == 0x01) { // LCD ON
 
 

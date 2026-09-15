@@ -25,7 +25,39 @@
 // ---- Platform hooks (see psx-stubs) ----
 unsigned long PadRead(int pad_num) { (void)pad_num; return 0; }
 void PadInit(int mode) { (void)mode; }
-void Draw_Buffer(int *screenBuffer) { (void)screenBuffer; }
+static int draw_buffer_call_count = 0;
+void Draw_Buffer(int *screenBuffer) {
+    draw_buffer_call_count++;
+    if (getenv("TRACE")) fprintf(stderr, "[Draw_Buffer] call #%d\n", draw_buffer_call_count);
+    if (getenv("ROWSUMMARY")) {
+        int r, c, nonwhite;
+        fprintf(stderr, "[Draw_Buffer] call #%d FRAMECOUNT=%d LCDC=%02X SCRX=%d SCRY=%d row summary (non-white pixel count per row):\n",
+                draw_buffer_call_count, FRAMECOUNT, LCDCONTROL, SCRX, SCRY);
+        for (r = 0; r < 144; r++) {
+            nonwhite = 0;
+            for (c = 0; c < 160; c++) {
+                if ((screenBuffer[r*160+c] & 0x03) != 0) nonwhite++;
+            }
+            if (nonwhite > 0) fprintf(stderr, "  row %d: %d non-white pixels\n", r, nonwhite);
+        }
+    }
+    const char *dump_path = getenv("DUMP_PPM");
+    const char *dump_at_str = getenv("DUMP_AT");
+    int dump_at = dump_at_str ? atoi(dump_at_str) : -1;
+    if (dump_path && (dump_at < 0 || dump_at == draw_buffer_call_count)) {
+        FILE *f = fopen(dump_path, "wb");
+        if (f) {
+            fprintf(f, "P5\n160 144\n255\n");
+            int i;
+            for (i = 0; i < 160*144; i++) {
+                unsigned char shade = screenBuffer[i] & 0x03;
+                unsigned char gray = 255 - (shade * 85); // 0->255(white),1->170,2->85,3->0(black)
+                fputc(gray, f);
+            }
+            fclose(f);
+        }
+    }
+}
 void Draw_Buffer_SPRT(int *screenBuffer) { (void)screenBuffer; }
 void Draw_Buffer_Pixel_Blitting(int *screenBuffer) { (void)screenBuffer; }
 void PrepScreen(void) {}
@@ -116,6 +148,28 @@ int main(int argc, char **argv) {
     }
 
     printf("\n");
+    if (getenv("DUMP_VRAM")) {
+        int r, c, i;
+        fprintf(stderr, "[VRAM] tile map at $9800, all 32 rows x 20 cols:\n");
+        for (r = 0; r < 32; r++) {
+            fprintf(stderr, "  ");
+            for (c = 0; c < 20; c++) {
+                fprintf(stderr, "%02X ", ReadMEM(0x9800 + r*32 + c));
+            }
+            fprintf(stderr, "\n");
+        }
+        fprintf(stderr, "[VRAM] tile data for tile #0x20 ('space', 16 bytes at $8000+0x20*16):\n  ");
+        for (i = 0; i < 16; i++) {
+            fprintf(stderr, "%02X ", ReadMEM(0x8000 + 0x20*16 + i));
+        }
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[VRAM] tile data for tile #0x30 ('0', 16 bytes at $8000+0x30*16):\n  ");
+        for (i = 0; i < 16; i++) {
+            fprintf(stderr, "%02X ", ReadMEM(0x8000 + 0x30*16 + i));
+        }
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[VRAM] LCDC=%02X BGP=%02X\n", LCDCONTROL, BGPAL);
+    }
     if (strstr(serial_log, "Passed")) {
         printf("[harness] RESULT: PASS\n");
         return 0;

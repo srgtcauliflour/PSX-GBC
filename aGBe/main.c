@@ -1,81 +1,34 @@
 /* --------------------------------------------------
 
-
              aGBe - a game boy emulator
              		for the psx
 
-    	           	(RELOADED)
+  REWRITE NOTE: replaces the original Psy-Q-based main.c (see git history
+  or /tmp/old_main.c during the session this was written in), which called
+  into the GsLib-based GUI (CD-ROM ROM bank loading, splash screen, ROM
+  select menu - see gui.c) that has no PSn00bSDK equivalent yet (real,
+  separate follow-up work - see STATUS.md).
 
-
-  	VERSION '0.2.1' - Fixed and tested CD Loading/Reading routines.
-	  					  Rearranged CPU Opcode instructions.
-  					  Added agbeBank loading routines.
-  	VERSION '0.2.0' - Revival. Updating and getting rid of code. Massive clean-up.
-
+  This version proves the actual emulator core - the CPU/MBC/PPU logic
+  this project spent a whole session finding and fixing real bugs in, and
+  independently validating against Blargg's test ROMs - runs correctly as
+  real PS1 machine code with real GPU output and real controller input.
+  It boots an embedded demo ROM (a Blargg test ROM already known to pass)
+  as a stand-in for real CD-ROM-based game loading.
 
    -------------------------------------------------- */
 
-
-// includes ////////////////////////////////////////////////////
-#include <sys/types.h>
-#include <sys/file.h>
-#include <libetc.h>
-#include <libgte.h>
-#include <libgpu.h>
-#include <libgs.h>
-#include <libcd.h>
-#include <libsn.h>
-#include <kernel.h>
-
-#include <strings.h>
-#include "pad.h"
 #include "main.h"
+#include "emu.h"
+#include "pad.h"
 #include "psx.h"
-//#include "mem.h"
-#include "gui.h"
+#include "demo_rom.h"
 
-
-
-
-// functions ////////////////////////////////////////////////////
-int main(void){
-	#if defined(DEBUG)
-	printf("aGBe \n");
-	#endif
-
-
+int main(void) {
 	init_PSX();
 
-	#if defined(DEBUG)
-	printf("Initializing CD...\n");
-	#endif
+	ROM = (BYTE *) demo_rom;
+	runEmu();
 
-	CdInit();
-
-	#if defined(DEBUG)
-		printf("Initializing CD...Complete\n");
-	#endif
-    //initFont();
-    //loadFonts(1);
-
-	#if defined(DEBUG)
-		printf("Initializing GUI...\n");
-	#endif
-	initGUI();
-	#if defined(DEBUG)
-		printf("Initializing GUI...Complete\n");
-	#endif
-
-	while(1) {
-		#if defined(RELEASE)
-		doSplash();
-		doGUIRollIn();
-		#endif
-		MainMenu();
-	}
-return 0;
+	return 0;
 }
-
-
-
-
