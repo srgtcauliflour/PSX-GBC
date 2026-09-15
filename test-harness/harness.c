@@ -221,11 +221,36 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\n");
         fprintf(stderr, "[VRAM] LCDC=%02X BGP=%02X\n", LCDCONTROL, BGPAL);
     }
+    if (getenv("DUMP_HRAM")) {
+        int i;
+        fprintf(stderr, "[HRAM] $FF80-$FFFE:\n");
+        for (i = 0xFF80; i <= 0xFFFE; i++) {
+            fprintf(stderr, "%02X ", ReadMEM(i));
+            if ((i - 0xFF7F) % 16 == 0) fprintf(stderr, "\n");
+        }
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[WRAM] $C200+256..287 (expected_banks block3):\n");
+        for (i = 0; i < 32; i++) {
+            fprintf(stderr, "%d ", ReadMEM(0xC200 + 256 + i));
+        }
+        fprintf(stderr, "\n");
+    }
     if (strstr(serial_log, "Passed")) {
         printf("[harness] RESULT: PASS\n");
         return 0;
     } else if (strstr(serial_log, "Failed")) {
         printf("[harness] RESULT: FAIL\n");
+        return 1;
+    } else if (reg_B == 3 && reg_C == 5 && reg_D == 8 && reg_E == 13 && get_rH() == 21 && get_rL() == 34) {
+        // Mooneye test suite convention: on success, parks in an infinite
+        // self-loop (caught by the stuck-loop detector above) with
+        // B,C,D,E,H,L set to this exact Fibonacci sequence beforehand.
+        printf("[harness] RESULT: PASS (Mooneye fibonacci signature)\n");
+        return 0;
+    } else if (reg_B == 0x42 && reg_C == 0x42 && reg_D == 0x42 && reg_E == 0x42 && get_rH() == 0x42 && get_rL() == 0x42) {
+        // Mooneye failure convention: same parked self-loop, but
+        // B=C=D=E=H=L=$42 instead of the success Fibonacci sequence.
+        printf("[harness] RESULT: FAIL (Mooneye $42 signature)\n");
         return 1;
     } else {
         printf("[harness] RESULT: UNKNOWN (no Blargg-style Passed/Failed banner seen)\n");

@@ -313,6 +313,26 @@ int GetCartRAMSize(void) {
 	return (iRAMSIZE ? iRAMSIZE : 1) * 1024;
 }
 
+// BUG FIX (severe): every cart-RAM bank address calculation used
+// RAMBANKNUMBER directly, masked only against its *protocol*-level range
+// (2 bits for MBC1, 4 bits for MBC5) - never against how many RAM banks
+// this specific cartridge's header actually reports having. A cart with
+// only one real 8KB bank but a game (or, as found via Mooneye's
+// emulator-only/mbc1/ram_64kb.gb test ROM, a deliberately adversarial
+// test of exactly this edge case) selecting a higher bank number still
+// within the *protocol's* range would compute an address past the end
+// of the real, much smaller EXTRNRAM allocation - confirmed to cause
+// real heap corruption (a glibc sysmalloc assertion failure) in the host
+// test harness, not just a logic error; on the real console this is
+// undefined behaviour writing into whatever happens to sit past the
+// buffer instead. Real hardware simply doesn't have the extra physical
+// RAM to select in the first place, so the bank number effectively wraps
+// within however many banks actually exist.
+int GetCartRAMBankCount(void) {
+	int banks = GetCartRAMSize() / 0x2000;
+	return banks > 0 ? banks : 1;
+}
+
 void Allocate_Memory(void){
 	// BUG FIX: every buffer here was malloc()'d, never zeroed. malloc does
 	// not zero-initialize memory - these came up full of leftover heap
@@ -930,6 +950,15 @@ void loadRom(void){
 		if(ROMSIZE == 0x04) { iROMSIZE = 32; }
 		if(ROMSIZE == 0x05) { iROMSIZE = 64; }
 		if(ROMSIZE == 0x06) { iROMSIZE = 128; }
+		// BUG FIX: the standard ROMSIZE encoding continues to 0x08 (8MB/
+		// 512 banks), but this table stopped at 0x06 (2MB/128 banks) -
+		// leaving iROMSIZE at 0 for any larger cart, which then caused a
+		// real division-by-zero crash in the ROMBANKNUMBER masking fix
+		// added alongside this (found via Mooneye's emulator-only/mbc5/
+		// rom_32Mb.gb and rom_64Mb.gb tests, which specifically exercise
+		// these two largest standard sizes).
+		if(ROMSIZE == 0x07) { iROMSIZE = 256; }
+		if(ROMSIZE == 0x08) { iROMSIZE = 512; }
 
 	#if defined(DEBUG)
 		printf("Name:      %s\n", CARTTITLE);
@@ -997,7 +1026,19 @@ BYTE ReadMEM(WORD loc) {
 			return ROM[loc];
 		}
 		if (loc < 0x8000) { // $4000-$7FFF - ROM Bank n
-        	return ROM[loc + ((ROMBANKNUMBER - 1 ) * 0x4000)];
+			// BUG FIX (severe): ROMBANKNUMBER was used completely
+			// unmasked against how many banks the loaded ROM file
+			// actually contains (iROMSIZE) - a game/test selecting a
+			// bank number beyond that (real hardware would just wrap/
+			// mirror, having no more physical ROM to address) read
+			// straight past the end of the ROM buffer. Confirmed to
+			// segfault outright in the host test harness on several of
+			// Mooneye's emulator-only/mbc1|mbc5/rom_*.gb tests, which
+			// deliberately probe exactly this edge case; on the real
+			// console this is undefined behaviour reading whatever
+			// happens to sit past the buffer instead of crashing
+			// outright, but no less wrong.
+        	return ROM[loc + ((ROMBANKNUMBER % (iROMSIZE ? iROMSIZE : 1)) - 1 ) * 0x4000];
 		}
 		if ( loc < 0xA000 ) { // $8000-$9FFF - VRAM
 			return VRAM[loc - 0x8000];
@@ -1016,13 +1057,13 @@ BYTE ReadMEM(WORD loc) {
 			if (!RAMENABLED) { return 0xFF; } // Real hardware reads open bus (~0xFF) while RAM is disabled
 			if (( CARTTYPE == 0x01 ) || ( CARTTYPE == 0x02) || ( CARTTYPE == 0x03 )) {
 				if (MBCMODE) { // 4/32 mode
-					return EXTRNRAM[loc - 0xA000 + (WORD)(RAMBANKNUMBER * 0x2000)];
+					return EXTRNRAM[loc - 0xA000 + (WORD)((RAMBANKNUMBER % GetCartRAMBankCount()) * 0x2000)];
 				} else {
 					return EXTRNRAM[loc - 0xA000 ];
 				}
 			}
 			// MBC2/3/5 - always bank via RAMBANKNUMBER
-			return EXTRNRAM[loc - 0xA000 + (WORD)(RAMBANKNUMBER * 0x2000)];
+			return EXTRNRAM[loc - 0xA000 + (WORD)((RAMBANKNUMBER % GetCartRAMBankCount()) * 0x2000)];
 		}
 		if ( loc < 0xE000 ) { // $C000-$DFFF - Internal RAM
 			return RAM[loc - 0xC000];
@@ -1212,10 +1253,10 @@ void WriteMEM(WORD loc, BYTE b){
 		} else if (RAMENABLED) {
 			RAM_DIRTY = 1;
 			if (( CARTTYPE == 0x01 ) || ( CARTTYPE == 0x02) || ( CARTTYPE == 0x03 )) {
-				if (MBCMODE) { EXTRNRAM[loc - 0xA000 + (WORD)(RAMBANKNUMBER * 0x2000)] = b; }
+				if (MBCMODE) { EXTRNRAM[loc - 0xA000 + (WORD)((RAMBANKNUMBER % GetCartRAMBankCount()) * 0x2000)] = b; }
 				else { EXTRNRAM[loc - 0xA000] = b; }
 			} else {
-				EXTRNRAM[loc - 0xA000 + (WORD)(RAMBANKNUMBER * 0x2000)] = b;
+				EXTRNRAM[loc - 0xA000 + (WORD)((RAMBANKNUMBER % GetCartRAMBankCount()) * 0x2000)] = b;
 			}
 		}
 	} else if ( ( loc >= 0xC000 ) &&  ( loc <= 0xDFFF ) ) { // $C000-$DFFF - Internal RAM

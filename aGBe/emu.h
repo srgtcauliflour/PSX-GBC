@@ -48,6 +48,7 @@ extern int FRAMECOUNT;
 extern int RAM_DIRTY;
 int CartHasBattery(void);
 int GetCartRAMSize(void);
+int GetCartRAMBankCount(void);
 
 // Platform hooks for battery-backed cart RAM persistence (memory card on
 // PSn00bSDK; a plain host file in the test harness). Implementations
