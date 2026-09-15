@@ -61,11 +61,16 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
 - **CPU/MBC/PPU core correctness** (`aGBe/emu.c`, `aGBe/opcodes.c`): dozens
   of real, confirmed bugs fixed this session — see `git log` for the full,
   detailed list. Validated against Blargg's `cpu_instrs` test suite: went
-  from every single test hanging forever (0/11) to 6/11 fully passing, with
-  the rest making real progress (no more hangs, itemized remaining
-  failures). `instr_timing.gb` (dedicated cycle-timing test) still fails
-  but the underlying PPU timing model was corrected substantially (see the
-  "PPU/CPU cycle-count timing" commit).
+  from every single test hanging forever (0/11), to 6/11, to a clean
+  **11/11 passing**. The methodology that got the last 5 tests across the
+  line: generate a tiny ROM that exercises every input combination for one
+  suspect opcode, run it through both this core and a reference core
+  (Peanut-GB, MIT-licensed) via `test-harness/refharness.c`, diff the
+  post-instruction state. Found several "unmasked Z-flag" bugs this way
+  (e.g. `0x00 - 0xFF - 1` wraps to a real zero result that an unmasked
+  `a == 0` check misses) that were otherwise invisible.
+  `instr_timing.gb` (the dedicated cycle-timing test, stricter than
+  cpu_instrs) still fails at one remaining point — see "What's next".
 - **MBC1/2/3/5 bank switching, RAM-enable gating, a basic MBC3 RTC.**
 - **Toolchain viability**: the core compiles and links into a genuine
   bootable PS-EXE with the real, free PSn00bSDK toolchain (see
@@ -74,29 +79,31 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
 
 ## What's next (roughly in priority order)
 
-1. **Finish CPU correctness.** `cpu_instrs` tests 04, 09, 11 still fail; 01
-   and 07 don't reach a verdict in a reasonable instruction budget. Use the
-   `refharness.c` diff technique (see git log for how this found the flag
-   bit-position and PPU timing bugs) to pinpoint the exact remaining
-   divergences. Then run Mooneye's MBC1/MBC5 test ROMs to validate the
-   bank-switching fixes.
-2. **Real platform-layer port.** `psx.c`/`gui.c`/`main.c` still assume
+1. **Close out `instr_timing.gb`.** Fails at the same point each time
+   (~instruction 188k, "Failed #255"), tracked to a small (~2-unit)
+   residual LY-read divergence against the reference core that doesn't
+   affect cpu_instrs's coarser checks. Candidates: the exact PPU cycle
+   phase at boot-ROM handoff (this project approximates it as "start of
+   VBlank", which may not be precisely right), or a timer/serial edge
+   case. Same diff-against-reference technique as above should find it.
+2. Run Mooneye's MBC1/MBC5 test ROMs to validate the bank-switching work.
+3. **Real platform-layer port.** `psx.c`/`gui.c`/`main.c` still assume
    Psy-Q's GsLib (`GsSPRITE`, `GsOT`, `GsSortSprite`, ...), which PSn00bSDK
    has no equivalent for. This needs a genuine rewrite against raw
    `psxgpu.h` primitives (ordering tables, `POLY_FT4`/`SPRT` primitives).
    `core_state.h` in the smoke test is a preview of the necessary split
    between "core state" and "GsLib rendering state."
-3. **Real controller input.** `PadRead()` is a stub. Port to PSn00bSDK's
+4. **Real controller input.** `PadRead()` is a stub. Port to PSn00bSDK's
    `psxpad.h` buffer-polling model (different shape than Psy-Q's simple
    polled `PadRead()`).
-4. **CD-ROM ROM loading.** The original `AGBEBANK.BIN` multi-ROM bundle
+5. **CD-ROM ROM loading.** The original `AGBEBANK.BIN` multi-ROM bundle
    format's packing tool was never committed to CVS — it needs to be
    rebuilt (a small Python script is enough) alongside switching the raw
    `CdRead()` sector calls to PSn00bSDK's `psxcd.h` + `mkpsxiso` for the
    actual bootable CD image.
-5. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
+6. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
    — needed for battery-backed cart RAM.
-6. **GBC support and sound** — explicitly deprioritized per the person's
+7. **GBC support and sound** — explicitly deprioritized per the person's
    direction this session; sound especially can wait until everything else
    is solid.
 
