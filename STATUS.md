@@ -127,31 +127,32 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   asymmetric tile) — extracted the actual rendered pixels and confirmed
   an exact match against the expected mirror/flip for all four, on both
   the top and bottom rows.
+- **Double buffering.** `Draw_Buffer` now draws into whichever half of
+  VRAM isn't currently displayed and flips each frame — the standard PS1
+  pattern, eliminating the tearing the earlier single-buffer version
+  could show.
 
 ## What's next (roughly in priority order)
 
 1. **Visual polish for the menu.** Current menu is plain `FntPrint` text
    - functional, not pretty. A real background/graphics layer can build
    on top of what's here now without touching the menu logic itself.
-2. **Double buffering.** `Draw_Buffer` currently blits straight into the
-   displayed VRAM area — works, but can tear. Needs a second buffer and
-   `PutDispEnv` flip, alternating like the PSn00bSDK template examples do.
-3. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
+2. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
    — needed for battery-backed cart RAM.
-4. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
+3. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
    (RGBDS toolchain needed to build them from source; wasn't readily
    available as a binary this session).
-5. **GBC support and sound** — explicitly deprioritized per the person's
+4. **GBC support and sound** — explicitly deprioritized per the person's
    direction earlier this session; sound especially can wait until
    everything else is solid.
-6. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
+5. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
    flat, fully-resident pointer with no partial loading — fine for the
    large majority of the GB/GBC library (32KB-512KB), but the small
    number of very large late-era GBC games (up to 4-8MB) won't fit
    resident in the PS1's 2MB of RAM. Only worth doing if support for
    those specific large titles is wanted; most of the library doesn't
    need it.
-7. **8x16 sprite mode** (`LCDC` bit 2) isn't supported — `DrawOBJline`'s
+6. **8x16 sprite mode** (`LCDC` bit 2) isn't supported — `DrawOBJline`'s
    line-range check assumes 8-tall sprites only. Most GB/GBC games use
    8x8 sprites predominantly; a real, separate gap if a specific game
    needs tall-sprite mode.
