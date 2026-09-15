@@ -7,3 +7,5 @@
 build/
 toolchain/
 test-harness/build/
+test-harness/harness
+test-harness/refharness
