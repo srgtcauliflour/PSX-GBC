@@ -131,31 +131,51 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   VRAM isn't currently displayed and flips each frame — the standard PS1
   pattern, eliminating the tearing the earlier single-buffer version
   could show.
+- **Memory card save support — verified end-to-end.** Battery-backed
+  cart RAM (MBC1/2/3/5) now persists via real PSn00bSDK memory card I/O
+  (`_bu_init`, `open`/`read`/`write` against `bu00:`). Saves trigger on
+  the RAM-enable→disable transition (mirroring how real cartridges
+  themselves commit), load automatically at boot, and are named from
+  each cartridge's own header title so multiple games on one disc get
+  separate saves. Proved the full cycle for real: wrote a distinctive
+  byte pattern from a synthetic ROM, confirmed the saved file's exact
+  size and content, then in a completely separate process/ROM run,
+  confirmed the same byte came back correctly on load.
 
 ## What's next (roughly in priority order)
 
 1. **Visual polish for the menu.** Current menu is plain `FntPrint` text
    - functional, not pretty. A real background/graphics layer can build
    on top of what's here now without touching the menu logic itself.
-2. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
-   — needed for battery-backed cart RAM.
-3. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
+2. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
    (RGBDS toolchain needed to build them from source; wasn't readily
    available as a binary this session).
-4. **GBC support and sound** — explicitly deprioritized per the person's
+3. **GBC support and sound** — explicitly deprioritized per the person's
    direction earlier this session; sound especially can wait until
    everything else is solid.
-5. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
+4. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
    flat, fully-resident pointer with no partial loading — fine for the
    large majority of the GB/GBC library (32KB-512KB), but the small
    number of very large late-era GBC games (up to 4-8MB) won't fit
    resident in the PS1's 2MB of RAM. Only worth doing if support for
    those specific large titles is wanted; most of the library doesn't
    need it.
-6. **8x16 sprite mode** (`LCDC` bit 2) isn't supported — `DrawOBJline`'s
+5. **8x16 sprite mode** (`LCDC` bit 2) isn't supported — `DrawOBJline`'s
    line-range check assumes 8-tall sprites only. Most GB/GBC games use
    8x8 sprites predominantly; a real, separate gap if a specific game
    needs tall-sprite mode.
+6. **MBC3 RTC isn't persisted.** The RTC registers implemented earlier
+   this session (clock/calendar for games like Pokémon Gold/Silver)
+   reset every boot rather than saving alongside cart RAM — a real,
+   separate gap from plain cart RAM save/load, lower priority since it
+   only affects real-time-clock-dependent game features, not save data
+   itself.
+7. **Very large cart RAM won't fit a single memory card.** A standard
+   PS1 card has 15 usable 8KB blocks (120KB total); `SaveCartRAM`
+   requests exactly the blocks a cart needs, but a 128KB-RAM MBC5 game
+   would need every single block on the card, and anything larger
+   wouldn't fit at all. Affects a small minority of RAM-heavy titles;
+   not fixed proactively since most games use far less.
 
 ## Known limitation: instr_timing.gb
 
