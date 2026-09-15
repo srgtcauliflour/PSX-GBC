@@ -116,33 +116,45 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   longer has a fixed ROM filename — the player picks. Re-verified the
   same way as the CD-loading milestone: rebuilt the disc, confirmed
   every file on it byte-identical to source via `isoinfo`.
+- **Sprite rendering fixed and verified.** Found and fixed a severe bug
+  where every row of every sprite showed the tile's top row repeated
+  (the row-within-tile fetch never varied with which scanline was being
+  drawn), wired up X/Y sprite flipping (attributes were read from OAM
+  but never applied), and fixed `Draw_Buffer` being incorrectly gated on
+  BG-enable instead of just LCD-on (a game with BG off but sprites on
+  would never present a frame at all). Verified with a synthetic
+  four-sprite test ROM (normal/X-flip/Y-flip/XY-flip of the same
+  asymmetric tile) — extracted the actual rendered pixels and confirmed
+  an exact match against the expected mirror/flip for all four, on both
+  the top and bottom rows.
 
 ## What's next (roughly in priority order)
 
 1. **Visual polish for the menu.** Current menu is plain `FntPrint` text
    - functional, not pretty. A real background/graphics layer can build
    on top of what's here now without touching the menu logic itself.
-2. **Sprite X/Y flipping.** `iflipx`/`iflipy` are read from OAM in
-   `DrawOBJline` but never actually applied to pixel indexing — real gap,
-   found alongside the other sprite bugs but out of scope for that fix.
-3. **Double buffering.** `Draw_Buffer` currently blits straight into the
+2. **Double buffering.** `Draw_Buffer` currently blits straight into the
    displayed VRAM area — works, but can tear. Needs a second buffer and
    `PutDispEnv` flip, alternating like the PSn00bSDK template examples do.
-4. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
+3. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
    — needed for battery-backed cart RAM.
-5. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
+4. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
    (RGBDS toolchain needed to build them from source; wasn't readily
    available as a binary this session).
-6. **GBC support and sound** — explicitly deprioritized per the person's
+5. **GBC support and sound** — explicitly deprioritized per the person's
    direction earlier this session; sound especially can wait until
    everything else is solid.
-7. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
+6. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
    flat, fully-resident pointer with no partial loading — fine for the
    large majority of the GB/GBC library (32KB-512KB), but the small
    number of very large late-era GBC games (up to 4-8MB) won't fit
    resident in the PS1's 2MB of RAM. Only worth doing if support for
    those specific large titles is wanted; most of the library doesn't
    need it.
+7. **8x16 sprite mode** (`LCDC` bit 2) isn't supported — `DrawOBJline`'s
+   line-range check assumes 8-tall sprites only. Most GB/GBC games use
+   8x8 sprites predominantly; a real, separate gap if a specific game
+   needs tall-sprite mode.
 
 ## Known limitation: instr_timing.gb
 
