@@ -643,19 +643,37 @@ void DrawOBJline(int line, int TILEaddr) {
 		tileNo = OAMRAM[pos + 2] & 0xFF;
 		bflag = OAMRAM[pos + 3] & 0xFF;
 		if (( bx != 0x00 && by != 0x00) && (by <=line + 16) && (by > line + (16 - 8))) {  // 8/16
-			B1 = (unsigned char)ReadMEM(TILEaddr + ((tileNo) * 16)  );
-		    B2 = (unsigned char)ReadMEM(TILEaddr + ((tileNo) * 16) + 1 );
+			// BUG FIX (severe): this always fetched row 0 of the tile
+			// (offset +0/+1) no matter which of the sprite's 8 scanlines
+			// was actually being drawn - every row of every sprite showed
+			// the same top row repeated, instead of each scanline showing
+			// its own row of the tile. Real hardware picks the row from
+			// how far into the sprite's height the current scanline
+			// (`line`) is; Y-flip (iflipy, computed below) just mirrors
+			// which row that ends up being.
+			iflipy = (bflag & 0x40) == 0x40;
+			int spriteRow = line - (by - 16);
+			if (iflipy) {
+				spriteRow = 7 - spriteRow;
+			}
+			B1 = (unsigned char)ReadMEM(TILEaddr + ((tileNo) * 16) + spriteRow * 2 );
+			B2 = (unsigned char)ReadMEM(TILEaddr + ((tileNo) * 16) + spriteRow * 2 + 1 );
 
 			iflipx = (bflag & 0x20) == 0x20;
-			iflipy = (bflag & 0x40) == 0x40;
 			ipal   = (bflag & 0x10) == 0x10;
 
 			//Hidden (Priority Bit 7)
 
 			for (j = 0; j < 8; j++) {
 
-				if (((B1 >> (7-j)) & 0x01) == 0x01) {
-					if (((B2 >> (7-j)) & 0x01) == 0x01) {
+				// BUG FIX: X-flip was computed above but never actually
+				// applied anywhere - reading bit (7-j) unconditionally
+				// always drew sprites in their normal orientation
+				// regardless of the flip flag. Flipping horizontally
+				// just means reading bit j itself instead of its mirror.
+				int bit = iflipx ? j : (7 - j);
+				if (((B1 >> bit) & 0x01) == 0x01) {
+					if (((B2 >> bit) & 0x01) == 0x01) {
 						if (ipal) { // Use OBJPAL1
 								colour = (OBJPAL1 >>6) & 0x3; //3;
 						} else {
@@ -668,7 +686,7 @@ void DrawOBJline(int line, int TILEaddr) {
 								colour = (OBJPAL0 >>4) & 0x3;
 						}
 					}
-				} else if (((B2 >> (7-j)) & 0x01) == 0x01) {
+				} else if (((B2 >> bit) & 0x01) == 0x01) {
 						if (ipal) { // Use OBJPAL1
 								colour = (OBJPAL1 >>2) & 0x3; //3;
 						} else {
@@ -699,13 +717,19 @@ void vblank(void){
 		FRAMECOUNT++;
 		if ((LCDCONTROL >> 7) == 0x01) { // LCD ON
 
+			// BUG FIX: Draw_Buffer (via DrawBG()) was only ever called
+			// when BG rendering was ALSO enabled (LCDCONTROL bit 0) -
+			// meaning a game that turns off BG but leaves sprites on
+			// (a real, legal combination - DMG software occasionally
+			// does this deliberately) would have hblank() correctly draw
+			// sprite pixels into screenBuffer all frame, then never
+			// actually present that frame at all, every single VBlank.
+			// The frame should be presented whenever the LCD itself is
+			// on, regardless of which specific layers are enabled.
+			PrepScreen();
+			DrawBG();
+			RenderWorld(0,0,0);
 
-
-				if((LCDCONTROL & 0x01) == 0x01) {
-					PrepScreen();
-					DrawBG();
-					RenderWorld(0,0,0);
-				}
 				//if(((LCDCONTROL >> 5) & 0x01) == 0x01) {
 				//	DrawWindow();
 				//}

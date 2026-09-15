@@ -126,7 +126,7 @@ int main(int argc, char **argv) {
         // that Blargg's ROMs drop into once they've printed their result.
         if (reg_PC == lastPC) {
             stuckCount++;
-            if (stuckCount > 1000) {
+            if (stuckCount > 1000 && !getenv("NOSTUCK")) {
                 fprintf(stderr, "\n[harness] CPU parked at PC=%04X after %ld instructions - test complete.\n", reg_PC, i);
                 break;
             }
