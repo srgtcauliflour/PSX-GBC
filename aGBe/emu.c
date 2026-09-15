@@ -70,9 +70,17 @@ BYTE P1;
 BYTE TIMEMOD, TIMCONT;
 int TIMECNT;
 int MAXTIME, TIMECOUNTER;
-int ROMBANKNUMBER = 0;// For MBC1 and MBC2
+int ROMBANKNUMBER = 1;// Bank register powers on selecting bank 1 (MBC1/2/3/5)
 int RAMBANKNUMBER = 0;
 int MBCMODE = 0;
+int RAMENABLED = 0; // Cart RAM $A000-$BFFF gate: enabled by writing 0x0A to $0000-$1FFF
+BYTE SERIALDATA = 0xFF;   // $FF01 SB - Serial transfer data
+BYTE SERIALCONTROL = 0;  // $FF02 SC - Serial transfer control
+// MBC3 Real-Time Clock
+BYTE RTCSELECT = 0;      // Which RTC register (0x08-0x0C) is mapped at $A000-$BFFF, 0 = none/RAM
+BYTE RTCLATCH = 0xFF;    // Tracks the 0x00->0x01 latch write sequence
+BYTE RTC_S, RTC_M, RTC_H, RTC_DL, RTC_DH;          // Live RTC registers
+BYTE RTCL_S, RTCL_M, RTCL_H, RTCL_DL, RTCL_DH;     // Latched (readable) copies
 //char pauseData[6][10]={ "Continue", "Save", "Load", "Reset", "Options", "Exit" };
 
 BYTE ROMSIZE, CARTTYPE, RAMSIZE, VERSIONNUMBER;
@@ -88,8 +96,9 @@ void reset_Z80() {
 		#endif
 		Allocate_Memory();
 		EMULATING =  1;
-		ROMBANKNUMBER = 0;
+		ROMBANKNUMBER = 1;
 		RAMBANKNUMBER = 0;
+		RAMENABLED = 0;
 		// Set Registers
 		reg_HL= 0x014D;
 		reg_SP= 0xFFFE;
@@ -112,6 +121,10 @@ void reset_Z80() {
 		TIMECOUNTER = 0;
 		TIMECNT = 0;
 		TIMCONT = 0;
+		RTCSELECT = 0;
+		RTCLATCH = 0xFF;
+		SERIALDATA = 0xFF;
+		SERIALCONTROL = 0x00;
 		MBCMODE = 0;
 }
 
@@ -132,7 +145,11 @@ BYTE get_rL(void) {
 }
 void put_rAF(WORD r1) {
 	reg_A = (r1 >> 8) & 0xFF;
-	reg_F = r1 & 0xFF;
+	// BUG FIX: the low nibble of F is hardwired to 0 on real hardware - it can
+	// never be set, including by POP AF popping garbage off the stack. Games
+	// (and test ROMs) that check flags right after POP AF would see phantom
+	// flag bits without this mask.
+	reg_F = r1 & 0xF0;
 }
 void put_rBC(WORD r1) {
 	reg_B = (r1 >> 8) & 0xFF;
@@ -219,7 +236,14 @@ void Allocate_Memory(void){
 	VRAM   = (BYTE *)malloc(8 * 1024 * sizeof(BYTE));
 	RAM    = (BYTE *)malloc(8 * 1024 * sizeof(BYTE)); //TODO: Check this out
 	OAMRAM = (BYTE *)malloc(160 * sizeof(BYTE));
-	EXTRNRAM = (BYTE *)malloc(iRAMSIZE * 1024 * sizeof(BYTE));
+	// MBC2 has 512x4-bit RAM built into the mapper itself; the cart header's RAMSIZE
+	// byte is 0 for these carts, so without this the buffer below would be 0 bytes
+	// while WriteMEM/ReadMEM still index into it for $A000-$BFFF.
+	if ((CARTTYPE == 0x05) || (CARTTYPE == 0x06)) {
+		EXTRNRAM = (BYTE *)malloc(512 * sizeof(BYTE));
+	} else {
+		EXTRNRAM = (BYTE *)malloc((iRAMSIZE ? iRAMSIZE : 1) * 1024 * sizeof(BYTE));
+	}
 }
 
 void UnAllocate_Memory(void){
@@ -236,6 +260,25 @@ void UnAllocate_Memory(void){
 	free(OAMRAM);
 	free(EXTRNRAM);
 
+}
+
+// Called whenever the game writes to SC ($FF02). No real Link Cable / multitap
+// support exists yet, so a requested internal-clock transfer completes immediately
+// with 0xFF read back (as real hardware would with nothing plugged into the port),
+// and the Serial interrupt fires. SerialByteSentHook (if set by the host/harness)
+// is given the outgoing byte first -- this is what test ROMs (e.g. Blargg's) use
+// to print their pass/fail text, and is also the natural place to eventually hang
+// a real PSX-side link cable / debug console feature.
+void (*SerialByteSentHook)(BYTE b) = 0;
+void onSerialControlWrite(void) {
+	if (SERIALCONTROL & 0x80) {
+		if (SerialByteSentHook) SerialByteSentHook(SERIALDATA);
+		if (SERIALCONTROL & 0x01) { // internal clock: PSX side is the 'master' with nothing attached
+			SERIALDATA = 0xFF;
+			SERIALCONTROL &= ~0x80;
+			IFLAG |= 0x08; // Bit 3: Serial I/O transfer end
+		}
+	}
 }
 
 void doDMA(BYTE addr) {
@@ -718,12 +761,27 @@ BYTE ReadMEM(WORD loc) {
 		if ( loc < 0xA000 ) { // $8000-$9FFF - VRAM
 			return VRAM[loc - 0x8000];
 		}
-		if ( loc < 0xC000 ) { // $A000-$BFFF - External (cartridge) RAM
-			if (MBCMODE) { // 4/32 mode
-				return EXTRNRAM[loc - 0xA000 + (WORD)(RAMBANKNUMBER * 0x2000)];
-			} else {
-				return EXTRNRAM[loc - 0xA000 ];
+		if ( loc < 0xC000 ) { // $A000-$BFFF - External (cartridge) RAM / MBC3 RTC
+			if (( CARTTYPE >= 0x0F ) && ( CARTTYPE <= 0x13 ) && ( RTCSELECT >= 0x08 )) {
+				switch (RTCSELECT) {
+					case 0x08: return RTCL_S;  break;
+					case 0x09: return RTCL_M;  break;
+					case 0x0A: return RTCL_H;  break;
+					case 0x0B: return RTCL_DL; break;
+					case 0x0C: return RTCL_DH; break;
+					default: return 0xFF; break;
+				}
 			}
+			if (!RAMENABLED) { return 0xFF; } // Real hardware reads open bus (~0xFF) while RAM is disabled
+			if (( CARTTYPE == 0x01 ) || ( CARTTYPE == 0x02) || ( CARTTYPE == 0x03 )) {
+				if (MBCMODE) { // 4/32 mode
+					return EXTRNRAM[loc - 0xA000 + (WORD)(RAMBANKNUMBER * 0x2000)];
+				} else {
+					return EXTRNRAM[loc - 0xA000 ];
+				}
+			}
+			// MBC2/3/5 - always bank via RAMBANKNUMBER
+			return EXTRNRAM[loc - 0xA000 + (WORD)(RAMBANKNUMBER * 0x2000)];
 		}
 		if ( loc < 0xE000 ) { // $C000-$DFFF - Internal RAM
 			return RAM[loc - 0xC000];
@@ -739,8 +797,8 @@ BYTE ReadMEM(WORD loc) {
 
 			switch (loc) {
 				case 0xFF00: return (BYTE)P1; break; // P1 (R/W)
-				case 0xFF01: break; // Serial transfer data (R/W)
-				case 0xFF02: break; // SIO control  (R/W)
+				case 0xFF01: return (BYTE)SERIALDATA; break; // Serial transfer data (R/W)
+				case 0xFF02: return (BYTE)(SERIALCONTROL | 0x7E); break; // SIO control (R/W), unused bits read as 1
 				case 0xFF04: break; // Divider Register (R/W)
 				case 0xFF05: return (BYTE)TIMECNT; break;// Timer counter (R/W)
 				case 0xFF06: return (BYTE)TIMEMOD; break;// Timer Modulo (R/W)
@@ -800,62 +858,111 @@ BYTE ReadMEM(WORD loc) {
 }
 
 void WriteMEM(WORD loc, BYTE b){
-   	if	  ( ( loc <= 0x3FFF)) {
-
-		if ( loc >= 0x2000) {
-
-			// MBC1
-			if (( CARTTYPE == 0x01 ) || ( CARTTYPE == 0x02) || ( CARTTYPE == 0x03 )) {
-				//This is MBC1
-				if (!b) b = 1;
-				ROMBANKNUMBER = (b & 0x1F);
-				#if defined(DEBUG)
-				printf("Switching MBC1 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
-				#endif
-			}
-			// MBC2
-			if (( CARTTYPE == 0x05 ) || ( CARTTYPE == 0x06 )) {
-				if (!b) b = 1;
-				ROMBANKNUMBER = (b & 0x0F);
-				#if defined(DEBUG)
-				printf("Switching MBC2 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
-				#endif
-			}
-
+	if ( loc <= 0x1FFF ) { // $0000-$1FFF - RAM Enable (MBC1/2/3/5)
+		if (CARTTYPE != 0x00) {
+			RAMENABLED = ((b & 0x0F) == 0x0A);
 		}
-	} else if ( ( loc >= 0x4000 ) && ( loc <= 0x7FFF ) ) { // $4000-$7FFF - ROM Bank n
-		if ( loc <= 0x5FFF ) { //TODO: Add Test for MBC1
+	} else if ( loc <= 0x3FFF ) { // $2000-$3FFF - ROM Bank number (low bits)
+		// MBC1
+		if (( CARTTYPE == 0x01 ) || ( CARTTYPE == 0x02) || ( CARTTYPE == 0x03 )) {
+			if (!b) b = 1;
+			ROMBANKNUMBER = (ROMBANKNUMBER & ~0x1F) | (b & 0x1F);
+			#if defined(DEBUG)
+			printf("Switching MBC1 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
+			#endif
+		}
+		// MBC2
+		if (( CARTTYPE == 0x05 ) || ( CARTTYPE == 0x06 )) {
+			if (!b) b = 1;
+			ROMBANKNUMBER = (b & 0x0F);
+			#if defined(DEBUG)
+			printf("Switching MBC2 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
+			#endif
+		}
+		// MBC3 - full 7-bit bank number in one write, bank 0 -> bank 1 quirk (same as MBC1)
+		if (( CARTTYPE >= 0x0F ) && ( CARTTYPE <= 0x13 )) {
+			if (!b) b = 1;
+			ROMBANKNUMBER = (b & 0x7F);
+			#if defined(DEBUG)
+			printf("Switching MBC3 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
+			#endif
+		}
+		// MBC5 - 9-bit bank number split across two write windows, NO bank-0 quirk
+		if (( CARTTYPE >= 0x19 ) && ( CARTTYPE <= 0x1E )) {
+			if (loc <= 0x2FFF) { // low 8 bits
+				ROMBANKNUMBER = (ROMBANKNUMBER & 0x100) | b;
+			} else { // $3000-$3FFF - bit 8
+				ROMBANKNUMBER = (ROMBANKNUMBER & 0x0FF) | ((b & 0x01) << 8);
+			}
+			#if defined(DEBUG)
+			printf("Switching MBC5 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
+			#endif
+		}
+	} else if ( ( loc >= 0x4000 ) && ( loc <= 0x7FFF ) ) { // $4000-$7FFF - RAM Bank / upper ROM bits / RTC select
+		if ( loc <= 0x5FFF ) {
+			// MBC1 - in 4/32 mode, these 2 bits pick the RAM bank; in 16/8 mode they're the
+			// two high bits of a >512KB ROM's bank number instead (rare; not yet modelled).
 			if (( CARTTYPE == 0x01 ) || ( CARTTYPE == 0x02) || ( CARTTYPE == 0x03 )) {
 				if (MBCMODE) {
 					RAMBANKNUMBER = (b & 0x03);
 				} else {
-					#if defined(DEBUG)
-						printf("I dont know.. Set the two most significant ROM Adress Lines!");
-					#endif
+					ROMBANKNUMBER = (ROMBANKNUMBER & 0x1F) | ((b & 0x03) << 5);
 				}
 			}
+			// MBC3 - $00-$03 selects a RAM bank; $08-$0C selects an RTC register to map instead
+			if (( CARTTYPE >= 0x0F ) && ( CARTTYPE <= 0x13 )) {
+				if (b <= 0x03) {
+					RAMBANKNUMBER = b;
+					RTCSELECT = 0;
+				} else if ((b >= 0x08) && (b <= 0x0C)) {
+					RTCSELECT = b;
+				}
+			}
+			// MBC5 - full 4-bit RAM bank number (bit 3 doubles as the rumble motor on +RUMBLE carts;
+			// rumble output isn't emulated, so it's harmlessly ignored here)
+			if (( CARTTYPE >= 0x19 ) && ( CARTTYPE <= 0x1E )) {
+				RAMBANKNUMBER = (b & 0x0F);
+			}
 			#if defined(DEBUG)
-				printf("Switching RAM MBC1 to %d. [PC: %04X | LOC: %04X]\n", b, reg_PC, loc);
+			printf("RAM/RTC select %d. [PC: %04X | LOC: %04X]\n", b, reg_PC, loc);
 			#endif
-			RAMBANKNUMBER = b;
-		} else {
-			if (b & 0x01) {
+		} else { // $6000-$7FFF
+			// MBC1 mode select
+			if (( CARTTYPE == 0x01 ) || ( CARTTYPE == 0x02) || ( CARTTYPE == 0x03 )) {
+				MBCMODE = (b & 0x01);
 				#if defined(DEBUG)
-					printf("4/32 Memory mode selected\n");
+				printf(MBCMODE ? "4/32 Memory mode selected\n" : "16/8 Memory mode selected\n");
 				#endif
-				MBCMODE = 1;
-			} else {
-				#if defined(DEBUG)
-					printf("16/8 Memory mode selected\n");
-				#endif
-				MBCMODE = 0;
+			}
+			// MBC3 RTC latch: a 0x00 write followed by a 0x01 write copies the live
+			// RTC_* registers into the RTCL_* latched copies that games actually read.
+			if (( CARTTYPE >= 0x0F ) && ( CARTTYPE <= 0x10 )) {
+				if ((RTCLATCH == 0x00) && (b == 0x01)) {
+					RTCL_S = RTC_S; RTCL_M = RTC_M; RTCL_H = RTC_H;
+					RTCL_DL = RTC_DL; RTCL_DH = RTC_DH;
+				}
+				RTCLATCH = b;
 			}
 		}
-
 	} else if ( ( loc >= 0x8000 ) &&  ( loc <= 0x9FFF ) ) { // $8000-$9FFF VRAM
 		VRAM[loc - 0x8000] = b;
-	} else if ( ( loc >= 0xA000 ) &&  ( loc <= 0xBFFF ) ) { // $A000-$BFFF - External (cartridge) RAM
-		EXTRNRAM[loc - 0xA000] = b;
+	} else if ( ( loc >= 0xA000 ) &&  ( loc <= 0xBFFF ) ) { // $A000-$BFFF - External (cartridge) RAM / MBC3 RTC
+		if (( CARTTYPE >= 0x0F ) && ( CARTTYPE <= 0x13 ) && ( RTCSELECT >= 0x08 )) {
+			switch (RTCSELECT) {
+				case 0x08: RTC_S  = b; break;
+				case 0x09: RTC_M  = b; break;
+				case 0x0A: RTC_H  = b; break;
+				case 0x0B: RTC_DL = b; break;
+				case 0x0C: RTC_DH = b; break;
+			}
+		} else if (RAMENABLED) {
+			if (( CARTTYPE == 0x01 ) || ( CARTTYPE == 0x02) || ( CARTTYPE == 0x03 )) {
+				if (MBCMODE) { EXTRNRAM[loc - 0xA000 + (WORD)(RAMBANKNUMBER * 0x2000)] = b; }
+				else { EXTRNRAM[loc - 0xA000] = b; }
+			} else {
+				EXTRNRAM[loc - 0xA000 + (WORD)(RAMBANKNUMBER * 0x2000)] = b;
+			}
+		}
 	} else if ( ( loc >= 0xC000 ) &&  ( loc <= 0xDFFF ) ) { // $C000-$DFFF - Internal RAM
 		RAM[loc - 0xC000] = b;
 	} else if ( ( loc >= 0xE000 ) &&  ( loc <= 0xFDFF ) ) { // $E000-$FDFF - Reserved Area/Echo RAM
@@ -891,8 +998,8 @@ void WriteMEM(WORD loc, BYTE b){
 						 }
 					}
 					break;
-			case 0xFF01: break; // Serial transfer data (R/W)
-			case 0xFF02: break; // SIO control  (R/W)
+			case 0xFF01: SERIALDATA = b; break; // Serial transfer data (R/W)
+			case 0xFF02: SERIALCONTROL = b; onSerialControlWrite(); break; // SIO control (R/W)
 			case 0xFF04: break; // Divider Register (R/W)
 			case 0xFF05: TIMECNT = b; break; // Timer counter (R/W)
 			case 0xFF06: TIMEMOD = b; break; // Timer Modulo (R/W)
@@ -1220,10 +1327,24 @@ void OP26(void){ // case  0x26:
 	cycleLength(8);
 } // 26    LD   H,nn
 
-void OP27(void){
-	printf("Incomplete Opcode 27\n");
+void OP27(void){ // DAA - decimal-adjust A after a BCD add/subtract.
+	// This was a total no-op stub before (never adjusted A, never touched any
+	// flag) - any game or test doing BCD math (score counters, some timers/
+	// currency logic) using ADD/SUB followed by DAA would get a plain binary
+	// result instead of the corrected BCD one.
+	int a = reg_A;
+	if (!getN()) {
+		if (getC() || a > 0x99) { a += 0x60; setC(1); }
+		if (getH() || (a & 0x0F) > 0x09) { a += 0x06; }
+	} else {
+		if (getC()) { a -= 0x60; }
+		if (getH()) { a -= 0x06; }
+	}
+	reg_A = (BYTE)(a & 0xFF);
+	setZ(reg_A == 0);
+	setH(0);
 	cycleLength(4);
-}// case  27? cycleLength(4);
+} // 27    DAA
 
 void OP28(void){ // case  0x28:
 	if (getZ()) {
@@ -2354,3 +2475,43 @@ void CBFD(void) {  put_rL(SET(7, get_rL())); } // CBFD	 	SET 7,L
 void CBFE(void) {  WriteMEM(reg_HL, SET(7, ReadMEM(reg_HL))); } // CBFE	 	SET 7,(HL)
 void CBFF(void) {  reg_A = SET(7, reg_A); } // CBFF	 	SET 7,A
 
+// Opcode dispatch tables. These are real (initialized) definitions, so they
+// live in exactly one translation unit; emu.h only carries the extern
+// declarations. (Previously the initialized arrays lived directly in the
+// header, which happened to work only because emu.h was never included by
+// more than one .c file - the moment a second file includes it, e.g. a
+// test harness or a future split of emu.c, the linker sees two definitions
+// of the same symbol and fails.)
+funcPtr instructions[]= {OP00, OP01, OP02, OP03, OP04, OP05, OP06, OP07, OP08, OP09, OP0A, OP0B, OP0C, OP0D, OP0E, OP0F,
+						 OP10, OP11, OP12, OP13, OP14, OP15, OP16, OP17, OP18, OP19, OP1A, OP1B, OP1C, OP1D, OP1E, OP1F,
+						 OP20, OP21, OP22, OP23, OP24, OP25, OP26, OP27, OP28, OP29, OP2A, OP2B, OP2C, OP2D, OP2E, OP2F,
+						 OP30, OP31, OP32, OP33, OP34, OP35, OP36, OP37, OP38, OP39, OP3A, OP3B, OP3C, OP3D, OP3E, OP3F,
+						 OP40, OP41, OP42, OP43, OP44, OP45, OP46, OP47, OP48, OP49, OP4A, OP4B, OP4C, OP4D, OP4E, OP4F,
+						 OP50, OP51, OP52, OP53, OP54, OP55, OP56, OP57, OP58, OP59, OP5A, OP5B, OP5C, OP5D, OP5E, OP5F,
+						 OP60, OP61, OP62, OP63, OP64, OP65, OP66, OP67, OP68, OP69, OP6A, OP6B, OP6C, OP6D, OP6E, OP6F,
+						 OP70, OP71, OP72, OP73, OP74, OP75, OP76, OP77, OP78, OP79, OP7A, OP7B, OP7C, OP7D, OP7E, OP7F,
+						 OP80, OP81, OP82, OP83, OP84, OP85, OP86, OP87, OP88, OP89, OP8A, OP8B, OP8C, OP8D, OP8E, OP8F,
+						 OP90, OP91, OP92, OP93, OP94, OP95, OP96, OP97, OP98, OP99, OP9A, OP9B, OP9C, OP9D, OP9E, OP9F,
+						 OPA0, OPA1, OPA2, OPA3, OPA4, OPA5, OPA6, OPA7, OPA8, OPA9, OPAA, OPAB, OPAC, OPAD, OPAE, OPAF,
+						 OPB0, OPB1, OPB2, OPB3, OPB4, OPB5, OPB6, OPB7, OPB8, OPB9, OPBA, OPBB, OPBC, OPBD, OPBE, OPBF,
+						 OPC0, OPC1, OPC2, OPC3, OPC4, OPC5, OPC6, OPC7, OPC8, OPC9, OPCA, OPCB, OPCC, OPCD, OPCE, OPCF,
+						 OPD0, OPD1, OPD2, OPD3, OPD4, OPD5, OPD6, OPD7, OPD8, OPD9, OPDA, OPDB, OPDC, OPDD, OPDE, OPDF,
+						 OPE0, OPE1, OPE2, OPE3, OPE4, OPE5, OPE6, OPE7, OPE8, OPE9, OPEA, OPEB, OPEC, OPED, OPEE, OPEF,
+						 OPF0, OPF1, OPF2, OPF3, OPF4, OPF5, OPF6, OPF7, OPF8, OPF9, OPFA, OPFB, OPFC, OPFD, OPFE, OPFF};
+
+funcPtr CBinst[]= { CB00, CB01, CB02, CB03, CB04, CB05, CB06, CB07, CB08, CB09, CB0A, CB0B, CB0C, CB0D, CB0E, CB0F,
+						 CB10, CB11, CB12, CB13, CB14, CB15, CB16, CB17, CB18, CB19, CB1A, CB1B, CB1C, CB1D, CB1E, CB1F,
+						 CB20, CB21, CB22, CB23, CB24, CB25, CB26, CB27, CB28, CB29, CB2A, CB2B, CB2C, CB2D, CB2E, CB2F,
+						 CB30, CB31, CB32, CB33, CB34, CB35, CB36, CB37, CB38, CB39, CB3A, CB3B, CB3C, CB3D, CB3E, CB3F,
+						 CB40, CB41, CB42, CB43, CB44, CB45, CB46, CB47, CB48, CB49, CB4A, CB4B, CB4C, CB4D, CB4E, CB4F,
+						 CB50, CB51, CB52, CB53, CB54, CB55, CB56, CB57, CB58, CB59, CB5A, CB5B, CB5C, CB5D, CB5E, CB5F,
+						 CB60, CB61, CB62, CB63, CB64, CB65, CB66, CB67, CB68, CB69, CB6A, CB6B, CB6C, CB6D, CB6E, CB6F,
+						 CB70, CB71, CB72, CB73, CB74, CB75, CB76, CB77, CB78, CB79, CB7A, CB7B, CB7C, CB7D, CB7E, CB7F,
+						 CB80, CB81, CB82, CB83, CB84, CB85, CB86, CB87, CB88, CB89, CB8A, CB8B, CB8C, CB8D, CB8E, CB8F,
+						 CB90, CB91, CB92, CB93, CB94, CB95, CB96, CB97, CB98, CB99, CB9A, CB9B, CB9C, CB9D, CB9E, CB9F,
+						 CBA0, CBA1, CBA2, CBA3, CBA4, CBA5, CBA6, CBA7, CBA8, CBA9, CBAA, CBAB, CBAC, CBAD, CBAE, CBAF,
+						 CBB0, CBB1, CBB2, CBB3, CBB4, CBB5, CBB6, CBB7, CBB8, CBB9, CBBA, CBBB, CBBC, CBBD, CBBE, CBBF,
+						 CBC0, CBC1, CBC2, CBC3, CBC4, CBC5, CBC6, CBC7, CBC8, CBC9, CBCA, CBCB, CBCC, CBCD, CBCE, CBCF,
+						 CBD0, CBD1, CBD2, CBD3, CBD4, CBD5, CBD6, CBD7, CBD8, CBD9, CBDA, CBDB, CBDC, CBDD, CBDE, CBDF,
+						 CBE0, CBE1, CBE2, CBE3, CBE4, CBE5, CBE6, CBE7, CBE8, CBE9, CBEA, CBEB, CBEC, CBED, CBEE, CBEF,
+						 CBF0, CBF1, CBF2, CBF3, CBF4, CBF5, CBF6, CBF7, CBF8, CBF9, CBFA, CBFB, CBFC, CBFD, CBFE, CBFF};

@@ -1,36 +1,55 @@
 #include "main.h"
 #include "opcodes.h"
+// Previously missing: every flag setter/getter (setZ/setN/setH/setC/getZ...)
+// and ReadMEM/WriteMEM used below were only ever implicitly declared. Lenient
+// old compilers (and GCC with warnings suppressed) tolerate that, but it's
+// undefined behaviour, and a modern strict cross-compiler for the real PSX
+// port is liable to either hard-error on it or -- worse -- silently
+// miscompile a call whose real signature doesn't match the assumed
+// "implicit int" one.
+#include "emu.h"
 
 BYTE INCreg(BYTE reg){
-	int a = reg + 1; //reg = INC(reg);
-	//setC(a != (a & 0xFF));
-	if (a==0) { setZ(1); } else { setZ(0); }
+	// BUG FIX: Z was previously tested against the pre-mask int value, which can
+	// never be 0 for an 8-bit INC (0xFF+1=256, not 0) - so Z never got set on the
+	// 0xFF->0x00 wraparound. Any code using the extremely common "INC r / JR Z or
+	// NZ" pattern to run a 256-iteration loop (checksum/copy/delay loops, etc.)
+	// would spin forever. Masking before the comparison is the actual fix.
+	// Also restores the H flag, which this never set at all: real hardware sets
+	// H when the low nibble overflows (i.e. it was 0xF before the increment).
+	int a = reg + 1;
+	setH((reg & 0x0F) == 0x0F);
+	if ((a & 0xFF) == 0) { setZ(1); } else { setZ(0); }
 	setN(0);
-	return (BYTE)a & 0xFF;
+	return (BYTE)(a & 0xFF);
 }
 
 BYTE DECreg(BYTE reg){
+	// Same class of fix as INCreg for consistency/H flag; the Z check here
+	// happened to already be correct since reg-1 can only be negative (never
+	// exactly 0) when it *shouldn't* set Z, but is corrected to compare the
+	// masked result on principle, matching hardware behaviour exactly.
 	int a = reg - 1;
-	//reg -= 1 ;  DEC(reg);
-	//setC(a != (a & 0xFF));
-	if (a==0) { setZ(1); } else { setZ(0); }
+	setH((reg & 0x0F) == 0x00);
+	if ((a & 0xFF) == 0) { setZ(1); } else { setZ(0); }
 	setN(1);
 	return (BYTE)(a & 0xFF);
 }
 
 WORD INCWreg(WORD reg){
+	// BUG FIX: real Game Boy hardware's 16-bit INC (INC BC/DE/HL/SP) affects NO
+	// flags at all. This was incorrectly setting Z/N, corrupting flags that the
+	// following instruction may depend on (e.g. code doing "INC HL" purely for
+	// pointer arithmetic between a comparison and its conditional jump).
 	reg += 1;
 	reg &= 0xFFFF;
-	if (reg==0) { setZ(1); } else { setZ(0); }
-	setN(0);
 	return (WORD)reg;
 }
 
 WORD DECWreg(WORD reg){
+	// Same fix as INCWreg: 16-bit DEC (DEC BC/DE/HL/SP) affects no flags either.
 	reg -= 1;
 	reg &= 0xFFFF;
-	if (reg==0) { setZ(1); } else { setZ(0); }
-	setN(1);
 	return (WORD)reg;
 }
 
