@@ -22,7 +22,7 @@
 #include "psx.h"
 #include "emu.h"
 
-// ---- PSX SDK stand-ins (only what the core touches) ------------------
+// ---- Platform hooks (see psx-stubs) ----
 unsigned long PadRead(int pad_num) { (void)pad_num; return 0; }
 void PadInit(int mode) { (void)mode; }
 void Draw_Buffer(int *screenBuffer) { (void)screenBuffer; }
@@ -30,6 +30,12 @@ void Draw_Buffer_SPRT(int *screenBuffer) { (void)screenBuffer; }
 void Draw_Buffer_Pixel_Blitting(int *screenBuffer) { (void)screenBuffer; }
 void PrepScreen(void) {}
 void RenderWorld(BYTE re, BYTE gr, BYTE bl) { (void)re; (void)gr; (void)bl; }
+
+// The one real (defining) declaration of ROM/pad/lastpad for this host
+// build - psx.h/pad.h only extern-declare them now (see the BUG FIX notes
+// in those headers), same as the real psx.c would provide on target.
+BYTE *ROM;
+u_long pad, lastpad;
 
 // ---- Serial-port capture (this is how Blargg's test ROMs report PASS/FAIL) --
 static char serial_log[65536];

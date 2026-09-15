@@ -56,43 +56,57 @@ WORD DECWreg(WORD reg){
 
 BYTE ADDreg(BYTE regA, BYTE regB){
 	// BUG FIX: H (half-carry, carry out of bit 3) was never set at all.
+	// Also: Z was checked against the unmasked sum, which can be exactly
+	// 256 (e.g. 0x01+0xFF) - 256 != 0 but the real 8-bit result is, so Z
+	// was wrongly left clear in that case. Same class of bug as the
+	// original INCreg wraparound fix earlier this session.
 	int a = regA + regB;
 	setH(((regA & 0x0F) + (regB & 0x0F)) > 0x0F);
 	setC(a != (a & 0xFF));
-	if (a==0) { setZ(1); } else { setZ(0); }
+	if ((a & 0xFF)==0) { setZ(1); } else { setZ(0); }
 	setN(0);
 	return (BYTE)a & 0xFF;
 }
 
 BYTE ADCreg(BYTE regA, BYTE regB){
 	// BUG FIX: H never set; also has to include the incoming carry bit in the
-	// half-carry calculation, not just regA/regB.
+	// half-carry calculation, not just regA/regB. Also same unmasked-Z bug
+	// as ADDreg above (reachable here too, e.g. 0x00+0xFF+carry-in-1).
 	int carryIn = getC();
 	int a = regA + regB + carryIn;
 	setH(((regA & 0x0F) + (regB & 0x0F) + carryIn) > 0x0F);
 	setC(a != (a & 0xFF));
-	if (a==0) { setZ(1); } else { setZ(0); }
+	if ((a & 0xFF)==0) { setZ(1); } else { setZ(0); }
 	setN(0);
 	return (BYTE)a & 0xFF;
 }
 
 BYTE SUBreg(BYTE regA, BYTE regB){
-	// BUG FIX: H (borrow out of bit 4) was never set at all.
+	// BUG FIX: H (borrow out of bit 4) was never set at all. (The Z check
+	// below is masked defensively for consistency with ADD/ADC/SBC, though
+	// plain SUB's range - regA/regB both single bytes, no carry-in - can
+	// never actually reach the +-256 edge case that makes the distinction
+	// matter.)
 	int a = regA - regB;
 	setH((regA & 0x0F) < (regB & 0x0F));
 	setC(a != (a & 0xFF));
-	if (a==0) { setZ(1); } else { setZ(0); }
+	if ((a & 0xFF)==0) { setZ(1); } else { setZ(0); }
 	setN(1);
 	return (BYTE)a & 0xFF;
 }
 
 BYTE SBCreg(BYTE regA, BYTE regB){
 	// BUG FIX: H never set; must include the incoming carry/borrow bit.
+	// Also the same unmasked-Z bug as ADDreg/ADCreg: SBC can reach exactly
+	// -256 (e.g. 0x00 - 0xFF - 1), which is a real Z-worthy zero result
+	// but != 0 unmasked - confirmed via a full sweep (8 A values x 256 n
+	// values x both carry states) diffed against a reference GB core,
+	// which caught this exact case (A=0x00, n=0xFF, carry=1).
 	int carryIn = getC();
 	int a = regA - regB - carryIn;
 	setH((int)(regA & 0x0F) - (int)(regB & 0x0F) - carryIn < 0);
 	setC(a != (a & 0xFF));
-	if (a==0) { setZ(1); } else { setZ(0); }
+	if ((a & 0xFF)==0) { setZ(1); } else { setZ(0); }
 	setN(1);
 	return (BYTE)a & 0xFF;
 }
@@ -215,10 +229,15 @@ BYTE RR(BYTE reg) {
 	return (BYTE)a & 0xFF;
 }
 BYTE SLA(BYTE reg) {
+	// BUG FIX: H was never cleared - real hardware always clears H (and N)
+	// for SLA, leaving whatever a prior op left in H otherwise. Also the
+	// same unmasked-Z bug as ADDreg/ADCreg/SBCreg: reg=0x80 shifts to 0x100
+	// unmasked, which is a real Z-worthy zero result but != 0 unmasked.
 	int a = (reg << 1);
 	setC( a != (a & 0xFF));
-	if (a==0) { setZ(1); } else { setZ(0); }
+	if ((a & 0xFF)==0) { setZ(1); } else { setZ(0); }
 	setN(0);
+	setH(0);
 	return (BYTE)a & 0xFF;
 }
 BYTE SRA(BYTE reg) {
@@ -239,10 +258,12 @@ BYTE SLL(BYTE reg) {
 }
 
 BYTE SRL(BYTE reg) {
+	// BUG FIX: H was never cleared here either - same class of leak as SLA.
 	setC(reg & 0x01);
 	reg = reg >> 1;
 	if (reg==0) { setZ(1); } else { setZ(0); }
 	setN(0);
+	setH(0);
 	return reg & 0xFF;
 }
 BYTE SET(int i, BYTE reg){

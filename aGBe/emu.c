@@ -92,6 +92,16 @@ int ROMBANKNUMBER = 1;// Bank register powers on selecting bank 1 (MBC1/2/3/5)
 int RAMBANKNUMBER = 0;
 int MBCMODE = 0;
 int RAMENABLED = 0; // Cart RAM $A000-$BFFF gate: enabled by writing 0x0A to $0000-$1FFF
+// BUG FIX: DIV ($FF04) was a complete no-op stub on both read and write.
+// Real hardware free-runs an internal 16-bit divider at the base clock
+// rate regardless of anything else (TAC/TIMA included) and exposes its
+// upper 8 bits as DIV, incrementing every 256 cycles; any write to DIV
+// resets it to 0 regardless of the value written. Software commonly reads
+// it as a simple hardware counter/pseudo-random source, so a stuck-at-0
+// (or whatever garbage the stub happened to return) DIV can cause
+// spurious failures far removed from anything DIV-related on its face.
+int DIVCOUNTER = 0;
+BYTE DIVREG = 0;
 BYTE SERIALDATA = 0xFF;   // $FF01 SB - Serial transfer data
 BYTE SERIALCONTROL = 0;  // $FF02 SC - Serial transfer control
 // MBC3 Real-Time Clock
@@ -134,7 +144,17 @@ void reset_Z80() {
 		SCRY = 0x00;
 		LCDY = 0x00;
 		LYC = 0x00;
-		VideoCyclesLeft = 100;
+		// BUG FIX: LCDCONTROL/LCDSTATUS/videoMode were never (re-)initialized
+		// here at all, leaving LCDC at 0 (display OFF) instead of the real,
+		// well-documented DMG post-boot-ROM power-up snapshot (LCDC=$91,
+		// STAT=$85 i.e. mode 1/VBlank with the LYC=LY coincidence flag set,
+		// since LY=LYC=0 at that point) - this project skips boot ROM
+		// emulation entirely and starts straight at $0100, so matching that
+        // snapshot exactly is what real cartridge code expects to see.
+		LCDCONTROL = 0x91;
+		LCDSTATUS = 0x85;
+		videoMode = VBLANKMODE;
+		VideoCyclesLeft = VBLANK_CYCLES;
 		MAXTIME = 1024;
 		TIMECOUNTER = 0;
 		TIMECNT = 0;
@@ -143,6 +163,8 @@ void reset_Z80() {
 		RTCLATCH = 0xFF;
 		SERIALDATA = 0xFF;
 		SERIALCONTROL = 0x00;
+		DIVREG = 0;
+		DIVCOUNTER = 0;
 		MBCMODE = 0;
 }
 
@@ -316,6 +338,11 @@ void doDMA(BYTE addr) {
 }
 
 void cycleLength(int cycle) {
+	DIVCOUNTER += cycle;
+	while (DIVCOUNTER >= 256) {
+		DIVCOUNTER -= 256;
+		DIVREG++; // wraps naturally as a BYTE
+	}
 	if ((TIMCONT >> 2) & 0x01){
 		TIMECOUNTER += cycle;
 		if (TIMECOUNTER >= MAXTIME){
@@ -830,7 +857,7 @@ BYTE ReadMEM(WORD loc) {
 				case 0xFF00: return (BYTE)P1; break; // P1 (R/W)
 				case 0xFF01: return (BYTE)SERIALDATA; break; // Serial transfer data (R/W)
 				case 0xFF02: return (BYTE)(SERIALCONTROL | 0x7E); break; // SIO control (R/W), unused bits read as 1
-				case 0xFF04: break; // Divider Register (R/W)
+				case 0xFF04: return DIVREG; break; // Divider Register (R/W)
 				case 0xFF05: return (BYTE)TIMECNT; break;// Timer counter (R/W)
 				case 0xFF06: return (BYTE)TIMEMOD; break;// Timer Modulo (R/W)
 				case 0xFF07: return (BYTE)TIMCONT; break; // Timer Control
@@ -1031,7 +1058,7 @@ void WriteMEM(WORD loc, BYTE b){
 					break;
 			case 0xFF01: SERIALDATA = b; break; // Serial transfer data (R/W)
 			case 0xFF02: SERIALCONTROL = b; onSerialControlWrite(); break; // SIO control (R/W)
-			case 0xFF04: break; // Divider Register (R/W)
+			case 0xFF04: DIVREG = 0; DIVCOUNTER = 0; break; // Any write resets the divider to 0
 			case 0xFF05: TIMECNT = b; break; // Timer counter (R/W)
 			case 0xFF06: TIMEMOD = b; break; // Timer Modulo (R/W)
 			case 0xFF07: TIMCONT = b;
@@ -1471,7 +1498,11 @@ void OP36(void){ // case  0x36:
 } // 36    LD   (HL),nn
 
 void OP37(void){ // case  0x37:
-	setC(1); //TODO TEST!
+	// BUG FIX: SCF must also clear N and H (Z is left alone) - this only
+	// ever set C, leaking whatever N/H a prior instruction left behind.
+	setC(1);
+	setN(0);
+	setH(0);
 	cycleLength(4);
 } // 37    SCF
 
@@ -1512,7 +1543,8 @@ void OP3E(void){ // case  0x3E:
 } // 3E    LD   A,nn
 
 void OP3F(void){ // case  0x3F:
-setC(!getC()); cycleLength(4); }// 3F    CCF
+// BUG FIX: CCF must also clear N and H (Z is left alone), same leak as SCF.
+setC(!getC()); setN(0); setH(0); cycleLength(4); }// 3F    CCF
 void OP40(void){ // case  0x40:
 cycleLength(4); } // 40    LD   B,B
 void OP41(void){ // case  0x41:
