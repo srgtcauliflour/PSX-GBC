@@ -1160,24 +1160,42 @@ void WriteMEM(WORD loc, BYTE b){
 	} else if ( loc <= 0x3FFF ) { // $2000-$3FFF - ROM Bank number (low bits)
 		// MBC1
 		if (( CARTTYPE == 0x01 ) || ( CARTTYPE == 0x02) || ( CARTTYPE == 0x03 )) {
-			if (!b) b = 1;
-			ROMBANKNUMBER = (ROMBANKNUMBER & ~0x1F) | (b & 0x1F);
+			// BUG FIX (severe): the bank-0-becomes-1 quirk checked the RAW
+			// unmasked byte for zero, not the masked 5-bit value that
+			// actually becomes the new bank number. Real hardware only
+			// has 5 physical bits to look at; software setting the upper
+			// 3 bits to garbage (which is legal - those lines simply
+			// aren't connected to anything on this register) while
+			// writing an otherwise-zero bank number must still trigger
+			// the quirk. Found via Mooneye's emulator-only/mbc1 ROM-size
+			// tests, whose own switch_bank routine deliberately does
+			// exactly this ("or %11100000 ; set high bits to expose
+			// bugs") - and did.
+			BYTE lower5 = b & 0x1F;
+			if (!lower5) lower5 = 1;
+			ROMBANKNUMBER = (ROMBANKNUMBER & ~0x1F) | lower5;
 			#if defined(DEBUG)
 			printf("Switching MBC1 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
 			#endif
 		}
 		// MBC2
 		if (( CARTTYPE == 0x05 ) || ( CARTTYPE == 0x06 )) {
-			if (!b) b = 1;
-			ROMBANKNUMBER = (b & 0x0F);
+			// BUG FIX: same class of masked-vs-raw quirk-check bug as
+			// MBC1 above, for MBC2's 4-bit bank number.
+			BYTE lower4 = b & 0x0F;
+			if (!lower4) lower4 = 1;
+			ROMBANKNUMBER = lower4;
 			#if defined(DEBUG)
 			printf("Switching MBC2 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
 			#endif
 		}
 		// MBC3 - full 7-bit bank number in one write, bank 0 -> bank 1 quirk (same as MBC1)
 		if (( CARTTYPE >= 0x0F ) && ( CARTTYPE <= 0x13 )) {
-			if (!b) b = 1;
-			ROMBANKNUMBER = (b & 0x7F);
+			// BUG FIX: same class of masked-vs-raw quirk-check bug as
+			// MBC1 above, for MBC3's 7-bit bank number.
+			BYTE lower7 = b & 0x7F;
+			if (!lower7) lower7 = 1;
+			ROMBANKNUMBER = lower7;
 			#if defined(DEBUG)
 			printf("Switching MBC3 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
 			#endif

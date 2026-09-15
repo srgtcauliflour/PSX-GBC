@@ -223,6 +223,8 @@ int main(int argc, char **argv) {
     }
     if (getenv("DUMP_HRAM")) {
         int i;
+        fprintf(stderr, "[Mooneye state] bank_number=%d actual=%d expected=%d lower_upper=$%02X mode=%d\n",
+                ReadMEM(0xFF80), ReadMEM(0xFF81), ReadMEM(0xFF82), ReadMEM(0xFF83), ReadMEM(0xFF84));
         fprintf(stderr, "[HRAM] $FF80-$FFFE:\n");
         for (i = 0xFF80; i <= 0xFFFE; i++) {
             fprintf(stderr, "%02X ", ReadMEM(i));
