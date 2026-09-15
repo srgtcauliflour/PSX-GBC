@@ -56,6 +56,11 @@ cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE="$PSN00BSDK_LIBS/cmake/sdk.cmake"
   -DPSN00BSDK_TC="" -DPSN00BSDK_TARGET="mipsel-none-elf"
 cmake --build build
 # -> build/agbe.exe is a real, bootable PS-EXE running the actual emulator
+
+# Build a real bootable CD image with two demo ROMs on it (iso_files/
+# holds the actual .GB files to include - swap in real ROMs as needed):
+/opt/psn00bsdk/sdk/PSn00bSDK-0.24-Linux/bin/mkpsxiso -y iso.xml
+# -> agbe.bin + agbe.cue, a genuine multi-game PS1 disc image
 ```
 
 ### Setting up the toolchain yourself
@@ -97,24 +102,32 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   real controller input (`InitPAD`/`StartPAD`). Builds and links into a
   real, bootable PS-EXE (`psn00bsdk-build/build/agbe.exe`) that runs an
   embedded demo ROM through the actual `runEmu()` loop.
+- **Real CD-ROM ROM loading — multiple games on one disc, confirmed.**
+  `LoadROMFromCD()` in `psx.c` uses PSn00bSDK's real `psxcd.h` (the same
+  `CdSearchFile`/`CdControl`/`CdRead` pattern PSn00bSDK's own examples
+  use). Built a genuine bootable CD image with `mkpsxiso` containing two
+  real Game Boy ROM files plus the executable, then independently
+  verified with standard ISO9660 tooling (`isoinfo`, after de-interleaving
+  the raw sectors) that the disc structure is correct and every file on
+  it is byte-identical to its source — not just trusting the build.
 
 ## What's next (roughly in priority order)
 
-1. **Sprite X/Y flipping.** `iflipx`/`iflipy` are read from OAM in
-   `DrawOBJline` but never actually applied to pixel indexing — real gap,
-   found alongside the other sprite bugs but out of scope for that fix.
-2. **Double buffering.** `Draw_Buffer` currently blits straight into the
-   displayed VRAM area — works, but can tear. Needs a second buffer and
-   `PutDispEnv` flip, alternating like the PSn00bSDK template examples do.
-3. **Real CD-ROM ROM loading**, replacing `main.c`'s embedded demo ROM.
-   The original `AGBEBANK.BIN` multi-ROM bundle format's packing tool was
-   never committed to CVS — needs rebuilding (a small Python script is
-   enough) alongside switching to PSn00bSDK's `psxcd.h` + `mkpsxiso` for
-   the actual bootable CD image.
-4. **GUI/menu.** `gui.c` (splash screen, ROM select menu) is still the
+1. **ROM-select menu.** `main.c` currently loads a fixed filename
+   (`GAME.GB`); `ListRootDirectory()` (via `CdOpenDir`/`CdReadDir`) is
+   already implemented and ready for a menu to call, list what's on the
+   disc, and let the player pick. This is the natural next step now that
+   loading itself is real, and unblocks the GUI/menu rewrite below.
+2. **GUI/menu.** `gui.c` (splash screen, ROM select menu) is still the
    old GsLib version and isn't part of the current build at all — needs
    its own from-scratch rewrite against raw `psxgpu.h` primitives, same
    as `psx.c` got this session.
+3. **Sprite X/Y flipping.** `iflipx`/`iflipy` are read from OAM in
+   `DrawOBJline` but never actually applied to pixel indexing — real gap,
+   found alongside the other sprite bugs but out of scope for that fix.
+4. **Double buffering.** `Draw_Buffer` currently blits straight into the
+   displayed VRAM area — works, but can tear. Needs a second buffer and
+   `PutDispEnv` flip, alternating like the PSn00bSDK template examples do.
 5. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
    — needed for battery-backed cart RAM.
 6. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
@@ -123,6 +136,13 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
 7. **GBC support and sound** — explicitly deprioritized per the person's
    direction earlier this session; sound especially can wait until
    everything else is solid.
+8. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
+   flat, fully-resident pointer with no partial loading — fine for the
+   large majority of the GB/GBC library (32KB-512KB), but the small
+   number of very large late-era GBC games (up to 4-8MB) won't fit
+   resident in the PS1's 2MB of RAM. Only worth doing if support for
+   those specific large titles is wanted; most of the library doesn't
+   need it.
 
 ## Known limitation: instr_timing.gb
 
