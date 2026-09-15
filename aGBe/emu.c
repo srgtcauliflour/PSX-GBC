@@ -84,6 +84,7 @@ int ROMBANKNUMBER = 1;// Bank register powers on selecting bank 1 (MBC1/2/3/5)
 int RAMBANKNUMBER = 0;
 int MBCMODE = 0;
 int RAMENABLED = 0; // Cart RAM $A000-$BFFF gate: enabled by writing 0x0A to $0000-$1FFF
+int RAM_DIRTY = 0; // Set on any cart RAM write; cleared once a save completes.
 // BUG FIX: DIV ($FF04) was a complete no-op stub on both read and write.
 // Real hardware free-runs an internal 16-bit divider at the base clock
 // rate regardless of anything else (TAC/TIMA included) and exposes its
@@ -298,6 +299,20 @@ void interrupt(void){
 	}
 }
 
+// Real size in bytes of the EXTRNRAM buffer for the current cartridge -
+// shared by Allocate_Memory (to size the allocation) and the save/load
+// calls (to know how much to persist), so the two can never disagree.
+// MBC2 has 512x4-bit RAM built into the mapper itself; the cart header's
+// RAMSIZE byte is 0 for these carts, which would otherwise size the
+// buffer (and any save file) at 0 bytes while WriteMEM/ReadMEM still
+// index into it for $A000-$BFFF.
+int GetCartRAMSize(void) {
+	if ((CARTTYPE == 0x05) || (CARTTYPE == 0x06)) {
+		return 512;
+	}
+	return (iRAMSIZE ? iRAMSIZE : 1) * 1024;
+}
+
 void Allocate_Memory(void){
 	// BUG FIX: every buffer here was malloc()'d, never zeroed. malloc does
 	// not zero-initialize memory - these came up full of leftover heap
@@ -312,14 +327,7 @@ void Allocate_Memory(void){
 	VRAM   = (BYTE *)calloc(8 * 1024, sizeof(BYTE));
 	RAM    = (BYTE *)calloc(8 * 1024, sizeof(BYTE)); //TODO: Check this out
 	OAMRAM = (BYTE *)calloc(160, sizeof(BYTE));
-	// MBC2 has 512x4-bit RAM built into the mapper itself; the cart header's RAMSIZE
-	// byte is 0 for these carts, so without this the buffer below would be 0 bytes
-	// while WriteMEM/ReadMEM still index into it for $A000-$BFFF.
-	if ((CARTTYPE == 0x05) || (CARTTYPE == 0x06)) {
-		EXTRNRAM = (BYTE *)calloc(512, sizeof(BYTE));
-	} else {
-		EXTRNRAM = (BYTE *)calloc((iRAMSIZE ? iRAMSIZE : 1) * 1024, sizeof(BYTE));
-	}
+	EXTRNRAM = (BYTE *)calloc(GetCartRAMSize(), sizeof(BYTE));
 }
 
 void UnAllocate_Memory(void){
@@ -744,6 +752,16 @@ void runEmu(){
 	loadRom();
 	reset_Z80();
 
+	// Load any existing battery-backed save for this cartridge now that
+	// loadRom()/reset_Z80() have parsed the header and sized EXTRNRAM.
+	// A missing save (first time playing this game) is not an error -
+	// EXTRNRAM is already zeroed by Allocate_Memory(), the same blank
+	// state a fresh, never-saved-to real cartridge would present.
+	if (CartHasBattery()) {
+		LoadCartRAM((const char *)CARTTITLE, EXTRNRAM, GetCartRAMSize());
+		RAM_DIRTY = 0;
+	}
+
     temp = 0;
     Voff = 2048;
 	runto = 0;
@@ -837,6 +855,28 @@ void runEmu(){
 	//TODO:
 	//Unload Rom
 	UnAllocate_Memory();
+}
+
+// Whether the currently loaded cartridge has battery-backed RAM worth
+// saving/loading to a memory card. Matches this project's actual
+// supported MBC types (MBC1/2/3/5) plus the plain ROM+RAM+BATTERY case;
+// cart types this project doesn't implement bank switching for at all
+// (MMM01, MBC4, HuC1, HuC3, Pocket Camera, TAMA5) are deliberately
+// excluded even though some of them are nominally battery-backed too.
+int CartHasBattery(void) {
+	switch (CARTTYPE) {
+		case 0x03: // MBC1+RAM+BATTERY
+		case 0x06: // MBC2+BATTERY
+		case 0x09: // ROM+RAM+BATTERY
+		case 0x0F: // MBC3+TIMER+BATTERY
+		case 0x10: // MBC3+TIMER+RAM+BATTERY
+		case 0x13: // MBC3+RAM+BATTERY
+		case 0x1B: // MBC5+RAM+BATTERY
+		case 0x1E: // MBC5+RUMBLE+RAM+BATTERY
+			return 1;
+		default:
+			return 0;
+	}
 }
 
 void loadRom(void){
@@ -1036,7 +1076,20 @@ BYTE ReadMEM(WORD loc) {
 void WriteMEM(WORD loc, BYTE b){
 	if ( loc <= 0x1FFF ) { // $0000-$1FFF - RAM Enable (MBC1/2/3/5)
 		if (CARTTYPE != 0x00) {
+			int wasEnabled = RAMENABLED;
 			RAMENABLED = ((b & 0x0F) == 0x0A);
+			// Real MBC1/3/5 cartridges commit their save to the battery-
+			// backed RAM chip around the point the game disables RAM
+			// access again (having enabled it briefly to read/write save
+			// data is the normal access pattern) - mirroring that same
+			// transition is a natural, low-overhead point to persist to
+			// the memory card, rather than saving on every single write
+			// or trying to guess some other "the game is done" moment.
+			if (wasEnabled && !RAMENABLED && RAM_DIRTY && CartHasBattery()) {
+				if (SaveCartRAM((const char *)CARTTITLE, EXTRNRAM, GetCartRAMSize())) {
+					RAM_DIRTY = 0;
+				}
+			}
 		}
 	} else if ( loc <= 0x3FFF ) { // $2000-$3FFF - ROM Bank number (low bits)
 		// MBC1
@@ -1132,6 +1185,7 @@ void WriteMEM(WORD loc, BYTE b){
 				case 0x0C: RTC_DH = b; break;
 			}
 		} else if (RAMENABLED) {
+			RAM_DIRTY = 1;
 			if (( CARTTYPE == 0x01 ) || ( CARTTYPE == 0x02) || ( CARTTYPE == 0x03 )) {
 				if (MBCMODE) { EXTRNRAM[loc - 0xA000 + (WORD)(RAMBANKNUMBER * 0x2000)] = b; }
 				else { EXTRNRAM[loc - 0xA000] = b; }

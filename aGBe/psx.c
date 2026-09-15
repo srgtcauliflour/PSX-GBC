@@ -20,6 +20,7 @@
 #include <psxpad.h>
 #include <psxapi.h>
 #include <psxcd.h>
+#include <sys/fcntl.h>
 #include "main.h"
 #include "pad.h"
 #include "psx.h"
@@ -188,6 +189,10 @@ void init_PSX(void) {
 	ChangeClearPAD(0);
 
 	CdInit();
+
+	// Initializes the BIOS's memory card filesystem driver so the
+	// bu00:/bu10: device paths used by Save/LoadCartRAM below work.
+	_bu_init();
 }
 
 // ---- CD-ROM ROM loading (multi-game disc support) ----------------------
@@ -243,4 +248,74 @@ int ListRootDirectory(void *outFiles, int maxFiles) {
 	}
 	CdCloseDir(dir);
 	return found;
+}
+
+// ---- Memory card save/load (battery-backed cart RAM) -------------------
+// Real BIOS filesystem access via psxapi.h's open/close/read/write and
+// sys/fcntl.h's FREAD/FWRITE/FCREATE/FNBLOCKS - the same "bu00:" device
+// path convention and flag values the official SDK's memory card access
+// uses (PSn00bSDK deliberately mirrors it; _bu_init() below is its name
+// for what the official SDK exposes as InitCARD/StartCARD's underlying
+// driver init).
+//
+// One save file per cartridge, named from the cart's own header title so
+// multiple games on one disc (see the CD-loading/ROM-select work earlier
+// this session) don't collide with each other's saves.
+#define SAVE_BLOCK_SIZE 8192
+
+// Builds a memory-card-safe file path from a cartridge title: "bu00:"
+// plus up to 10 sanitized characters (alphanumeric only, everything else
+// dropped) from the title, prefixed "AGBE-" so these saves are
+// identifiable and don't collide with any other homebrew's saves on the
+// same card.
+static void build_save_path(char *out, const char *title) {
+	strcpy(out, "bu00:AGBE-");
+	int outLen = strlen(out);
+	int i;
+	for (i = 0; i < 10 && title[i] != '\0'; i++) {
+		char c = title[i];
+		int isAlnum = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+		if (isAlnum) {
+			out[outLen++] = c;
+		}
+	}
+	out[outLen] = '\0';
+}
+
+int SaveCartRAM(const char *saveId, BYTE *buf, int size) {
+	char path[32];
+	build_save_path(path, saveId);
+
+	int blocks = (size + SAVE_BLOCK_SIZE - 1) / SAVE_BLOCK_SIZE;
+	if (blocks < 1) {
+		blocks = 1;
+	}
+
+	// Make sure a correctly-sized file exists first (creating one is a
+	// no-op error, harmlessly ignored, if it already does).
+	int f = open(path, FCREATE | FWRITE | FNBLOCKS(blocks));
+	if (f >= 0) {
+		close(f);
+	}
+
+	f = open(path, FWRITE);
+	if (f < 0) {
+		return 0; // no card present, card full, or some other I/O error
+	}
+	int written = write(f, buf, size);
+	close(f);
+	return written == size;
+}
+
+int LoadCartRAM(const char *saveId, BYTE *buf, int size) {
+	char path[32];
+	build_save_path(path, saveId);
+
+	int f = open(path, FREAD);
+	if (f < 0) {
+		return 0; // no save yet - not an error, just a fresh cartridge
+	}
+	int got = read(f, buf, size);
+	close(f);
+	return got == size;
 }

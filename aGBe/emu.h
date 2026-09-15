@@ -45,6 +45,19 @@ extern BYTE CARTTITLE[16];
 extern BYTE LCDCONTROL, LCDSTATUS, LCDY, LYC, SCRX, SCRY;
 extern BYTE BGPAL, OBJPAL0, OBJPAL1;
 extern int FRAMECOUNT;
+extern int RAM_DIRTY;
+int CartHasBattery(void);
+int GetCartRAMSize(void);
+
+// Platform hooks for battery-backed cart RAM persistence (memory card on
+// PSn00bSDK; a plain host file in the test harness). Implementations
+// decide their own storage format/location - the core only needs to know
+// whether a save exists to load, and when to ask for one to be written.
+// destBuf/size describe the EXTRNRAM region to persist; saveId is a
+// short, filesystem-safe identifier for the current cartridge (derived
+// from its header title) so multiple games' saves don't collide.
+int SaveCartRAM(const char *saveId, BYTE *buf, int size);
+int LoadCartRAM(const char *saveId, BYTE *buf, int size);
 
 // ProtoTypes //
 void runEmu(void);

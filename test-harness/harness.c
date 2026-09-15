@@ -60,6 +60,48 @@ void Draw_Buffer(int *screenBuffer) {
 }
 void Draw_Buffer_SPRT(int *screenBuffer) { (void)screenBuffer; }
 void Draw_Buffer_Pixel_Blitting(int *screenBuffer) { (void)screenBuffer; }
+
+// ---- Real save/load for testing purposes ----
+// Plain host files (one per sanitized cart title, matching the same
+// naming idea the real psx.c memory-card implementation uses) rather
+// than a no-op stub, so the actual save-trigger logic in emu.c (dirty
+// flag, RAM-enable-transition save, load-on-boot) can be genuinely
+// exercised and verified on the host, not just assumed correct.
+static void build_save_path(char *out, const char *title) {
+    strcpy(out, "/tmp/agbe_save_");
+    int outLen = strlen(out);
+    int i;
+    for (i = 0; i < 10 && title[i] != '\0'; i++) {
+        char c = title[i];
+        int isAlnum = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+        if (isAlnum) {
+            out[outLen++] = c;
+        }
+    }
+    strcpy(out + outLen, ".sav");
+}
+
+int SaveCartRAM(const char *saveId, unsigned char *buf, int size) {
+    char path[64];
+    build_save_path(path, saveId);
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    size_t written = fwrite(buf, 1, size, f);
+    fclose(f);
+    if (getenv("TRACE")) fprintf(stderr, "[SaveCartRAM] wrote %s (%d bytes)\n", path, size);
+    return (int)written == size;
+}
+
+int LoadCartRAM(const char *saveId, unsigned char *buf, int size) {
+    char path[64];
+    build_save_path(path, saveId);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    size_t got = fread(buf, 1, size, f);
+    fclose(f);
+    if (getenv("TRACE")) fprintf(stderr, "[LoadCartRAM] read %s (%d bytes)\n", path, size);
+    return (int)got == size;
+}
 void PrepScreen(void) {}
 void RenderWorld(BYTE re, BYTE gr, BYTE bl) { (void)re; (void)gr; (void)bl; }
 
@@ -103,6 +145,15 @@ int main(int argc, char **argv) {
 
     loadRom();
     reset_Z80();
+
+    // Mirrors the load-on-boot call in emu.c's real runEmu() - this
+    // harness has its own instruction-dispatch loop (for bounded/traced
+    // test runs) instead of calling runEmu() directly, so it needs its
+    // own copy of this bit to genuinely exercise save/load in tests.
+    if (CartHasBattery()) {
+        LoadCartRAM((const char *)CARTTITLE, EXTRNRAM, GetCartRAMSize());
+        RAM_DIRTY = 0;
+    }
 
     fprintf(stderr, "[harness] loaded %s (%ld bytes), cart type 0x%02X, romsize idx 0x%02X, ramsize idx 0x%02X\n",
             argv[1], size, CARTTYPE, ROMSIZE, RAMSIZE);
