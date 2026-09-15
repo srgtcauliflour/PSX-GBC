@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<iso_project image_name="agbe.bin" cue_sheet="agbe.cue">
+	<track type="data">
+		<identifiers
+			system			="PLAYSTATION"
+			application		="PLAYSTATION"
+			volume			="AGBE"
+			volume_set		="AGBE"
+			publisher		="AGBE PROJECT"
+			data_preparer	="PSN00BSDK"
+		/>
+		<directory_tree>
+			<file name="SYSTEM.CNF"	type="data" source="system.cnf" />
+			<file name="AGBE.EXE"		type="data" source="build/agbe.exe" />
+			<file name="GAME.GB"		type="data" source="iso_files/GAME.GB" />
+			<file name="GAME2.GB"		type="data" source="iso_files/GAME2.GB" />
+		</directory_tree>
+	</track>
+</iso_project>

@@ -15,9 +15,11 @@
 // separate follow-up work.
 
 #include <stdint.h>
+#include <string.h>
 #include <psxgpu.h>
 #include <psxpad.h>
 #include <psxapi.h>
+#include <psxcd.h>
 #include "main.h"
 #include "pad.h"
 #include "psx.h"
@@ -139,4 +141,61 @@ void init_PSX(void) {
 	// Match the original Psy-Q build's polling behaviour (continuous
 	// state rather than the BIOS's optional auto-clear-on-VSync mode).
 	ChangeClearPAD(0);
+
+	CdInit();
+}
+
+// ---- CD-ROM ROM loading (multi-game disc support) ----------------------
+// Real ISO9660 file access via PSn00bSDK's psxcd.h - CdSearchFile() finds
+// a named file's disc position and size (the same two-call pattern the
+// original Psy-Q-based version of this file used, just against a plain
+// ISO9660 file instead of a custom AGBEBANK.BIN multi-ROM bundle format:
+// plain files are simpler, standard, and don't need a bespoke packing
+// tool - the original's packer was never even committed to the project's
+// CVS history in the first place, see STATUS.md).
+int LoadROMFromCD(const char *filename, BYTE *dest, int maxSize) {
+	CdlFILE file;
+	char name[32];
+
+	// CdSearchFile wants the ISO9660 version suffix; add it if the caller
+	// didn't already include one, so callers can just pass "GAME.GB".
+	strncpy(name, filename, sizeof(name) - 3);
+	name[sizeof(name) - 3] = '\0';
+	if (!strchr(name, ';')) {
+		strcat(name, ";1");
+	}
+
+	if (!CdSearchFile(&file, name)) {
+		return -1;
+	}
+	if (file.size > maxSize) {
+		return -2;
+	}
+
+	CdControl(CdlSetloc, &file.pos, 0);
+	// Sectors are 2048 bytes each in the default (non-CdlModeSize) mode
+	// CdRead's own doc comments describe; round up so a file that isn't
+	// an exact multiple of 2048 bytes still gets fully read.
+	int sectors = (file.size + 2047) / 2048;
+	if (!CdRead(sectors, (uint32_t *) dest, 0)) {
+		return -3;
+	}
+	CdReadSync(0, 0);
+
+	return file.size;
+}
+
+int ListRootDirectory(void *outFiles, int maxFiles) {
+	CdlFILE *files = (CdlFILE *) outFiles;
+	CdlDIR *dir = CdOpenDir("\\");
+	int found = 0;
+
+	if (!dir) {
+		return 0;
+	}
+	while (found < maxFiles && CdReadDir(dir, &files[found])) {
+		found++;
+	}
+	CdCloseDir(dir);
+	return found;
 }
