@@ -1082,7 +1082,6 @@ void WriteMEM(WORD loc, BYTE b){
 		}
 
 	} else if ( ( loc >= 0xFF80 ) &&  ( loc <= 0xFFFE ) ) { // $FF80-$FFFE - High RAM Area
-		if (getenv("TRACE_FFFE") && loc == 0xFFFE) { fprintf(stderr, "[WATCH] write HIRAM[$FFFE]=%02X at PC=%04X\n", b, reg_PC); }
 		HIRAM[loc - 0xFF80] = b;
 
 	} else if  ( loc == 0xFFFF ) { // $FFFF - Interrupt Enable Register
