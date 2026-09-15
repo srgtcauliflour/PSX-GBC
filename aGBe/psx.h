@@ -54,4 +54,14 @@ int ListRootDirectory(void *outFiles, int maxFiles);
 #define GB_SCREEN_WIDTH  160
 #define GB_SCREEN_HEIGHT 144
 
+// Double-buffer frame lifecycle, exposed so other GPU-primitive-drawing
+// code (currently just the ROM select menu in gui.c) can safely share
+// the same two VRAM buffers Draw_Buffer() uses, instead of needing its
+// own separate display setup. BeginFrame() clears and returns the origin
+// of the buffer that's safe to draw into this frame; PresentFrame() shows
+// what was just drawn and flips to the other buffer for next time -
+// mirroring exactly what Draw_Buffer() itself does internally.
+void BeginFrame(int *outOffsetX, int *outOffsetY);
+void PresentFrame(void);
+
 #endif

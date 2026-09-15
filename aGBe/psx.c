@@ -70,35 +70,49 @@ static const uint16_t gb_shade_colors[4] = {
 	0x0000, // shade 3: black
 };
 
+// Shared double-buffer frame lifecycle - see psx.h. Draw_Buffer() below
+// and the ROM select menu (gui.c) both build on these instead of each
+// managing their own display setup.
+void BeginFrame(int *outOffsetX, int *outOffsetY) {
+	// Clears draw_env[db]'s half (the one NOT currently displayed) to
+	// black before drawing into it, same as PSn00bSDK's own multi-buffer
+	// examples do every frame - isbg+PutDrawEnv together issue a
+	// synchronous GPU fill of the draw area.
+	PutDrawEnv(&draw_env[db]);
+	*outOffsetX = draw_env[db].clip.x;
+	*outOffsetY = draw_env[db].clip.y;
+}
+
+void PresentFrame(void) {
+	// Shows what was just drawn (and starts drawing the next frame into
+	// what was, until this line, the displayed half) by flipping to the
+	// other index.
+	PutDispEnv(&disp_env[db]);
+	SetDispMask(1);
+	db = !db;
+}
+
 void Draw_Buffer(int *screenBuffer) {
 	int i;
 	for (i = 0; i < GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT; i++) {
 		gb_framebuffer[i] = gb_shade_colors[screenBuffer[i] & 0x03];
 	}
 
-	// Clears draw_env[db]'s half (the one NOT currently displayed) to
-	// black before blitting into it, same as PSn00bSDK's own multi-buffer
-	// examples do every frame - isbg+PutDrawEnv together issue a
-	// synchronous GPU fill of the draw area.
-	PutDrawEnv(&draw_env[db]);
+	int offsetX, offsetY;
+	BeginFrame(&offsetX, &offsetY);
 
 	// draw_env[db] points at the half of VRAM currently NOT being shown
 	// (disp_env[db] shows the other half) - safe to write into without
 	// tearing whatever is currently on screen.
 	RECT rect;
-	rect.x = draw_env[db].clip.x + (SCREEN_XRES - GB_SCREEN_WIDTH) / 2;
-	rect.y = draw_env[db].clip.y + (SCREEN_YRES - GB_SCREEN_HEIGHT) / 2;
+	rect.x = offsetX + (SCREEN_XRES - GB_SCREEN_WIDTH) / 2;
+	rect.y = offsetY + (SCREEN_YRES - GB_SCREEN_HEIGHT) / 2;
 	rect.w = GB_SCREEN_WIDTH;
 	rect.h = GB_SCREEN_HEIGHT;
 	LoadImage(&rect, (const uint32_t *) gb_framebuffer);
 	DrawSync(0);
 
-	// Now that the frame we just drew is complete, show it (and start
-	// drawing the next one into what was, until this line, the displayed
-	// half) by flipping to the other index.
-	PutDispEnv(&disp_env[db]);
-	SetDispMask(1);
-	db = !db;
+	PresentFrame();
 }
 
 // Legacy GsLib-era hooks the core still calls from vblank() (PrepScreen();
