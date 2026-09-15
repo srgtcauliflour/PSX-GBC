@@ -14,6 +14,7 @@ set(AGBE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../aGBe)
 psn00bsdk_add_executable(agbe GPREL
 	${AGBE_SRC}/main.c
 	${AGBE_SRC}/psx.c
+	${AGBE_SRC}/gui.c
 	${AGBE_SRC}/emu.c
 	${AGBE_SRC}/opcodes.c
 )

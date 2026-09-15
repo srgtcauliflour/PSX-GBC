@@ -136,6 +136,12 @@ void init_PSX(void) {
 	PutDispEnv(&disp_env);
 	SetDispMask(1);
 
+	// Loads PSn00bSDK's built-in debug font into an unused corner of VRAM
+	// (x=960 is well clear of the 320-wide visible display area) so
+	// FntPrint() works - used by the ROM select menu (gui.c) for now, and
+	// available for any future debug/UI text.
+	FntLoad(960, 0);
+
 	InitPAD(pad_buff[0], 34, pad_buff[1], 34);
 	StartPAD();
 	// Match the original Psy-Q build's polling behaviour (continuous
