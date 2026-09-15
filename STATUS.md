@@ -141,41 +141,49 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   byte pattern from a synthetic ROM, confirmed the saved file's exact
   size and content, then in a completely separate process/ROM run,
   confirmed the same byte came back correctly on load.
+- **Visual polish for the ROM select menu.** No longer plain text on
+  black — a real title bar, a bordered menu panel, and a selection-
+  highlight bar that tracks the cursor, all drawn as GPU primitives
+  underneath the existing `FntPrint` text. `Draw_Buffer`'s double-buffer
+  logic was factored into reusable `BeginFrame`/`PresentFrame` calls so
+  the menu shares the same VRAM buffers as the emulator's own screen.
 
 ## What's next (roughly in priority order)
 
-1. **Visual polish for the menu.** Current menu is plain `FntPrint` text
-   - functional, not pretty. A real background/graphics layer can build
-   on top of what's here now without touching the menu logic itself.
-2. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
+1. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
    (RGBDS toolchain needed to build them from source; wasn't readily
    available as a binary this session).
-3. **GBC support and sound** — explicitly deprioritized per the person's
+2. **GBC support and sound** — explicitly deprioritized per the person's
    direction earlier this session; sound especially can wait until
    everything else is solid.
-4. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
+3. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
    flat, fully-resident pointer with no partial loading — fine for the
    large majority of the GB/GBC library (32KB-512KB), but the small
    number of very large late-era GBC games (up to 4-8MB) won't fit
    resident in the PS1's 2MB of RAM. Only worth doing if support for
    those specific large titles is wanted; most of the library doesn't
    need it.
-5. **8x16 sprite mode** (`LCDC` bit 2) isn't supported — `DrawOBJline`'s
+4. **8x16 sprite mode** (`LCDC` bit 2) isn't supported — `DrawOBJline`'s
    line-range check assumes 8-tall sprites only. Most GB/GBC games use
    8x8 sprites predominantly; a real, separate gap if a specific game
    needs tall-sprite mode.
-6. **MBC3 RTC isn't persisted.** The RTC registers implemented earlier
+5. **MBC3 RTC isn't persisted.** The RTC registers implemented earlier
    this session (clock/calendar for games like Pokémon Gold/Silver)
    reset every boot rather than saving alongside cart RAM — a real,
    separate gap from plain cart RAM save/load, lower priority since it
    only affects real-time-clock-dependent game features, not save data
    itself.
-7. **Very large cart RAM won't fit a single memory card.** A standard
+6. **Very large cart RAM won't fit a single memory card.** A standard
    PS1 card has 15 usable 8KB blocks (120KB total); `SaveCartRAM`
    requests exactly the blocks a cart needs, but a 128KB-RAM MBC5 game
    would need every single block on the card, and anything larger
    wouldn't fit at all. Affects a small minority of RAM-heavy titles;
    not fixed proactively since most games use far less.
+7. **Real visual confirmation** (screenshot/video from actual hardware
+   or a working emulator session) — every emulator-boot attempt in this
+   sandbox has hung or stalled (see the note below); not something to
+   keep spending sandbox time on, but worth doing whenever a real
+   console or an interactive emulator session is available.
 
 ## Known limitation: instr_timing.gb
 
@@ -208,15 +216,35 @@ project's chat history for the full reasoning.
 
 ## A note on emulator verification via mednafen
 
-Attempts to get a visual screenshot of the built PS-EXE running under
-mednafen (with the open-source OpenBIOS in place of the proprietary
-retail BIOS) got stuck on OpenBIOS's own boot logo indefinitely, for both
-the smoke test and the real build. This looks like a mednafen standalone
-command-line invocation quirk (it's built around CD-image booting, not
-direct EXE injection) rather than anything wrong with the executables
-themselves — independently confirmed correct by `file` and by mednafen's
-own PS-EXE header parser reporting the exact right entry point/text
-segment. Real hardware or a different emulator invocation would likely
-show it correctly; this wasn't pursued further given the higher-value
-pivot to the host-harness PPM-dump approach, which is what actually found
-and helped fix the real rendering bugs above.
+Attempts to get a visual screenshot of the built PS-EXE/CD image running
+under an emulator have not succeeded in this sandbox despite several
+different approaches:
+
+- mednafen standalone with a raw injected `.exe` (no disc) - stuck on
+  OpenBIOS's boot logo indefinitely.
+- mednafen standalone with a real, mkpsxiso-built CD image (later
+  sessions, once CD loading existed) - same stuck-on-logo behavior, even
+  though the disc structure itself was independently confirmed correct
+  with `isoinfo` in that same session.
+- pcsxr (a different emulator core entirely, `-cdfile ... -nogui`) -
+  hung indefinitely on startup in this sandbox (unclear why; possibly a
+  GTK/display-session assumption that doesn't hold headless), consuming
+  two full 5-minute timeouts before being abandoned as a dead end.
+
+None of this points at anything wrong with the executables or disc
+images themselves - independently confirmed correct by `file`/mednafen's
+own PS-EXE header parser (exact right entry point/text segment both
+times), and by `isoinfo` (every file on the CD image byte-identical to
+its source, exactly as intended). This looks like a genuine limitation
+of getting *any* of these emulators to boot arbitrary homebrew
+non-interactively in this specific sandboxed, headless environment,
+rather than a property of this project's output. Real hardware, or a
+GUI session where these emulators' normal interactive boot flow (and any
+manual disc-eject/BIOS-menu tricks some of them need) can actually be
+driven, would be the way to get an actual screenshot - worth trying if
+that's ever available, but not something to keep spending sandbox time
+on. The host-harness PPM-dump approach (rendering the actual emulator
+core's output to a real image file, verified extensively earlier this
+session) remains the one visual-correctness technique that has
+genuinely worked throughout, and is what actually found and helped fix
+the real rendering bugs in this project.
