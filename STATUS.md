@@ -79,33 +79,46 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
 
 ## What's next (roughly in priority order)
 
-1. **Close out `instr_timing.gb`.** Fails at the same point each time
-   (~instruction 188k, "Failed #255"), tracked to a small (~2-unit)
-   residual LY-read divergence against the reference core that doesn't
-   affect cpu_instrs's coarser checks. Candidates: the exact PPU cycle
-   phase at boot-ROM handoff (this project approximates it as "start of
-   VBlank", which may not be precisely right), or a timer/serial edge
-   case. Same diff-against-reference technique as above should find it.
-2. Run Mooneye's MBC1/MBC5 test ROMs to validate the bank-switching work.
-3. **Real platform-layer port.** `psx.c`/`gui.c`/`main.c` still assume
+1. Run Mooneye's MBC1/MBC5 test ROMs to validate the bank-switching work.
+2. **Real platform-layer port.** `psx.c`/`gui.c`/`main.c` still assume
    Psy-Q's GsLib (`GsSPRITE`, `GsOT`, `GsSortSprite`, ...), which PSn00bSDK
    has no equivalent for. This needs a genuine rewrite against raw
    `psxgpu.h` primitives (ordering tables, `POLY_FT4`/`SPRT` primitives).
    `core_state.h` in the smoke test is a preview of the necessary split
    between "core state" and "GsLib rendering state."
-4. **Real controller input.** `PadRead()` is a stub. Port to PSn00bSDK's
+3. **Real controller input.** `PadRead()` is a stub. Port to PSn00bSDK's
    `psxpad.h` buffer-polling model (different shape than Psy-Q's simple
    polled `PadRead()`).
-5. **CD-ROM ROM loading.** The original `AGBEBANK.BIN` multi-ROM bundle
+4. **CD-ROM ROM loading.** The original `AGBEBANK.BIN` multi-ROM bundle
    format's packing tool was never committed to CVS — it needs to be
    rebuilt (a small Python script is enough) alongside switching the raw
    `CdRead()` sector calls to PSn00bSDK's `psxcd.h` + `mkpsxiso` for the
    actual bootable CD image.
-6. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
+5. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
    — needed for battery-backed cart RAM.
-7. **GBC support and sound** — explicitly deprioritized per the person's
+6. **GBC support and sound** — explicitly deprioritized per the person's
    direction this session; sound especially can wait until everything else
    is solid.
+
+## Known limitation: instr_timing.gb
+
+Blargg's `instr_timing.gb` (a stricter, dedicated cycle-timing test, as
+opposed to `cpu_instrs.gb`'s broader correctness checks) still fails.
+Investigated in depth: this project skips boot-ROM emulation entirely and
+starts execution straight at `$0100`, with the PPU pre-set to the
+well-documented real-hardware "power-up snapshot" (`LCDC=$91`,
+`STAT=$85`). That snapshot is a widely-used convention, but it isn't a
+bit-exact stand-in for the actual mid-boot-animation PPU phase real
+hardware would be in at that exact moment — and `instr_timing.gb` is
+sensitive to that exact phase in a way `cpu_instrs.gb` (now 11/11) is not.
+Confirmed every individual opcode's cycle cost is correct (audited against
+an authoritative table in an earlier commit) and confirmed the specific
+starting convention used here already matches the reference core's actual
+internal mechanics better than the alternative tried. Not worth further
+effort without implementing genuine boot-ROM timing emulation — a
+materially bigger undertaking than anything else on this list, for a test
+that doesn't reflect real-game compatibility (real games sync to VBlank/
+STAT via interrupts, not an assumption about the exact boot-time phase).
 
 ## Boot path
 
