@@ -1161,7 +1161,13 @@ void OP06(void){ //		case 0x06:
 } // 06	LD	B,nn
 
 void OP07(void){ // case 0x07:
+	// BUG FIX: RLCA/RLA/RRCA/RRA (the non-CB accumulator rotates) always
+	// clear Z on real hardware regardless of the result - RLA/RRA already
+	// did this via their own wrappers below, but RLCA/RRCA were calling the
+	// CB-style RLC/RRC directly, which set Z from the result like the CB
+	// versions correctly do for a general register, but not for A here.
 	reg_A = RLC(reg_A);
+	setZ(0);
 	cycleLength(4);
 } // 07    RLCA
 
@@ -1209,7 +1215,9 @@ void OP0E(void){ //		case 0x0E:
 }  // 0E    LD   C,nn
 
 void OP0F(void){ //		case 0x0F:
+	// BUG FIX: see OP07 above - RRCA must also force Z=0.
 	reg_A = RRC(reg_A);
+	setZ(0);
 cycleLength(4); } // 0F    RRCA
 
 void OP10(void){ //  0x10:
@@ -1608,15 +1616,28 @@ void OP75(void){ // case  0x75:
 WriteMEM(reg_HL, get_rL()); cycleLength(8); } // 75    LD   (HL),L
 
 void OP76(void){// 76 HALT
-	//printf("HALT\n");
-	if(IME) {
-
-		cycleLength(CyclesLeft());
-	} else {
-
+	// BUG FIX: this never actually halted anything. It inserted one delay of
+	// CyclesLeft() cycles (an odd, essentially arbitrary amount - "however
+	// many cycles until the next PPU/timer event", not "until an interrupt
+	// is pending") and then just fell through to the next instruction
+	// regardless of interrupt state. Real HALT freezes the CPU - no further
+	// instructions fetched - until (IF & IE) becomes non-zero, then resumes
+	// (servicing the interrupt if IME is set, or just falling through to the
+	// next opcode if not). Since essentially every commercial game's main
+	// loop is "HALT; <do per-frame work after VBlank wakes us up>", this
+	// bug alone would have broken game timing/pacing broadly, independent
+	// of the CPU-correctness bugs already fixed.
+	//
+	// Not yet modelled: the "HALT bug" quirk, where entering HALT with
+	// IME=0 while an interrupt is already pending causes real hardware to
+	// fail to increment PC afterwards (the following opcode byte gets
+	// executed twice). A handful of commercial games and test ROMs rely on
+	// this exact quirk; left as a known follow-up.
+	while (!(IFLAG & IER)) {
 		cycleLength(4);
 	}
-}// 0x7676
+	cycleLength(4);
+}// 76 HALT
 
 void OP77(void){ // case  0x77:
 WriteMEM(reg_HL, reg_A); cycleLength(8); } // 77    LD   (HL),A
@@ -2076,8 +2097,18 @@ void OPE7(void){ // case  0xE7:
 reg_PC = rst(0x0020); cycleLength(16); } // E7    RST  20H
 
 void OPE8(void){ // case  0xE8:
-	reg_SP += (signed char)(ReadMEM(reg_PC++));
-	setN(0); //TODO CHANGED FROM Z()
+	// BUG FIX: only ever adjusted SP - never set any flag except a stray
+	// N reset. Real hardware always clears Z and N, and computes H/C from
+	// an *unsigned* 8-bit add of SP's low byte with the immediate (even
+	// though the actual addition to SP is sign-extended) - order matters:
+	// compute the flags from the pre-update SP before overwriting it.
+	BYTE e = ReadMEM(reg_PC++);
+	int result = reg_SP + (signed char)e;
+	setH(((reg_SP & 0x0F) + (e & 0x0F)) > 0x0F);
+	setC(((reg_SP & 0xFF) + (e & 0xFF)) > 0xFF);
+	reg_SP = (WORD)(result & 0xFFFF);
+	setZ(0);
+	setN(0);
 	cycleLength(16);
 } // E8    ADD  SP,dd
 
@@ -2141,7 +2172,16 @@ void OPF7(void){ // case  0xF7:
 } // F7    RST  30H
 
 void OPF8(void){ // case  0xF8:
-	reg_HL = reg_SP + (signed char)(ReadMEM(reg_PC++));
+	// BUG FIX: previously set no flags at all. Same H/C computation as
+	// ADD SP,e8 above (this is really the same ALU operation, just written
+	// to HL instead of back to SP) - Z and N always clear.
+	BYTE e = ReadMEM(reg_PC++);
+	int result = reg_SP + (signed char)e;
+	setH(((reg_SP & 0x0F) + (e & 0x0F)) > 0x0F);
+	setC(((reg_SP & 0xFF) + (e & 0xFF)) > 0xFF);
+	reg_HL = (WORD)(result & 0xFFFF);
+	setZ(0);
+	setN(0);
 	cycleLength(12);
 } // F8    LD   HL,SP+dd
 

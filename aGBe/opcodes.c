@@ -55,7 +55,9 @@ WORD DECWreg(WORD reg){
 
 
 BYTE ADDreg(BYTE regA, BYTE regB){
+	// BUG FIX: H (half-carry, carry out of bit 3) was never set at all.
 	int a = regA + regB;
+	setH(((regA & 0x0F) + (regB & 0x0F)) > 0x0F);
 	setC(a != (a & 0xFF));
 	if (a==0) { setZ(1); } else { setZ(0); }
 	setN(0);
@@ -63,7 +65,11 @@ BYTE ADDreg(BYTE regA, BYTE regB){
 }
 
 BYTE ADCreg(BYTE regA, BYTE regB){
-	int a = regA + regB + getC(); //0x00;//= ADC(regA);
+	// BUG FIX: H never set; also has to include the incoming carry bit in the
+	// half-carry calculation, not just regA/regB.
+	int carryIn = getC();
+	int a = regA + regB + carryIn;
+	setH(((regA & 0x0F) + (regB & 0x0F) + carryIn) > 0x0F);
 	setC(a != (a & 0xFF));
 	if (a==0) { setZ(1); } else { setZ(0); }
 	setN(0);
@@ -71,7 +77,9 @@ BYTE ADCreg(BYTE regA, BYTE regB){
 }
 
 BYTE SUBreg(BYTE regA, BYTE regB){
+	// BUG FIX: H (borrow out of bit 4) was never set at all.
 	int a = regA - regB;
+	setH((regA & 0x0F) < (regB & 0x0F));
 	setC(a != (a & 0xFF));
 	if (a==0) { setZ(1); } else { setZ(0); }
 	setN(1);
@@ -79,7 +87,10 @@ BYTE SUBreg(BYTE regA, BYTE regB){
 }
 
 BYTE SBCreg(BYTE regA, BYTE regB){
-	int a = regA - regB - getC();  /// get_rH()
+	// BUG FIX: H never set; must include the incoming carry/borrow bit.
+	int carryIn = getC();
+	int a = regA - regB - carryIn;
+	setH((int)(regA & 0x0F) - (int)(regB & 0x0F) - carryIn < 0);
 	setC(a != (a & 0xFF));
 	if (a==0) { setZ(1); } else { setZ(0); }
 	setN(1);
@@ -96,24 +107,32 @@ BYTE ANDreg(BYTE regA, BYTE regB){
 }
 
 BYTE ORreg(BYTE regA, BYTE regB){
+    // BUG FIX: OR always clears H on real hardware; this never touched it,
+    // silently leaking whatever H happened to be left over from a prior op.
     int a;
     a = regA | regB;
     setC(0);
     if (a==0) { setZ(1); } else { setZ(0); }
     setN(0);
+    setH(0);
 	return (BYTE)a;
 }
 
 BYTE XORreg(BYTE regA, BYTE regB){
+	// BUG FIX: same H-not-cleared gap as ORreg above.
 	int a;
 	a = (regA ^ regB) & 0xFF;
 	setC(0);
 	if (a==0) { setZ(1); } else { setZ(0); }
 	setN(0);
+	setH(0);
 	return (BYTE)a;
 }
 
 void CPreg(BYTE regA, BYTE regB) {
+	// BUG FIX: CP is a SUB that discards its result but still sets flags the
+	// same way SUB does - H was never set here at all.
+	setH((regA & 0x0F) < (regB & 0x0F));
 	setC(regA < regB);
 	if (regA==regB) { setZ(1); } else { setZ(0); }
 	setN(1);
@@ -137,8 +156,13 @@ WORD jp(WORD reg) {
 	return reg;
 }
 WORD ADDWreg(WORD regA, WORD regB) {
+	// BUG FIX: never set H, never cleared N. Real hardware: ADD HL,rr clears
+	// N, sets H from a carry out of bit 11 (i.e. the low 12 bits overflow),
+	// sets C from a carry out of bit 15, and leaves Z alone entirely.
 	int aW = regA + regB;
+	setH(((regA & 0x0FFF) + (regB & 0x0FFF)) > 0x0FFF);
 	setC(aW != (aW & 0xFFFF));
+	setN(0);
 	aW &= 0xFFFF;
 	return (WORD)aW;
 }
