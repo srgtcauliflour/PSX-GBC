@@ -436,7 +436,32 @@ void cycleLength(int cycle) {
 				VideoCyclesLeft = VBLANK_CYCLES; // BUG FIX: see OAM_CYCLES above
 				if (LCDY == 0x90) {
 					vblank();
-					if ((LCDSTATUS >> 4) & 0x01) { IFLAG |= 0x01; }
+					// BUG FIX (severe): the dedicated VBlank interrupt (IF
+					// bit 0) was incorrectly gated on STAT bit 4 - it was
+					// only ever requested if the game had ALSO opted into
+					// STAT's separate "fire the LCD STAT interrupt at
+					// VBlank too" feature. Real hardware fires the
+					// dedicated VBlank interrupt completely unconditionally
+					// every single time LY reaches 144; STAT bit 4 only
+					// controls whether the *STAT* interrupt (IF bit 1)
+					// *additionally* fires at that same moment for
+					// programs that prefer to handle everything through
+					// one unified STAT interrupt path instead. Since most
+					// games (any that just HALT waiting on the ordinary,
+					// dedicated VBlank interrupt without touching STAT's
+					// interrupt-source-enable bits at all - an extremely
+					// common, arguably the single most common wait pattern
+					// in the entire GB library) never set STAT bit 4, this
+					// meant IF bit 0 could never be set at all, hanging any
+					// such game in HALT forever waiting for an interrupt
+					// that would never come. Found via real-world testing
+					// with an actual commercial ROM (Pokemon Red) hanging
+					// completely a fraction of a second into booting -
+					// every synthetic/test-ROM check this project had
+					// relied on before now happened not to exercise this
+					// exact, extremely common pattern.
+					IFLAG |= 0x01;
+					if ((LCDSTATUS >> 4) & 0x01) { IFLAG |= 0x02; }
 				}
 			}
 			if (LCDY == LYC) { IFLAG |= 0x02; } // 3

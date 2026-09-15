@@ -35,12 +35,15 @@ unsigned long PadRead(int pad_num);
 //
 // NOTE: this reads the whole ROM into RAM up front, same as the rest of
 // the emulator core assumes (ROM[loc] is a flat pointer, no bank
-// streaming). That's fine for the vast majority of the GB/GBC library
-// (32KB-512KB), but the small number of very large late-era GBC games
-// (up to 4-8MB) won't fit in the PS1's 2MB of RAM alongside everything
-// else this way - see STATUS.md for the real fix (stream only the
-// active MBC bank from CD on demand), which is a separate, bigger task.
-#define MAX_ROM_SIZE (512 * 1024)
+// streaming). 1.5MB comfortably covers the large majority of the real
+// GB/GBC library including some of the biggest, most common carts (e.g.
+// Pokemon Red/Blue and Yellow are both exactly 1MB) while leaving safe
+// headroom in the PS1's 2MB of RAM for everything else the emulator
+// needs (VRAM/internal RAM/OAM/cart RAM buffers, code, stack). The small
+// number of even larger late-era GBC games (up to 4-8MB) still won't
+// fit this way - see STATUS.md for the real fix (stream only the active
+// MBC bank from CD on demand), which is a separate, bigger task.
+#define MAX_ROM_SIZE (1536 * 1024)
 int LoadROMFromCD(const char *filename, BYTE *dest, int maxSize);
 
 // List up to maxFiles entries from the disc's root directory into
