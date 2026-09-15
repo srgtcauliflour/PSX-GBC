@@ -34,19 +34,31 @@ u_long pad, lastpad;
 #define SCREEN_XRES 320
 #define SCREEN_YRES 240
 
-static DISPENV disp_env;
-static DRAWENV draw_env;
+// BUG FIX (tearing): this used to be a single DISPENV/DRAWENV pair, with
+// Draw_Buffer() blitting straight into the region currently being shown
+// on screen - visible as tearing whenever a blit happened to land while
+// that same area was being scanned out to the TV. Standard PS1 double
+// buffering: two vertically-stacked regions in VRAM (0-239 and 240-479),
+// with disp[i]/draw[i] deliberately pointing at OPPOSITE halves for the
+// same index i, so showing disp[db] while drawing into draw[db] always
+// targets two different physical areas. Flipping db each frame means
+// each half alternates between "currently displayed" and "safe to draw
+// the next frame into" - the same pattern PSn00bSDK's own multi-buffer
+// examples (e.g. examples/cdrom/cdbrowse) use.
+static DISPENV disp_env[2];
+static DRAWENV draw_env[2];
+static int db = 0;
 
 // ---- Game Boy screen rendering ---------------------------------------
 // The emulator core hands off a raw 160x144 buffer of 2-bit shade indices
 // (0=white/lightest .. 3=black/darkest - the standard BGP/OBP register
 // shade semantics, already resolved by the core's own palette lookups) by
 // calling Draw_Buffer() once per emulated frame, from vblank(). Converting
-// that to real pixels and blitting it straight into the currently
-// displayed VRAM area (via a synchronous LoadImage(), no primitive/OT
-// queue needed) is the simplest rendering path that actually works -
-// proper double buffering to eliminate tearing is a real, separate
-// follow-up once the core pipeline is confirmed solid on real hardware.
+// that to real pixels and blitting it into the currently non-displayed
+// half of VRAM (via a synchronous LoadImage(), no primitive/OT queue
+// needed for a plain, non-animated blit like this) and then flipping
+// which half is displayed is what actually eliminates the tearing the
+// single-buffer version had.
 static uint16_t gb_framebuffer[GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT];
 
 // BGR555 grayscale shades, brightest (0) to darkest (3).
@@ -63,13 +75,29 @@ void Draw_Buffer(int *screenBuffer) {
 		gb_framebuffer[i] = gb_shade_colors[screenBuffer[i] & 0x03];
 	}
 
+	// Clears draw_env[db]'s half (the one NOT currently displayed) to
+	// black before blitting into it, same as PSn00bSDK's own multi-buffer
+	// examples do every frame - isbg+PutDrawEnv together issue a
+	// synchronous GPU fill of the draw area.
+	PutDrawEnv(&draw_env[db]);
+
+	// draw_env[db] points at the half of VRAM currently NOT being shown
+	// (disp_env[db] shows the other half) - safe to write into without
+	// tearing whatever is currently on screen.
 	RECT rect;
-	rect.x = (SCREEN_XRES - GB_SCREEN_WIDTH) / 2;
-	rect.y = (SCREEN_YRES - GB_SCREEN_HEIGHT) / 2;
+	rect.x = draw_env[db].clip.x + (SCREEN_XRES - GB_SCREEN_WIDTH) / 2;
+	rect.y = draw_env[db].clip.y + (SCREEN_YRES - GB_SCREEN_HEIGHT) / 2;
 	rect.w = GB_SCREEN_WIDTH;
 	rect.h = GB_SCREEN_HEIGHT;
 	LoadImage(&rect, (const uint32_t *) gb_framebuffer);
 	DrawSync(0);
+
+	// Now that the frame we just drew is complete, show it (and start
+	// drawing the next one into what was, until this line, the displayed
+	// half) by flipping to the other index.
+	PutDispEnv(&disp_env[db]);
+	SetDispMask(1);
+	db = !db;
 }
 
 // Legacy GsLib-era hooks the core still calls from vblank() (PrepScreen();
@@ -128,12 +156,23 @@ unsigned long PadRead(int pad_num) {
 void init_PSX(void) {
 	ResetGraph(0);
 
-	SetDefDrawEnv(&draw_env, 0, 0, SCREEN_XRES, SCREEN_YRES);
-	SetDefDispEnv(&disp_env, 0, 0, SCREEN_XRES, SCREEN_YRES);
-	setRGB0(&draw_env, 0, 0, 0);
-	draw_env.isbg = 1;
-	PutDrawEnv(&draw_env);
-	PutDispEnv(&disp_env);
+	// Two vertically-stacked 320x240 regions in VRAM: disp_env[i] and
+	// draw_env[i] deliberately point at OPPOSITE halves for the same i
+	// (see the comment above the buffer declarations) - this is what
+	// makes alternating db between 0 and 1 in Draw_Buffer() actually
+	// double-buffer instead of drawing into what's currently shown.
+	SetDefDispEnv(&disp_env[0], 0, 0, SCREEN_XRES, SCREEN_YRES);
+	SetDefDispEnv(&disp_env[1], 0, SCREEN_YRES, SCREEN_XRES, SCREEN_YRES);
+	SetDefDrawEnv(&draw_env[0], 0, SCREEN_YRES, SCREEN_XRES, SCREEN_YRES);
+	SetDefDrawEnv(&draw_env[1], 0, 0, SCREEN_XRES, SCREEN_YRES);
+
+	int i;
+	for (i = 0; i < 2; i++) {
+		setRGB0(&draw_env[i], 0, 0, 0);
+		draw_env[i].isbg = 1;
+	}
+	PutDrawEnv(&draw_env[0]);
+	PutDispEnv(&disp_env[0]);
 	SetDispMask(1);
 
 	// Loads PSn00bSDK's built-in debug font into an unused corner of VRAM
