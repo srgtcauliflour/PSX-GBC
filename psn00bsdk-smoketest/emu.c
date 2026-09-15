@@ -8,8 +8,9 @@
 #include <string.h>
 #include <sys/types.h>
 #include "main.h"
-//#include "mem.h"
 #include "emu.h"
+#include "opcodes.h"
+#include "pad.h"
 #include "core_state.h"
 
 // defines ////////////////////////////////////////////////////
@@ -2140,7 +2141,12 @@ void OPEC(void){printf("Incomplete Opcode! EC\n");}
 void OPED(void){printf("Incomplete Opcode! ED\n");}
 
 void OPEE(void){ // case  0xEE:
-reg_A = XORreg(ReadMEM(reg_PC++)); cycleLength(8); } // EE    XOR  nn
+// BUG FIX: was calling XORreg with only one argument (missing reg_A) - only
+// ever "worked" because implicit function declarations let the compiler
+// silently accept any argument count, feeding XORreg whatever happened to
+// be in the register the ABI would have used for a second argument. XOR n
+// (immediate) has been undefined ever since.
+reg_A = XORreg(reg_A, ReadMEM(reg_PC++)); cycleLength(8); } // EE    XOR  nn
 void OPEF(void){ // case  0xEF:
 reg_PC = rst(0x0028);
 cycleLength(16);
@@ -2272,7 +2278,7 @@ void CB1A(void) {  reg_D = RR(reg_D); cycleLength(8); } // CB1A	 	RR 1,D
 void CB1B(void) {  reg_E = RR(reg_E); cycleLength(8); } // CB1B	 	RR 1,E
 void CB1C(void) {  put_rH(RR(get_rH())); cycleLength(8); } // CB1C	 	RR 1,H
 void CB1D(void) {  put_rL(RR(get_rL())); cycleLength(8); } // CB1D	 	RR 1,L
-void CB1E(void) {  WriteMEM(reg_HL, RR(1, ReadMEM(reg_HL))); cycleLength(16); } // CB1E	 	RR 1,(HL)
+void CB1E(void) {  WriteMEM(reg_HL, RR(ReadMEM(reg_HL))); cycleLength(16); } // CB1E RR (HL) -- BUG FIX: was passing a stray extra "1" argument RR doesn't take (copy-paste from a BIT/SET/RES-style call)
 void CB1F(void) {  reg_A = RR(reg_A); cycleLength(8); } // CB1F	 	RR 1,A
 
 void CB20(void) {  reg_B = SLA(reg_B); cycleLength(8); } // CB20		SLA 0,B

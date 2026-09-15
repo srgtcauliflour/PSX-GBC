@@ -80,12 +80,19 @@ CdlFILE	cdf;
 char timbuffer[1];
 //char timbuffer[155648];		// ~150k needs unalloc
 long	games;				// Fnt screen
-u_long pad, lastpad;
+// BUG FIX: was a real (tentative) definition duplicated across this header
+// AND pad.h (both included together by main.c/psx.c/gui.c/emu.c) - two
+// separate tentative definitions of the same symbols even within one
+// file, before considering every other file that includes both headers.
+// `extern` here; the one real definition lives in psx.c.
+extern u_long pad, lastpad;
 int activeBuffer;
 
 struct RomList list[1024];		//128k
 //char	rombuffer[32768];	//128k
 //char ROM[131072];
 //char ROM[131072];
-BYTE *ROM;
+// BUG FIX: was a real (tentative) definition here; extern now, real
+// definition lives in psx.c (see the note there).
+extern BYTE *ROM;
 u_long  filePos;

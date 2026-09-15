@@ -18,6 +18,14 @@
 //#include "mem.h"
 #include "psx.h"
 
+// The one real (defining) declaration of pad/lastpad and ROM - every other
+// file that needs them gets `extern` declarations from pad.h/psx.h instead.
+// See the BUG FIX notes in those headers for why this matters on any
+// compiler that isn't defaulting to old-style "common symbol" linking.
+u_long pad, lastpad;
+BYTE *ROM;
+
+
 
 
 

@@ -17,16 +17,21 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
 #include <psxgpu.h>
 #include <psxetc.h>
 #include "main.h"
 #include "emu.h"
+#include "pad.h"
 #include "core_state.h"
 
-// ---- Platform hooks the core calls into (see core_state.h) ----
-// Real controller/GPU integration is follow-up work for the platform-layer
-// port; these placeholders let the core run standalone for this test.
-u_long pad = 0, lastpad = 0;
+// The one real definition of pad (extern-declared in pad.h) for this test
+// executable, plus the platform hooks the core calls into (see
+// core_state.h). Real controller/GPU integration is follow-up work for the
+// platform-layer port; these placeholders let the core run standalone.
+u_long pad = 0;
+u_long lastpad = 0;
+BYTE *ROM;
 u_long PadRead(int pad_num) { (void)pad_num; return 0; }
 void Draw_Buffer(int *screenBuffer) { (void)screenBuffer; }
 void PrepScreen(void) {}
