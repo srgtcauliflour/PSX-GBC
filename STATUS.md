@@ -7,43 +7,55 @@ into something on a path to a real Release build.
 
 ## Layout
 
-- `aGBe/` — the canonical, fixed source. This is what a real platform port
-  builds from.
+- `aGBe/` — the canonical, fixed source, including the real PSn00bSDK
+  platform layer (`psx.c`/`psx.h`/`main.c`). This is what actually builds
+  and runs on real PS1 hardware/toolchain now.
 - `test-harness/` — a host-native (Linux gcc) build of the *unmodified*
-  CPU/MBC core (`emu.c`+`opcodes.c`) against stub PSX SDK headers, so it can
-  be run against real Game Boy test ROMs without needing the PS1 toolchain.
-  Also contains `refharness.c`, a second core (Peanut-GB, MIT-licensed)
-  wired up to print identical per-instruction traces, for diffing against
-  aGBe's own core to pinpoint exact divergences.
-- `psn00bsdk-smoketest/` — a real PSn00bSDK CMake project proving the core
-  compiles and links into a genuine bootable PS-EXE. Not the real
-  front-end — see "What's next" below.
+  CPU/MBC/PPU core (`emu.c`+`opcodes.c`) against stub PSX SDK headers, so
+  it can be run against real Game Boy test ROMs without needing the PS1
+  toolchain. Also contains `refharness.c`, a second core (Peanut-GB,
+  MIT-licensed) wired up to print identical per-instruction traces, for
+  diffing against aGBe's own core to pinpoint exact divergences. Has
+  opt-in visual debugging via env vars: `DUMP_PPM=<path>` dumps the
+  rendered screen to a PGM/PPM image, `ROWSUMMARY=1` prints a per-row
+  non-white-pixel count, `DUMP_VRAM=1` dumps the tile map/tile data/
+  palette at exit, `TRACE`/`trace` arg give per-instruction register
+  traces.
+- `psn00bsdk-build/` — the real CMake project that builds `aGBe/`'s
+  canonical source directly (no copy-and-sync step) into a bootable
+  PS-EXE via the real PSn00bSDK toolchain.
+- `psn00bsdk-smoketest/` — an earlier proof-of-concept (superseded by
+  `psn00bsdk-build/` now that the real platform layer exists). Kept for
+  reference; not the thing to build from going forward.
 
 ## How to rebuild and test right now
 
 ```sh
 # Host-native correctness testing (no PS1 toolchain needed)
 cd test-harness
-gcc -w -fcommon -I psx-stubs -I ../aGBe emu.c opcodes.c harness.c -o harness
-./harness /path/to/test.gb 30000000        # run a ROM, see Blargg pass/fail
-./harness /path/to/test.gb 30000000 trace  # per-instruction register trace
+gcc -w -fcommon -I psx-stubs -I ../aGBe ../aGBe/emu.c ../aGBe/opcodes.c harness.c -o harness
+./harness /path/to/test.gb 30000000         # run a ROM, see Blargg pass/fail
+./harness /path/to/test.gb 30000000 trace   # per-instruction register trace
+DUMP_PPM=out.ppm ./harness /path/to/test.gb 30000000   # dump rendered screen
+ROWSUMMARY=1 ./harness /path/to/test.gb 30000000       # per-row pixel counts
+DUMP_VRAM=1 ./harness /path/to/test.gb 30000000        # tile map/data/palette dump
 
 # Blargg's test ROMs: https://github.com/retrio/gb-test-roms
 # Mooneye's test ROMs (not yet run this session): https://github.com/Gekkio/mooneye-test-suite
 ```
 
-For the real PS1 toolchain (already set up in this session's sandbox at
-`/opt/psn00bsdk`, not included in this archive due to size — see
+For the real PS1 build (toolchain already set up in this session's sandbox
+at `/opt/psn00bsdk`, not included in this archive due to size — see
 "Setting up the toolchain yourself" below):
 
 ```sh
 export PATH="/opt/psn00bsdk/toolchain/bin:$PATH"
 export PSN00BSDK_LIBS="/opt/psn00bsdk/sdk/PSn00bSDK-0.24-Linux/lib/libpsn00b"
-cd psn00bsdk-smoketest
+cd psn00bsdk-build
 cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE="$PSN00BSDK_LIBS/cmake/sdk.cmake" \
   -DPSN00BSDK_TC="" -DPSN00BSDK_TARGET="mipsel-none-elf"
 cmake --build build
-# -> build/smoketest.exe is a real PS-EXE
+# -> build/agbe.exe is a real, bootable PS-EXE running the actual emulator
 ```
 
 ### Setting up the toolchain yourself
@@ -58,47 +70,59 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
 
 ## What's proven so far
 
-- **CPU/MBC/PPU core correctness** (`aGBe/emu.c`, `aGBe/opcodes.c`): dozens
-  of real, confirmed bugs fixed this session — see `git log` for the full,
-  detailed list. Validated against Blargg's `cpu_instrs` test suite: went
-  from every single test hanging forever (0/11), to 6/11, to a clean
-  **11/11 passing**. The methodology that got the last 5 tests across the
-  line: generate a tiny ROM that exercises every input combination for one
-  suspect opcode, run it through both this core and a reference core
-  (Peanut-GB, MIT-licensed) via `test-harness/refharness.c`, diff the
-  post-instruction state. Found several "unmasked Z-flag" bugs this way
-  (e.g. `0x00 - 0xFF - 1` wraps to a real zero result that an unmasked
-  `a == 0` check misses) that were otherwise invisible.
-  `instr_timing.gb` (the dedicated cycle-timing test, stricter than
-  cpu_instrs) still fails at one remaining point — see "What's next".
+- **CPU/MBC/PPU core correctness**: dozens of real, confirmed bugs fixed
+  this session — see `git log` for the full, detailed list. Validated
+  against Blargg's `cpu_instrs` test suite: went from every single test
+  hanging forever (0/11) to a clean **11/11 passing**. Key technique:
+  generate a tiny ROM exercising every input combination for one suspect
+  opcode, run it through both this core and the Peanut-GB reference core,
+  diff the post-instruction state — found several "unmasked Z-flag" bugs
+  this way that were otherwise invisible.
+- **Real rendering, visually verified for the first time.** Every test up
+  to this point only checked CPU/flag state or serial output - nothing
+  had ever checked actual pixels. Standing up real GPU output surfaced
+  (and this session fixed) a cluster of real rendering bugs: BGP/OBP0/
+  OBP1 palette registers never initialized (defaulted to an all-black-
+  mapping 0 instead of the real post-boot defaults), a line-0 rendering
+  skip, missing background-scroll wraparound, and — the big one — a
+  severely broken sprite-rendering inner loop that reused the outer
+  sprite-index variable, compounded by unzeroed OAM memory producing
+  phantom garbage sprites. Confirmed fixed by dumping the actual
+  rendered framebuffer to an image and visually reading real, legible
+  "02-interrupts" / "Passed" text rendered through the genuine tile
+  pipeline.
 - **MBC1/2/3/5 bank switching, RAM-enable gating, a basic MBC3 RTC.**
-- **Toolchain viability**: the core compiles and links into a genuine
-  bootable PS-EXE with the real, free PSn00bSDK toolchain (see
-  `agbe-boot-screenshot.png` and `agbe-smoketest.psexe` alongside this
-  archive — confirmed booting in mednafen with the open-source OpenBIOS).
+- **Real PSn00bSDK platform layer.** `psx.c`/`psx.h`/`main.c` are now a
+  genuine (if minimal) implementation, not GsLib stubs: real GPU output,
+  real controller input (`InitPAD`/`StartPAD`). Builds and links into a
+  real, bootable PS-EXE (`psn00bsdk-build/build/agbe.exe`) that runs an
+  embedded demo ROM through the actual `runEmu()` loop.
 
 ## What's next (roughly in priority order)
 
-1. Run Mooneye's MBC1/MBC5 test ROMs to validate the bank-switching work.
-2. **Real platform-layer port.** `psx.c`/`gui.c`/`main.c` still assume
-   Psy-Q's GsLib (`GsSPRITE`, `GsOT`, `GsSortSprite`, ...), which PSn00bSDK
-   has no equivalent for. This needs a genuine rewrite against raw
-   `psxgpu.h` primitives (ordering tables, `POLY_FT4`/`SPRT` primitives).
-   `core_state.h` in the smoke test is a preview of the necessary split
-   between "core state" and "GsLib rendering state."
-3. **Real controller input.** `PadRead()` is a stub. Port to PSn00bSDK's
-   `psxpad.h` buffer-polling model (different shape than Psy-Q's simple
-   polled `PadRead()`).
-4. **CD-ROM ROM loading.** The original `AGBEBANK.BIN` multi-ROM bundle
-   format's packing tool was never committed to CVS — it needs to be
-   rebuilt (a small Python script is enough) alongside switching the raw
-   `CdRead()` sector calls to PSn00bSDK's `psxcd.h` + `mkpsxiso` for the
-   actual bootable CD image.
+1. **Sprite X/Y flipping.** `iflipx`/`iflipy` are read from OAM in
+   `DrawOBJline` but never actually applied to pixel indexing — real gap,
+   found alongside the other sprite bugs but out of scope for that fix.
+2. **Double buffering.** `Draw_Buffer` currently blits straight into the
+   displayed VRAM area — works, but can tear. Needs a second buffer and
+   `PutDispEnv` flip, alternating like the PSn00bSDK template examples do.
+3. **Real CD-ROM ROM loading**, replacing `main.c`'s embedded demo ROM.
+   The original `AGBEBANK.BIN` multi-ROM bundle format's packing tool was
+   never committed to CVS — needs rebuilding (a small Python script is
+   enough) alongside switching to PSn00bSDK's `psxcd.h` + `mkpsxiso` for
+   the actual bootable CD image.
+4. **GUI/menu.** `gui.c` (splash screen, ROM select menu) is still the
+   old GsLib version and isn't part of the current build at all — needs
+   its own from-scratch rewrite against raw `psxgpu.h` primitives, same
+   as `psx.c` got this session.
 5. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
    — needed for battery-backed cart RAM.
-6. **GBC support and sound** — explicitly deprioritized per the person's
-   direction this session; sound especially can wait until everything else
-   is solid.
+6. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
+   (RGBDS toolchain needed to build them from source; wasn't readily
+   available as a binary this session).
+7. **GBC support and sound** — explicitly deprioritized per the person's
+   direction earlier this session; sound especially can wait until
+   everything else is solid.
 
 ## Known limitation: instr_timing.gb
 
@@ -114,7 +138,7 @@ sensitive to that exact phase in a way `cpu_instrs.gb` (now 11/11) is not.
 Confirmed every individual opcode's cycle cost is correct (audited against
 an authoritative table in an earlier commit) and confirmed the specific
 starting convention used here already matches the reference core's actual
-internal mechanics better than the alternative tried. Not worth further
+internal mechanics better than an alternative tried. Not worth further
 effort without implementing genuine boot-ROM timing emulation — a
 materially bigger undertaking than anything else on this list, for a test
 that doesn't reflect real-game compatibility (real games sync to VBlank/
@@ -128,3 +152,18 @@ Unirom+a pre-flashed memory card (FreePSXBoot) remains possible later
 without extra console hardware, but actual ROM data still needs to come
 from a CD given memory card capacity — see prior discussion in this
 project's chat history for the full reasoning.
+
+## A note on emulator verification via mednafen
+
+Attempts to get a visual screenshot of the built PS-EXE running under
+mednafen (with the open-source OpenBIOS in place of the proprietary
+retail BIOS) got stuck on OpenBIOS's own boot logo indefinitely, for both
+the smoke test and the real build. This looks like a mednafen standalone
+command-line invocation quirk (it's built around CD-image booting, not
+direct EXE injection) rather than anything wrong with the executables
+themselves — independently confirmed correct by `file` and by mednafen's
+own PS-EXE header parser reporting the exact right entry point/text
+segment. Real hardware or a different emulator invocation would likely
+show it correctly; this wasn't pursued further given the higher-value
+pivot to the host-harness PPM-dump approach, which is what actually found
+and helped fix the real rendering bugs above.
