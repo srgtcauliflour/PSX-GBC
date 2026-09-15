@@ -69,12 +69,19 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[harness] loaded %s (%ld bytes), cart type 0x%02X, romsize idx 0x%02X, ramsize idx 0x%02X\n",
             argv[1], size, CARTTYPE, ROMSIZE, RAMSIZE);
 
+    int do_trace = (argc >= 4 && strcmp(argv[3], "trace") == 0);
+
     long i;
     WORD lastPC = 0xFFFF;
     int stuckCount = 0;
     for (i = 0; i < max_instr && EMULATING; i++) {
         if (IME && (IFLAG & IER)) {
             interrupt();
+        }
+
+        if (do_trace) {
+            printf("i=%ld PC=%04X SP=%04X A=%02X F=%02X B=%02X C=%02X D=%02X E=%02X H=%02X L=%02X op=%02X opnd=%02X\n",
+                   i, reg_PC, reg_SP, reg_A, reg_F, reg_B, reg_C, reg_D, reg_E, get_rH(), get_rL(), ReadMEM(reg_PC), ReadMEM(reg_PC+1));
         }
 
         // Detect the classic "test finished" spin loop (JR $FE, i.e. jump to self)

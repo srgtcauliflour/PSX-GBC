@@ -26,10 +26,20 @@
 #define VBLANKMODE 1 // 01: During V-Blank
 #define OAMMODE 2    // 10: During Searching OAM-RAM
 #define TRANSFERMODE 3 // 11: During Transfering Data to LCD Driver
-#define VBLANK_CYCLES   109
-#define HBLANK_CYCLES    49
-#define OAM_CYCLES       20
-#define TRANSFER_CYCLES  40
+// BUG FIX: these were scaled by an ad-hoc "CLOCKSPEED" fudge-factor (4.123)
+// at each use site instead of just being the real, exact, well-documented
+// T-state (cycle) counts real DMG hardware uses per PPU mode. The fudge
+// factor didn't reproduce them either: a full visible scanline came out to
+// ~448 cycles here vs the correct 456 (OAM 80 + pixel-transfer 172 +
+// HBlank 204), and a VBlank line came out to ~449 vs the correct 456. That
+// shortfall compounds every scanline and every frame, so LY (and anything
+// timed relative to it - raster effects, VBlank-wait loops, the shared
+// timing assumptions Blargg's test ROMs rely on) drifts further from real
+// hardware the longer a program runs.
+#define VBLANK_CYCLES   456
+#define HBLANK_CYCLES   204
+#define OAM_CYCLES       80
+#define TRANSFER_CYCLES 172
 
 
 // globals ////////////////////////////////////////////////////
@@ -223,11 +233,20 @@ WORD rst(WORD addr){
 
 void interrupt(void){
 	if (IME && (IFLAG & IER)) {
+		// BUG FIX: dispatching an interrupt never advanced any cycles at all.
+		// Real hardware takes 5 M-cycles (20 T-states) to service an interrupt
+		// (2 idle cycles, 2 to push PC like a CALL, 1 to jump to the vector).
+		// Since this runs every time ANY interrupt fires - most commonly
+		// VBlank, ~60 times a second - missing this caused the emulator's
+		// notion of elapsed time to drift further from real hardware the
+		// longer a program ran, throwing off anything that reads LY/timers
+		// expecting them to line up with a specific instruction.
 		if 		  (IFLAG & IER & 0x01) 	      { IFLAG &= ~0x01; IME = 0; reg_PC = rst(0x0040); }  // Bit 0: V-Blank
 		else if (((IFLAG & IER) >> 1) & 0x01) { IFLAG &= ~0x02; IME = 0; reg_PC = rst(0x0048); } //  Bit 1: LCD
 		else if (((IFLAG & IER) >> 2) & 0x01) { IFLAG &= ~0x04; IME = 0; reg_PC = rst(0x0050); } //  Bit 2: Timer Overflow
 		else if (((IFLAG & IER) >> 3) & 0x01) { IFLAG &= ~0x08; IME = 0; reg_PC = rst(0x0058); } //  Bit 3: Serial I/O transfer end
 		else if (((IFLAG & IER) >> 4) & 0x01) { IFLAG &= ~0x10; IME = 0; reg_PC = rst(0x0060); } //  Bit 4: New Value on Selected Joypad Keyline(s)
+		cycleLength(20);
 	}
 }
 
@@ -308,16 +327,20 @@ void cycleLength(int cycle) {
 	if(VideoCyclesLeft <= 0) { // Video
 		if((videoMode == HBLANKMODE) || (videoMode == VBLANKMODE)){
 			LCDY++;
-			if (LCDY > 0x100){
+			// BUG FIX: was wrapping at 0x100 (256) instead of 154 (144 visible
+			// lines + 10 VBlank lines) - real hardware's LY never exceeds 153.
+			// This alone made VBlank last roughly 10x too long relative to a
+			// real frame.
+			if (LCDY >= 154){
 				LCDY = 0;
 			} else if (LCDY < 0x90) {
 				hblank();
 				videoMode = OAMMODE;
-				VideoCyclesLeft = (int)(OAM_CYCLES * CLOCKSPEED);
+				VideoCyclesLeft = OAM_CYCLES; // BUG FIX: no more CLOCKSPEED fudge factor - these are exact T-state counts already
 				if ((LCDSTATUS >> 3) & 0x01) { IFLAG |= 0x02; } // LCD 3
 			} else {
 				videoMode = VBLANKMODE;
-				VideoCyclesLeft = (int)(VBLANK_CYCLES* CLOCKSPEED);
+				VideoCyclesLeft = VBLANK_CYCLES; // BUG FIX: see OAM_CYCLES above
 				if (LCDY == 0x90) {
 					vblank();
 					if ((LCDSTATUS >> 4) & 0x01) { IFLAG |= 0x01; }
@@ -328,13 +351,13 @@ void cycleLength(int cycle) {
 		} else {
 			if (videoMode == OAMMODE) {
 				videoMode = TRANSFERMODE;
-				VideoCyclesLeft = (int)(TRANSFER_CYCLES * CLOCKSPEED);
+				VideoCyclesLeft = TRANSFER_CYCLES; // BUG FIX: see OAM_CYCLES above
 				if ((LCDSTATUS >> 5) & 0x01) { IFLAG |= 0x02; } //3
 				return;
 			}
 			if (videoMode == TRANSFERMODE) {
 				videoMode = HBLANKMODE;
-				VideoCyclesLeft = (int)(HBLANK_CYCLES * CLOCKSPEED);
+				VideoCyclesLeft = HBLANK_CYCLES; // BUG FIX: see OAM_CYCLES above
 				return;
 			}
 		}
@@ -1059,6 +1082,7 @@ void WriteMEM(WORD loc, BYTE b){
 		}
 
 	} else if ( ( loc >= 0xFF80 ) &&  ( loc <= 0xFFFE ) ) { // $FF80-$FFFE - High RAM Area
+		if (getenv("TRACE_FFFE") && loc == 0xFFFE) { fprintf(stderr, "[WATCH] write HIRAM[$FFFE]=%02X at PC=%04X\n", b, reg_PC); }
 		HIRAM[loc - 0xFF80] = b;
 
 	} else if  ( loc == 0xFFFF ) { // $FFFF - Interrupt Enable Register
@@ -1132,17 +1156,17 @@ void OP00(void){  // 00	NOP
 void OP01(void){  // 01	LD	BC,nnnn
 	put_rBC(ReadWord(reg_PC));
 	reg_PC += 2;
-	cycleLength(20);
+	cycleLength(12); // BUG FIX: was 20, real hardware is 12 (3 M-cycles)
 }
 
 void OP02(void){
 	WriteMEM(get_rBC(), reg_A);
-	cycleLength(7);
+	cycleLength(8); // BUG FIX: was 7 (not even a multiple of 4 - impossible on real hardware), correct is 8
 } // 02	LD	(BC),A
 
 void OP03(void){ //  case 0x03:
 	put_rBC(INCWreg(get_rBC()));
-	cycleLength(6);
+	cycleLength(8); // BUG FIX: was 6 (not a multiple of 4), correct is 8
 } // 03	INC	BC
 
 void OP04(void){ // case 0x04:
@@ -1188,7 +1212,7 @@ void OP08(void){ //		case 0x08:
 
 void OP09(void){ //		case 0x09:
 	reg_HL = ADDWreg(reg_HL, get_rBC());
-	cycleLength(12);
+	cycleLength(8); // BUG FIX: was 12, real hardware is 8
 } // 09    ADD  HL,BC
 
 void OP0A(void){ //		case 0x0A:
@@ -1261,7 +1285,7 @@ void OP18(void){ // case  0x18:
 
 void OP19(void){ // case  0x19:
 		reg_HL = ADDWreg(reg_HL, get_rDE());
-		cycleLength(16);
+		cycleLength(8); // BUG FIX: was 16, real hardware is 8
 } //19    ADD  HL,DE
 
 void OP1A(void){ // case  0x1A:
@@ -1271,7 +1295,7 @@ void OP1A(void){ // case  0x1A:
 
 void OP1B(void){ // case  0x1B:
 	put_rDE(DECWreg(get_rDE()));
-	cycleLength(4);
+	cycleLength(8); // BUG FIX: was 4, real hardware is 8
 } // 1B    DEC  DE
 
 void OP1C(void){
@@ -1312,7 +1336,7 @@ void OP21(void){ // case  0x21:
 void OP22(void){ // case  0x22:
 	WriteMEM(reg_HL, reg_A);
 	reg_HL = INCWreg(reg_HL);
-	cycleLength(16);
+	cycleLength(8); // BUG FIX: was 16, real hardware is 8
 } // 22    LDI  (HL),A
 
 void OP23(void){ // case  0x23:
@@ -1366,13 +1390,13 @@ void OP28(void){ // case  0x28:
 
 void OP29(void){ // case  0x29:
 	reg_HL = ADDWreg(reg_HL, reg_HL);
-	cycleLength(12);
+	cycleLength(8); // BUG FIX: was 12, real hardware is 8
 } // 29    ADD  HL,HL
 
 void OP2A(void){ // case  0x2A:
 	reg_A = ReadMEM(reg_HL);
 	reg_HL = INCWreg(reg_HL);
-	cycleLength(16);
+	cycleLength(8); // BUG FIX: was 16, real hardware is 8
 } // 2A    LDI  A,(HL)
 
 void OP2B(void){ // case  0x2B:
@@ -1418,7 +1442,7 @@ void OP31(void){ // case  0x31:
 void OP32(void){ // case  0x32:
 	WriteMEM(reg_HL, reg_A);
 	reg_HL = DECWreg(reg_HL);
-	cycleLength(16);
+	cycleLength(8); // BUG FIX: was 16, real hardware is 8
 } // 32    LDD  (HL),A
 
 void OP33(void){ // case  0x33:
@@ -1456,13 +1480,13 @@ void OP38(void){ // case  0x38:
 
 void OP39(void){ // case  0x39:
 	reg_HL = ADDWreg(reg_HL, reg_SP);
-	cycleLength(12);
+	cycleLength(8); // BUG FIX: was 12, real hardware is 8
 } // 39    ADD  HL,SP
 
 void OP3A(void){ // case  0x3A:
 	reg_A = ReadMEM(reg_HL);
 	reg_HL = DECWreg(reg_HL);
-	cycleLength(16);
+	cycleLength(8); // BUG FIX: was 16, real hardware is 8
 } // 3A    LDD  A,(HL)
 
 void OP3B(void){ // case  0x3B:
@@ -1984,17 +2008,17 @@ void OPD0(void){ // case  0xD0:
 
 void OPD1(void){ // case  0xD1:
 	put_rDE(pop());
-	cycleLength(10);
+	cycleLength(12); // BUG FIX: was 10 (not a multiple of 4), correct is 12
 } // D1    POP  DE
 
 void OPD2(void){ // case  0xD2:
 	if (getC() != 1) {
 		reg_PC = jp(ReadWord(reg_PC));
 		//reg_PC += 2; // TODO: TEST
-		cycleLength(20);
+		cycleLength(16); // BUG FIX: was 20, real hardware is 16 when taken
 	} else {
 		reg_PC += 2;
-		cycleLength(8);
+		cycleLength(12); // BUG FIX: was 8, real hardware is 12 when not taken
 	}
 }// D2    JP   NC,nnnn
 
@@ -2134,7 +2158,7 @@ cycleLength(16);
 
 void OPF0(void){ // case  0xF0:
 	reg_A = ReadMEM( 0xFF00 | ReadMEM(reg_PC++));
-	cycleLength(8);
+	cycleLength(12); // BUG FIX: was 8, real hardware is 12
 } // F0    LD   A,($FF00+nn)
 
 void OPF1(void){ // case  0xF1:
@@ -2225,295 +2249,295 @@ void OPFF(void){ // case  0xFF:
 
 // Case CB
 
-void CB00(void) {	reg_B = RLC(reg_B); }  // CB00		RLC B
-void CB01(void) {	reg_C = RLC(reg_C); }  // CB01		RLC C
-void CB02(void) { 	reg_D = RLC(reg_D); }  // CB02		RLC D
-void CB03(void) { 	reg_E = RLC(reg_E); }  // CB03		RLC E
-void CB04(void) { 	put_rH(RLC(get_rH())); }  // CB04		RLC H
-void CB05(void) {   put_rL(RLC(get_rL())); }  // CB05		RLC L
-void CB06(void) {   WriteMEM(reg_HL, RLC(ReadMEM(reg_HL))); } // CB06		RLC (HL)		15	4	2
-void CB07(void) {   reg_A = RLC(reg_A); } // CB07		RLC A
+void CB00(void) {	reg_B = RLC(reg_B); cycleLength(8); }  // CB00		RLC B
+void CB01(void) {	reg_C = RLC(reg_C); cycleLength(8); }  // CB01		RLC C
+void CB02(void) { 	reg_D = RLC(reg_D); cycleLength(8); }  // CB02		RLC D
+void CB03(void) { 	reg_E = RLC(reg_E); cycleLength(8); }  // CB03		RLC E
+void CB04(void) { 	put_rH(RLC(get_rH())); cycleLength(8); }  // CB04		RLC H
+void CB05(void) {   put_rL(RLC(get_rL())); cycleLength(8); }  // CB05		RLC L
+void CB06(void) {   WriteMEM(reg_HL, RLC(ReadMEM(reg_HL))); cycleLength(16); } // CB06		RLC (HL)		15	4	2
+void CB07(void) {   reg_A = RLC(reg_A); cycleLength(8); } // CB07		RLC A
 
-void CB08(void) {  reg_B = RRC(reg_B); } // CB08	 	RRC 7,B
-void CB09(void) {  reg_C = RRC(reg_C); } // CB09	 	RRC 7,C
-void CB0A(void) {  reg_D = RRC(reg_D); } // CB0A	 	RRC 7,D
-void CB0B(void) {  reg_E = RRC(reg_E); } // CB0B	 	RRC 7,E
-void CB0C(void) {  put_rH(RRC(get_rH())); } // CB0C	 	RRC 7,H
-void CB0D(void) {  put_rL(RRC(get_rL())); } // CB0D	 	RRC 7,L
-void CB0E(void) {  WriteMEM(reg_HL, RRC(ReadMEM(reg_HL))); } // CB0E	 	RRC 7,(HL)
-void CB0F(void) {  reg_A = RRC(reg_A); } // CB0F	 	RRC 7,A
+void CB08(void) {  reg_B = RRC(reg_B); cycleLength(8); } // CB08	 	RRC 7,B
+void CB09(void) {  reg_C = RRC(reg_C); cycleLength(8); } // CB09	 	RRC 7,C
+void CB0A(void) {  reg_D = RRC(reg_D); cycleLength(8); } // CB0A	 	RRC 7,D
+void CB0B(void) {  reg_E = RRC(reg_E); cycleLength(8); } // CB0B	 	RRC 7,E
+void CB0C(void) {  put_rH(RRC(get_rH())); cycleLength(8); } // CB0C	 	RRC 7,H
+void CB0D(void) {  put_rL(RRC(get_rL())); cycleLength(8); } // CB0D	 	RRC 7,L
+void CB0E(void) {  WriteMEM(reg_HL, RRC(ReadMEM(reg_HL))); cycleLength(16); } // CB0E	 	RRC 7,(HL)
+void CB0F(void) {  reg_A = RRC(reg_A); cycleLength(8); } // CB0F	 	RRC 7,A
 
-void CB10(void) {  reg_B = RL(reg_B); } // CB10		RL 0,B
-void CB11(void) {  reg_C = RL(reg_C); } // CB11		RL 0,C
-void CB12(void) {  reg_D = RL(reg_D); } // CB12		RL 0,D
-void CB13(void) {  reg_E = RL(reg_E); } // CB13		RL 0,E
-void CB14(void) {  put_rH(RL(get_rH())); } // CB14	 	RL 0,H
-void CB15(void) {  put_rL(RL(get_rL())); } // CB15	 	RL 0,L
-void CB16(void) {  WriteMEM(reg_HL, RL(ReadMEM(reg_HL))); } // CB16	 	RL 0,(HL)
-void CB17(void) {  reg_A = RL(reg_A); } // CB17	 	RL 0,A
+void CB10(void) {  reg_B = RL(reg_B); cycleLength(8); } // CB10		RL 0,B
+void CB11(void) {  reg_C = RL(reg_C); cycleLength(8); } // CB11		RL 0,C
+void CB12(void) {  reg_D = RL(reg_D); cycleLength(8); } // CB12		RL 0,D
+void CB13(void) {  reg_E = RL(reg_E); cycleLength(8); } // CB13		RL 0,E
+void CB14(void) {  put_rH(RL(get_rH())); cycleLength(8); } // CB14	 	RL 0,H
+void CB15(void) {  put_rL(RL(get_rL())); cycleLength(8); } // CB15	 	RL 0,L
+void CB16(void) {  WriteMEM(reg_HL, RL(ReadMEM(reg_HL))); cycleLength(16); } // CB16	 	RL 0,(HL)
+void CB17(void) {  reg_A = RL(reg_A); cycleLength(8); } // CB17	 	RL 0,A
 
-void CB18(void) {  reg_B = RR(reg_B); } // CB18	 	RR 1,B
-void CB19(void) {  reg_C = RR(reg_C); } // CB19	 	RR 1,C
-void CB1A(void) {  reg_D = RR(reg_D); } // CB1A	 	RR 1,D
-void CB1B(void) {  reg_E = RR(reg_E); } // CB1B	 	RR 1,E
-void CB1C(void) {  put_rH(RR(get_rH())); } // CB1C	 	RR 1,H
-void CB1D(void) {  put_rL(RR(get_rL())); } // CB1D	 	RR 1,L
-void CB1E(void) {  WriteMEM(reg_HL, RR(1, ReadMEM(reg_HL))); } // CB1E	 	RR 1,(HL)
-void CB1F(void) {  reg_A = RR(reg_A); } // CB1F	 	RR 1,A
+void CB18(void) {  reg_B = RR(reg_B); cycleLength(8); } // CB18	 	RR 1,B
+void CB19(void) {  reg_C = RR(reg_C); cycleLength(8); } // CB19	 	RR 1,C
+void CB1A(void) {  reg_D = RR(reg_D); cycleLength(8); } // CB1A	 	RR 1,D
+void CB1B(void) {  reg_E = RR(reg_E); cycleLength(8); } // CB1B	 	RR 1,E
+void CB1C(void) {  put_rH(RR(get_rH())); cycleLength(8); } // CB1C	 	RR 1,H
+void CB1D(void) {  put_rL(RR(get_rL())); cycleLength(8); } // CB1D	 	RR 1,L
+void CB1E(void) {  WriteMEM(reg_HL, RR(1, ReadMEM(reg_HL))); cycleLength(16); } // CB1E	 	RR 1,(HL)
+void CB1F(void) {  reg_A = RR(reg_A); cycleLength(8); } // CB1F	 	RR 1,A
 
-void CB20(void) {  reg_B = SLA(reg_B); } // CB20		SLA 0,B
-void CB21(void) {  reg_C = SLA(reg_C); } // CB21		SLA 0,C
-void CB22(void) {  reg_D = SLA(reg_D); } // CB22		SLA 0,D
-void CB23(void) {  reg_E = SLA(reg_E); } // CB23		SLA 0,E
-void CB24(void) {  put_rH(SLA(get_rH())); } // CB24	 	SLA 0,H
-void CB25(void) {  put_rL(SLA(get_rL())); } // CB25	 	SLA 0,L
-void CB26(void) {  WriteMEM(reg_HL, SLA(ReadMEM(reg_HL))); } // CB26	 	SLA 0,(HL)
-void CB27(void) {  reg_A = SLA(reg_A); } // CB27	 	SLA 0,A
+void CB20(void) {  reg_B = SLA(reg_B); cycleLength(8); } // CB20		SLA 0,B
+void CB21(void) {  reg_C = SLA(reg_C); cycleLength(8); } // CB21		SLA 0,C
+void CB22(void) {  reg_D = SLA(reg_D); cycleLength(8); } // CB22		SLA 0,D
+void CB23(void) {  reg_E = SLA(reg_E); cycleLength(8); } // CB23		SLA 0,E
+void CB24(void) {  put_rH(SLA(get_rH())); cycleLength(8); } // CB24	 	SLA 0,H
+void CB25(void) {  put_rL(SLA(get_rL())); cycleLength(8); } // CB25	 	SLA 0,L
+void CB26(void) {  WriteMEM(reg_HL, SLA(ReadMEM(reg_HL))); cycleLength(16); } // CB26	 	SLA 0,(HL)
+void CB27(void) {  reg_A = SLA(reg_A); cycleLength(8); } // CB27	 	SLA 0,A
 
-void CB28(void) {  reg_B = SRA(reg_B); } // CB28	 	SRA 1,B
-void CB29(void) {  reg_C = SRA(reg_C); } // CB29	 	SRA 1,C
-void CB2A(void) {  reg_D = SRA(reg_D); } // CB2A	 	SRA 1,D
-void CB2B(void) {  reg_E = SRA(reg_E); } // CB2B	 	SRA 1,E
-void CB2C(void) {  put_rH(SRA(get_rH())); } // CB2C	 	SRA 1,H
-void CB2D(void) {  put_rL(SRA(get_rL())); } // CB2D	 	SRA 1,L
-void CB2E(void) {  WriteMEM(reg_HL, SRA(ReadMEM(reg_HL))); } // CB2E	 	SRA 1,(HL)
-void CB2F(void) {  reg_A = SRA(reg_A); } // CB2F	 	SRA 1,A
+void CB28(void) {  reg_B = SRA(reg_B); cycleLength(8); } // CB28	 	SRA 1,B
+void CB29(void) {  reg_C = SRA(reg_C); cycleLength(8); } // CB29	 	SRA 1,C
+void CB2A(void) {  reg_D = SRA(reg_D); cycleLength(8); } // CB2A	 	SRA 1,D
+void CB2B(void) {  reg_E = SRA(reg_E); cycleLength(8); } // CB2B	 	SRA 1,E
+void CB2C(void) {  put_rH(SRA(get_rH())); cycleLength(8); } // CB2C	 	SRA 1,H
+void CB2D(void) {  put_rL(SRA(get_rL())); cycleLength(8); } // CB2D	 	SRA 1,L
+void CB2E(void) {  WriteMEM(reg_HL, SRA(ReadMEM(reg_HL))); cycleLength(16); } // CB2E	 	SRA 1,(HL)
+void CB2F(void) {  reg_A = SRA(reg_A); cycleLength(8); } // CB2F	 	SRA 1,A
 
-void CB30(void) {  reg_B = SLL(reg_B); } // CB30		SLL 0,B
-void CB31(void) {  reg_C = SLL(reg_C); } // CB31		SLL 0,C
-void CB32(void) {  reg_D = SLL(reg_D); } // CB32		SLL 0,D
-void CB33(void) {  reg_E = SLL(reg_E); } // CB33		SLL 0,E
-void CB34(void) {  put_rH(SLL(get_rH())); } // CB34	 	SLL 0,H
-void CB35(void) {  put_rL(SLL(get_rL())); } // CB35	 	SLL 0,L
-void CB36(void) {  WriteMEM(reg_HL, SLL(ReadMEM(reg_HL))); } // CB36	 	SLL 0,(HL)
-void CB37(void) {  reg_A = SLL(reg_A); } // CB37	 	SLL 0,A
+void CB30(void) {  reg_B = SLL(reg_B); cycleLength(8); } // CB30		SLL 0,B
+void CB31(void) {  reg_C = SLL(reg_C); cycleLength(8); } // CB31		SLL 0,C
+void CB32(void) {  reg_D = SLL(reg_D); cycleLength(8); } // CB32		SLL 0,D
+void CB33(void) {  reg_E = SLL(reg_E); cycleLength(8); } // CB33		SLL 0,E
+void CB34(void) {  put_rH(SLL(get_rH())); cycleLength(8); } // CB34	 	SLL 0,H
+void CB35(void) {  put_rL(SLL(get_rL())); cycleLength(8); } // CB35	 	SLL 0,L
+void CB36(void) {  WriteMEM(reg_HL, SLL(ReadMEM(reg_HL))); cycleLength(16); } // CB36	 	SLL 0,(HL)
+void CB37(void) {  reg_A = SLL(reg_A); cycleLength(8); } // CB37	 	SLL 0,A
 
-void CB38(void) { reg_B = SRL(reg_B); } // CB38	 	SRL 1,B
-void CB39(void) {  reg_C = SRL(reg_C); } // CB39	 	SRL 1,C
-void CB3A(void) {  reg_D = SRL(reg_D); } // CB3A	 	SRL 1,D
-void CB3B(void) {  reg_E = SRL(reg_E); } // CB3B	 	SRL 1,E
-void CB3C(void) {  put_rH(SRL(get_rH())); } // CB3C	 	SRL 1,H
-void CB3D(void) {  put_rL(SRL(get_rL())); } // CB3D	 	SRL 1,L
-void CB3E(void) {  WriteMEM(reg_HL, SRL(ReadMEM(reg_HL))); } // CB3E	 	SRL 1,(HL)
-void CB3F(void) {  reg_A = SRL(reg_A); } // CB3F	 	SRL 1,A
-
-
-void CB40(void) {  BIT(0, reg_B); } // CB40		BIT 0,B
-void CB41(void) {  BIT(0, reg_C); } // CB41		BIT 0,C
-void CB42(void) {  BIT(0, reg_D); } // CB42		BIT 0,D
-void CB43(void) {  BIT(0, reg_E); } // CB43		BIT 0,E
-void CB44(void) {  BIT(0, get_rH()); } // CB44	 	BIT 0,H
-void CB45(void) {  BIT(0, get_rL()); } // CB45	 	BIT 0,L
-void CB46(void) {  BIT(0, ReadMEM(reg_HL)); } // CB46	 	BIT 0,(HL)
-void CB47(void) {  BIT(0, reg_A); } // CB47	 	BIT 0,A
-
-void CB48(void) {  BIT(1, reg_B); } // CB48	 	BIT 1,B
-void CB49(void) {  BIT(1, reg_C); } // CB49	 	BIT 1,C
-void CB4A(void) {  BIT(1, reg_D); } // CB4A	 	BIT 1,D
-void CB4B(void) {  BIT(1, reg_E); } // CB4B	 	BIT 1,E
-void CB4C(void) {  BIT(1, get_rH()); } // CB4C	 	BIT 1,H
-void CB4D(void) {  BIT(1, get_rL()); } // CB4D	 	BIT 1,L
-void CB4E(void) {  BIT(1, ReadMEM(reg_HL)); } // CB4E	 	BIT 1,(HL)
-void CB4F(void) {  BIT(1, reg_A); } // CB4F	 	BIT 1,A
-
-void CB50(void) {  BIT(2, reg_B); } // CB50		BIT 2,B
-void CB51(void) {  BIT(2, reg_C); } // CB51		BIT 2,C
-void CB52(void) {  BIT(2, reg_D); } // CB52		BIT 2,D
-void CB53(void) {  BIT(2, reg_E); } // CB53		BIT 2,E
-void CB54(void) {  BIT(2, get_rH()); } // CB54	 	BIT 2,H
-void CB55(void) {  BIT(2, get_rL()); } // CB55	 	BIT 2,L
-void CB56(void) {  BIT(2, ReadMEM(reg_HL)); } // CB56	 	BIT 2,(HL)
-void CB57(void) {  BIT(2, reg_A); } // CB57	 	BIT 2,A
-
-void CB58(void) {  BIT(3, reg_B); } // CB58	 	BIT 3,B
-void CB59(void) {  BIT(3, reg_C); } // CB59	 	BIT 3,C
-void CB5A(void) {  BIT(3, reg_D); } // CB5A	 	BIT 3,D
-void CB5B(void) {  BIT(3, reg_E); } // CB5B	 	BIT 3,E
-void CB5C(void) {  BIT(3, get_rH()); } // CB5C	 	BIT 3,H
-void CB5D(void) {  BIT(3, get_rL()); } // CB5D	 	BIT 3,L
-void CB5E(void) {  BIT(3, ReadMEM(reg_HL)); } // CB5E	 	BIT 3,(HL)
-void CB5F(void) {  BIT(3, reg_A); } // CB5F	 	BIT 3,A
-
-void CB60(void) {  BIT(4, reg_B); } // CB60		BIT 4,B
-void CB61(void) {  BIT(4, reg_C); } // CB61		BIT 4,C
-void CB62(void) {  BIT(4, reg_D); } // CB62		BIT 4,D
-void CB63(void) {  BIT(4, reg_E); } // CB63		BIT 4,E
-void CB64(void) {  BIT(4, get_rH()); } // CB64	 	BIT 4,H
-void CB65(void) {  BIT(4, get_rL()); } // CB65	 	BIT 4,L
-void CB66(void) {  BIT(4, ReadMEM(reg_HL)); } // CB66	 	BIT 4,(HL)
-void CB67(void) {  BIT(4, reg_A); } // CB67	 	BIT 4,A
-
-void CB68(void) {  BIT(5, reg_B); } // CB68	 	BIT 5,B
-void CB69(void) {  BIT(5, reg_C); } // CB69	 	BIT 5,C
-void CB6A(void) {  BIT(5, reg_D); } // CB6A	 	BIT 5,D
-void CB6B(void) {  BIT(5, reg_E); } // CB6B	 	BIT 5,E
-void CB6C(void) {  BIT(5, get_rH()); } // CB6C	 	BIT 5,H
-void CB6D(void) {  BIT(5, get_rL()); } // CB6D	 	BIT 5,L
-void CB6E(void) {  BIT(5, ReadMEM(reg_HL)); } // CB6E	 	BIT 5,(HL)
-void CB6F(void) {  BIT(5, reg_A); } // CB6F	 	BIT 5,A
-
-void CB70(void) {  BIT(6, reg_B); } // CB70		BIT 6,B
-void CB71(void) {  BIT(6, reg_C); } // CB71		BIT 6,C
-void CB72(void) {  BIT(6, reg_D); } // CB72		BIT 6,D
-void CB73(void) {  BIT(6, reg_E); } // CB73		BIT 6,E
-void CB74(void) {  BIT(6, get_rH()); } // CB74	 	BIT 6,H
-void CB75(void) {  BIT(6, get_rL()); } // CB75	 	BIT 6,L
-void CB76(void) {  BIT(6, ReadMEM(reg_HL)); } // CB76	 	BIT 6,(HL)
-void CB77(void) {  BIT(6, reg_A); } // CB77	 	BIT 6,A
-
-void CB78(void) {  BIT(7, reg_B); } // CB78	 	BIT 7,B
-void CB79(void) {  BIT(7, reg_C); } // CB79	 	BIT 7,C
-void CB7A(void) {  BIT(7, reg_D); } // CB7A	 	BIT 7,D
-void CB7B(void) {  BIT(7, reg_E); } // CB7B	 	BIT 7,E
-void CB7C(void) {  BIT(7, get_rH()); } // CB7C	 	BIT 7,H
-void CB7D(void) {  BIT(7, get_rL()); } // CB7D	 	BIT 7,L
-void CB7E(void) {  BIT(7, ReadMEM(reg_HL)); } // CB7E	 	BIT 7,(HL)
-void CB7F(void) {  BIT(7, reg_A); } // CB7F	 	BIT 7,A
+void CB38(void) { reg_B = SRL(reg_B); cycleLength(8); } // CB38	 	SRL 1,B
+void CB39(void) {  reg_C = SRL(reg_C); cycleLength(8); } // CB39	 	SRL 1,C
+void CB3A(void) {  reg_D = SRL(reg_D); cycleLength(8); } // CB3A	 	SRL 1,D
+void CB3B(void) {  reg_E = SRL(reg_E); cycleLength(8); } // CB3B	 	SRL 1,E
+void CB3C(void) {  put_rH(SRL(get_rH())); cycleLength(8); } // CB3C	 	SRL 1,H
+void CB3D(void) {  put_rL(SRL(get_rL())); cycleLength(8); } // CB3D	 	SRL 1,L
+void CB3E(void) {  WriteMEM(reg_HL, SRL(ReadMEM(reg_HL))); cycleLength(16); } // CB3E	 	SRL 1,(HL)
+void CB3F(void) {  reg_A = SRL(reg_A); cycleLength(8); } // CB3F	 	SRL 1,A
 
 
-void CB80(void) {  reg_B = RES(0, reg_B); } // CB80		RES 0,B
-void CB81(void) {  reg_C = RES(0, reg_C); } // CB81		RES 0,C
-void CB82(void) {  reg_D = RES(0, reg_D); } // CB82		RES 0,D
-void CB83(void) {  reg_E = RES(0, reg_E); } // CB83		RES 0,E
-void CB84(void) {  put_rH(RES(0, get_rH())); } // CB84	 	RES 0,H
-void CB85(void) {  put_rL(RES(0, get_rL())); } // CB85	 	RES 0,L
-void CB86(void) {  WriteMEM(reg_HL, RES(0, ReadMEM(reg_HL))); } // CB86	 	RES 0,(HL)
-void CB87(void) {  reg_A = RES(0, reg_A); } // CB87	 	RES 0,A
+void CB40(void) {  BIT(0, reg_B); cycleLength(8); } // CB40		BIT 0,B
+void CB41(void) {  BIT(0, reg_C); cycleLength(8); } // CB41		BIT 0,C
+void CB42(void) {  BIT(0, reg_D); cycleLength(8); } // CB42		BIT 0,D
+void CB43(void) {  BIT(0, reg_E); cycleLength(8); } // CB43		BIT 0,E
+void CB44(void) {  BIT(0, get_rH()); cycleLength(8); } // CB44	 	BIT 0,H
+void CB45(void) {  BIT(0, get_rL()); cycleLength(8); } // CB45	 	BIT 0,L
+void CB46(void) {  BIT(0, ReadMEM(reg_HL)); cycleLength(12); } // CB46	 	BIT 0,(HL)
+void CB47(void) {  BIT(0, reg_A); cycleLength(8); } // CB47	 	BIT 0,A
 
-void CB88(void) {  reg_B = RES(1, reg_B); } // CB88	 	RES 1,B
-void CB89(void) {  reg_C = RES(1, reg_C); } // CB89	 	RES 1,C
-void CB8A(void) {  reg_D = RES(1, reg_D); } // CB8A	 	RES 1,D
-void CB8B(void) {  reg_E = RES(1, reg_E); } // CB8B	 	RES 1,E
-void CB8C(void) {  put_rH(RES(1, get_rH())); } // CB8C	 	RES 1,H
-void CB8D(void) {  put_rL(RES(1, get_rL())); } // CB8D	 	RES 1,L
-void CB8E(void) {  WriteMEM(reg_HL, RES(1, ReadMEM(reg_HL))); } // CB8E	 	RES 1,(HL)
-void CB8F(void) {  reg_A = RES(1, reg_A); } // CB8F	 	RES 1,A
+void CB48(void) {  BIT(1, reg_B); cycleLength(8); } // CB48	 	BIT 1,B
+void CB49(void) {  BIT(1, reg_C); cycleLength(8); } // CB49	 	BIT 1,C
+void CB4A(void) {  BIT(1, reg_D); cycleLength(8); } // CB4A	 	BIT 1,D
+void CB4B(void) {  BIT(1, reg_E); cycleLength(8); } // CB4B	 	BIT 1,E
+void CB4C(void) {  BIT(1, get_rH()); cycleLength(8); } // CB4C	 	BIT 1,H
+void CB4D(void) {  BIT(1, get_rL()); cycleLength(8); } // CB4D	 	BIT 1,L
+void CB4E(void) {  BIT(1, ReadMEM(reg_HL)); cycleLength(12); } // CB4E	 	BIT 1,(HL)
+void CB4F(void) {  BIT(1, reg_A); cycleLength(8); } // CB4F	 	BIT 1,A
 
-void CB90(void) {  reg_B = RES(2, reg_B); } // CB90		RES 2,B
-void CB91(void) {  reg_C = RES(2, reg_C); } // CB91		RES 2,C
-void CB92(void) {  reg_D = RES(2, reg_D); } // CB92		RES 2,D
-void CB93(void) {  reg_E = RES(2, reg_E); } // CB93		RES 2,E
-void CB94(void) {  put_rH(RES(2, get_rH())); } // CB94	 	RES 2,H
-void CB95(void) {  put_rL(RES(2, get_rL())); } // CB95	 	RES 2,L
-void CB96(void) {  WriteMEM(reg_HL, RES(2, ReadMEM(reg_HL))); } // CB96	 	RES 2,(HL)
-void CB97(void) {  reg_A = RES(2, reg_A); } // CB97	 	RES 2,A
+void CB50(void) {  BIT(2, reg_B); cycleLength(8); } // CB50		BIT 2,B
+void CB51(void) {  BIT(2, reg_C); cycleLength(8); } // CB51		BIT 2,C
+void CB52(void) {  BIT(2, reg_D); cycleLength(8); } // CB52		BIT 2,D
+void CB53(void) {  BIT(2, reg_E); cycleLength(8); } // CB53		BIT 2,E
+void CB54(void) {  BIT(2, get_rH()); cycleLength(8); } // CB54	 	BIT 2,H
+void CB55(void) {  BIT(2, get_rL()); cycleLength(8); } // CB55	 	BIT 2,L
+void CB56(void) {  BIT(2, ReadMEM(reg_HL)); cycleLength(12); } // CB56	 	BIT 2,(HL)
+void CB57(void) {  BIT(2, reg_A); cycleLength(8); } // CB57	 	BIT 2,A
 
-void CB98(void) {  reg_B = RES(3, reg_B); } // CB98	 	RES 3,B
-void CB99(void) {  reg_C = RES(3, reg_C); } // CB99	 	RES 3,C
-void CB9A(void) {  reg_D = RES(3, reg_D); } // CB9A	 	RES 3,D
-void CB9B(void) {  reg_E = RES(3, reg_E); } // CB9B	 	RES 3,E
-void CB9C(void) {  put_rH(RES(3, get_rH())); } // CB9C	 	RES 3,H
-void CB9D(void) {  put_rL(RES(3, get_rL())); } // CB9D	 	RES 3,L
-void CB9E(void) {  WriteMEM(reg_HL, RES(3, ReadMEM(reg_HL))); } // CB9E	 	RES 3,(HL)
-void CB9F(void) {  reg_A = RES(3, reg_A); } // CB9F	 	RES 3,A
+void CB58(void) {  BIT(3, reg_B); cycleLength(8); } // CB58	 	BIT 3,B
+void CB59(void) {  BIT(3, reg_C); cycleLength(8); } // CB59	 	BIT 3,C
+void CB5A(void) {  BIT(3, reg_D); cycleLength(8); } // CB5A	 	BIT 3,D
+void CB5B(void) {  BIT(3, reg_E); cycleLength(8); } // CB5B	 	BIT 3,E
+void CB5C(void) {  BIT(3, get_rH()); cycleLength(8); } // CB5C	 	BIT 3,H
+void CB5D(void) {  BIT(3, get_rL()); cycleLength(8); } // CB5D	 	BIT 3,L
+void CB5E(void) {  BIT(3, ReadMEM(reg_HL)); cycleLength(12); } // CB5E	 	BIT 3,(HL)
+void CB5F(void) {  BIT(3, reg_A); cycleLength(8); } // CB5F	 	BIT 3,A
 
-void CBA0(void) {  reg_B = RES(4, reg_B); } // CBA0		RES 4,B
-void CBA1(void) {  reg_C = RES(4, reg_C); } // CBA1		RES 4,C
-void CBA2(void) {  reg_D = RES(4, reg_D); } // CBA2		RES 4,D
-void CBA3(void) {  reg_E = RES(4, reg_E); } // CBA3		RES 4,E
-void CBA4(void) { put_rH(RES(4, get_rH())); } // CBA4	 	RES 4,H
-void CBA5(void) {  put_rL(RES(4, get_rL())); } // CBA5	 	RES 4,L
-void CBA6(void) {  WriteMEM(reg_HL, RES(4, ReadMEM(reg_HL))); } // CBA6	 	RES 4,(HL)
-void CBA7(void) {  reg_A = RES(4, reg_A); } // CBA7	 	RES 4,A
+void CB60(void) {  BIT(4, reg_B); cycleLength(8); } // CB60		BIT 4,B
+void CB61(void) {  BIT(4, reg_C); cycleLength(8); } // CB61		BIT 4,C
+void CB62(void) {  BIT(4, reg_D); cycleLength(8); } // CB62		BIT 4,D
+void CB63(void) {  BIT(4, reg_E); cycleLength(8); } // CB63		BIT 4,E
+void CB64(void) {  BIT(4, get_rH()); cycleLength(8); } // CB64	 	BIT 4,H
+void CB65(void) {  BIT(4, get_rL()); cycleLength(8); } // CB65	 	BIT 4,L
+void CB66(void) {  BIT(4, ReadMEM(reg_HL)); cycleLength(12); } // CB66	 	BIT 4,(HL)
+void CB67(void) {  BIT(4, reg_A); cycleLength(8); } // CB67	 	BIT 4,A
 
-void CBA8(void) {  reg_B = RES(5, reg_B); } // CBA8	 	RES 5,B
-void CBA9(void) {  reg_C = RES(5, reg_C); } // CBA9	 	RES 5,C
-void CBAA(void) {  reg_D = RES(5, reg_D); } // CBAA	 	RES 5,D
-void CBAB(void) {  reg_E = RES(5, reg_E); } // CBAB	 	RES 5,E
-void CBAC(void) {  put_rH(RES(5, get_rH())); } // CBAC	 	RES 5,H
-void CBAD(void) {  put_rL(RES(5, get_rL())); } // CBAD	 	RES 5,L
-void CBAE(void) {  WriteMEM(reg_HL, RES(5, ReadMEM(reg_HL))); } // CBAE	 	RES 5,(HL)
-void CBAF(void) {  reg_A = RES(5, reg_A); } // CBAF	 	RES 5,A
+void CB68(void) {  BIT(5, reg_B); cycleLength(8); } // CB68	 	BIT 5,B
+void CB69(void) {  BIT(5, reg_C); cycleLength(8); } // CB69	 	BIT 5,C
+void CB6A(void) {  BIT(5, reg_D); cycleLength(8); } // CB6A	 	BIT 5,D
+void CB6B(void) {  BIT(5, reg_E); cycleLength(8); } // CB6B	 	BIT 5,E
+void CB6C(void) {  BIT(5, get_rH()); cycleLength(8); } // CB6C	 	BIT 5,H
+void CB6D(void) {  BIT(5, get_rL()); cycleLength(8); } // CB6D	 	BIT 5,L
+void CB6E(void) {  BIT(5, ReadMEM(reg_HL)); cycleLength(12); } // CB6E	 	BIT 5,(HL)
+void CB6F(void) {  BIT(5, reg_A); cycleLength(8); } // CB6F	 	BIT 5,A
 
-void CBB0(void) {  reg_B = RES(6, reg_B); } // CBB0		RES 6,B
-void CBB1(void) {  reg_C = RES(6, reg_C); } // CBB1		RES 6,C
-void CBB2(void) {  reg_D = RES(6, reg_D); } // CBB2		RES 6,D
-void CBB3(void) {  reg_E = RES(6, reg_E); } // CBB3		RES 6,E
-void CBB4(void) {  put_rH(RES(6, get_rH())); } // CBB4	 	RES 6,H
-void CBB5(void) {  put_rL(RES(6, get_rL())); } // CBB5	 	RES 6,L
-void CBB6(void) {  WriteMEM(reg_HL, RES(6, ReadMEM(reg_HL))); } // CBB6	 	RES 6,(HL)
-void CBB7(void) {  reg_A = RES(6, reg_A); } // CBB7	 	RES 6,A
+void CB70(void) {  BIT(6, reg_B); cycleLength(8); } // CB70		BIT 6,B
+void CB71(void) {  BIT(6, reg_C); cycleLength(8); } // CB71		BIT 6,C
+void CB72(void) {  BIT(6, reg_D); cycleLength(8); } // CB72		BIT 6,D
+void CB73(void) {  BIT(6, reg_E); cycleLength(8); } // CB73		BIT 6,E
+void CB74(void) {  BIT(6, get_rH()); cycleLength(8); } // CB74	 	BIT 6,H
+void CB75(void) {  BIT(6, get_rL()); cycleLength(8); } // CB75	 	BIT 6,L
+void CB76(void) {  BIT(6, ReadMEM(reg_HL)); cycleLength(12); } // CB76	 	BIT 6,(HL)
+void CB77(void) {  BIT(6, reg_A); cycleLength(8); } // CB77	 	BIT 6,A
 
-void CBB8(void) {  reg_B = RES(7, reg_B); } // CBB8	 	RES 7,B
-void CBB9(void) {  reg_C = RES(7, reg_C); } // CBB9	 	RES 7,C
-void CBBA(void) {  reg_D = RES(7, reg_D); } // CBBA	 	RES 7,D
-void CBBB(void) {  reg_E = RES(7, reg_E); } // CBBB	 	RES 7,E
-void CBBC(void) { put_rH(RES(7, get_rH())); } // CBBC	 	RES 7,H
-void CBBD(void) {  put_rL(RES(7, get_rL())); } // CBBD	 	RES 7,L
-void CBBE(void) {  WriteMEM(reg_HL, RES(7, ReadMEM(reg_HL))); } // CBBE	 	RES 7,(HL)
-void CBBF(void) {  reg_A = RES(7, reg_A); } // CBBF	 	RES 7,A
+void CB78(void) {  BIT(7, reg_B); cycleLength(8); } // CB78	 	BIT 7,B
+void CB79(void) {  BIT(7, reg_C); cycleLength(8); } // CB79	 	BIT 7,C
+void CB7A(void) {  BIT(7, reg_D); cycleLength(8); } // CB7A	 	BIT 7,D
+void CB7B(void) {  BIT(7, reg_E); cycleLength(8); } // CB7B	 	BIT 7,E
+void CB7C(void) {  BIT(7, get_rH()); cycleLength(8); } // CB7C	 	BIT 7,H
+void CB7D(void) {  BIT(7, get_rL()); cycleLength(8); } // CB7D	 	BIT 7,L
+void CB7E(void) {  BIT(7, ReadMEM(reg_HL)); cycleLength(12); } // CB7E	 	BIT 7,(HL)
+void CB7F(void) {  BIT(7, reg_A); cycleLength(8); } // CB7F	 	BIT 7,A
 
-void CBC0(void) {  reg_B = SET(0, reg_B); } // CBC0		SET 0,B
-void CBC1(void) {  reg_C = SET(0, reg_C); } // CBC1		SET 0,C
-void CBC2(void) {  reg_D = SET(0, reg_D); } // CBC2		SET 0,D
-void CBC3(void) {  reg_E = SET(0, reg_E); } // CBC3		SET 0,E
-void CBC4(void) {  put_rH(SET(0, get_rH())); } // CBC4	 	SET 0,H
-void CBC5(void) {  put_rL(SET(0, get_rL())); } // CBC5	 	SET 0,L
-void CBC6(void) {  WriteMEM(reg_HL, SET(0, ReadMEM(reg_HL))); } // CBC6	 	SET 0,(HL)
-void CBC7(void) {  reg_A = SET(0, reg_A); } // CBC7	 	SET 0,A
 
-void CBC8(void) { reg_B = SET(1, reg_B); } // CBC8	 	SET 1,B
-void CBC9(void) {  reg_C = SET(1, reg_C); } // CBC9	 	SET 1,C
-void CBCA(void) {  reg_D = SET(1, reg_D); } // CBCA	 	SET 1,D
-void CBCB(void) {  reg_E = SET(1, reg_E); } // CBCB	 	SET 1,E
-void CBCC(void) {  put_rH(SET(1, get_rH())); } // CBCC	 	SET 1,H
-void CBCD(void) {  put_rL(SET(1, get_rL())); } // CBCD	 	SET 1,L
-void CBCE(void) {  WriteMEM(reg_HL, SET(1, ReadMEM(reg_HL))); } // CBCE	 	SET 1,(HL)
-void CBCF(void) {  reg_A = SET(1, reg_A); } // CBCF	 	SET 1,A
+void CB80(void) {  reg_B = RES(0, reg_B); cycleLength(8); } // CB80		RES 0,B
+void CB81(void) {  reg_C = RES(0, reg_C); cycleLength(8); } // CB81		RES 0,C
+void CB82(void) {  reg_D = RES(0, reg_D); cycleLength(8); } // CB82		RES 0,D
+void CB83(void) {  reg_E = RES(0, reg_E); cycleLength(8); } // CB83		RES 0,E
+void CB84(void) {  put_rH(RES(0, get_rH())); cycleLength(8); } // CB84	 	RES 0,H
+void CB85(void) {  put_rL(RES(0, get_rL())); cycleLength(8); } // CB85	 	RES 0,L
+void CB86(void) {  WriteMEM(reg_HL, RES(0, ReadMEM(reg_HL))); cycleLength(16); } // CB86	 	RES 0,(HL)
+void CB87(void) {  reg_A = RES(0, reg_A); cycleLength(8); } // CB87	 	RES 0,A
 
-void CBD0(void) {  reg_B = SET(2, reg_B); } // CBD0		SET 2,B
-void CBD1(void) {  reg_C = SET(2, reg_C); } // CBD1		SET 2,C
-void CBD2(void) {  reg_D = SET(2, reg_D); } // CBD2		SET 2,D
-void CBD3(void) {  reg_E = SET(2, reg_E); } // CBD3		SET 2,E
-void CBD4(void) {  put_rH(SET(2, get_rH())); } // CBD4	 	SET 2,H
-void CBD5(void) {  put_rL(SET(2, get_rL())); } // CBD5	 	SET 2,L
-void CBD6(void) {  WriteMEM(reg_HL, SET(2, ReadMEM(reg_HL))); } // CBD6	 	SET 2,(HL)
-void CBD7(void) {  reg_A = SET(2, reg_A); } // CBD7	 	SET 2,A
+void CB88(void) {  reg_B = RES(1, reg_B); cycleLength(8); } // CB88	 	RES 1,B
+void CB89(void) {  reg_C = RES(1, reg_C); cycleLength(8); } // CB89	 	RES 1,C
+void CB8A(void) {  reg_D = RES(1, reg_D); cycleLength(8); } // CB8A	 	RES 1,D
+void CB8B(void) {  reg_E = RES(1, reg_E); cycleLength(8); } // CB8B	 	RES 1,E
+void CB8C(void) {  put_rH(RES(1, get_rH())); cycleLength(8); } // CB8C	 	RES 1,H
+void CB8D(void) {  put_rL(RES(1, get_rL())); cycleLength(8); } // CB8D	 	RES 1,L
+void CB8E(void) {  WriteMEM(reg_HL, RES(1, ReadMEM(reg_HL))); cycleLength(16); } // CB8E	 	RES 1,(HL)
+void CB8F(void) {  reg_A = RES(1, reg_A); cycleLength(8); } // CB8F	 	RES 1,A
 
-void CBD8(void) {  reg_B = SET(3, reg_B); } // CBD8	 	SET 3,B
-void CBD9(void) {  reg_C = SET(3, reg_C); } // CBD9	 	SET 3,C
-void CBDA(void) {  reg_D = SET(3, reg_D); } // CBDA	 	SET 3,D
-void CBDB(void) {  reg_E = SET(3, reg_E); } // CBDB	 	SET 3,E
-void CBDC(void) {  put_rH(SET(3, get_rH())); } // CBDC	 	SET 3,H
-void CBDD(void) {  put_rL(SET(3, get_rL())); } // CBDD	 	SET 3,L
-void CBDE(void) {  WriteMEM(reg_HL, SET(3, ReadMEM(reg_HL))); } // CBDE	 	SET 3,(HL)
-void CBDF(void) {  reg_A = SET(3, reg_A); } // CBDF	 	SET 3,A
+void CB90(void) {  reg_B = RES(2, reg_B); cycleLength(8); } // CB90		RES 2,B
+void CB91(void) {  reg_C = RES(2, reg_C); cycleLength(8); } // CB91		RES 2,C
+void CB92(void) {  reg_D = RES(2, reg_D); cycleLength(8); } // CB92		RES 2,D
+void CB93(void) {  reg_E = RES(2, reg_E); cycleLength(8); } // CB93		RES 2,E
+void CB94(void) {  put_rH(RES(2, get_rH())); cycleLength(8); } // CB94	 	RES 2,H
+void CB95(void) {  put_rL(RES(2, get_rL())); cycleLength(8); } // CB95	 	RES 2,L
+void CB96(void) {  WriteMEM(reg_HL, RES(2, ReadMEM(reg_HL))); cycleLength(16); } // CB96	 	RES 2,(HL)
+void CB97(void) {  reg_A = RES(2, reg_A); cycleLength(8); } // CB97	 	RES 2,A
 
-void CBE0(void) { reg_B = SET(4, reg_B); } // CBE0		SET 4,B
-void CBE1(void) {  reg_C = SET(4, reg_C); } // CBE1		SET 4,C
-void CBE2(void) {  reg_D = SET(4, reg_D); } // CBE2		SET 4,D
-void CBE3(void) {  reg_E = SET(4, reg_E); } // CBE3		SET 4,E
-void CBE4(void) {  put_rH(SET(4, get_rH())); } // CBE4	 	SET 4,H
-void CBE5(void) {  put_rL(SET(4, get_rL())); } // CBE5	 	SET 4,L
-void CBE6(void) {  WriteMEM(reg_HL, SET(4, ReadMEM(reg_HL))); } // CBE6	 	SET 4,(HL)
-void CBE7(void) {  reg_A = SET(4, reg_A); } // CBE7	 	SET 4,A
+void CB98(void) {  reg_B = RES(3, reg_B); cycleLength(8); } // CB98	 	RES 3,B
+void CB99(void) {  reg_C = RES(3, reg_C); cycleLength(8); } // CB99	 	RES 3,C
+void CB9A(void) {  reg_D = RES(3, reg_D); cycleLength(8); } // CB9A	 	RES 3,D
+void CB9B(void) {  reg_E = RES(3, reg_E); cycleLength(8); } // CB9B	 	RES 3,E
+void CB9C(void) {  put_rH(RES(3, get_rH())); cycleLength(8); } // CB9C	 	RES 3,H
+void CB9D(void) {  put_rL(RES(3, get_rL())); cycleLength(8); } // CB9D	 	RES 3,L
+void CB9E(void) {  WriteMEM(reg_HL, RES(3, ReadMEM(reg_HL))); cycleLength(16); } // CB9E	 	RES 3,(HL)
+void CB9F(void) {  reg_A = RES(3, reg_A); cycleLength(8); } // CB9F	 	RES 3,A
 
-void CBE8(void) {  reg_B = SET(5, reg_B); } // CBE8	 	SET 5,B
-void CBE9(void) {  reg_C = SET(5, reg_C); } // CBE9	 	SET 5,C
-void CBEA(void) {  reg_D = SET(5, reg_D); } // CBEA	 	SET 5,D
-void CBEB(void) {  reg_E = SET(5, reg_E); } // CBEB	 	SET 5,E
-void CBEC(void) {  put_rH(SET(5, get_rH())); } // CBEC	 	SET 5,H
-void CBED(void) {  put_rL(SET(5, get_rL())); } // CBED	 	SET 5,L
-void CBEE(void) {  WriteMEM(reg_HL, SET(5, ReadMEM(reg_HL))); } // CBEE	 	SET 5,(HL)
-void CBEF(void) {  reg_A = SET(5, reg_A); } // CBEF	 	SET 5,A
+void CBA0(void) {  reg_B = RES(4, reg_B); cycleLength(8); } // CBA0		RES 4,B
+void CBA1(void) {  reg_C = RES(4, reg_C); cycleLength(8); } // CBA1		RES 4,C
+void CBA2(void) {  reg_D = RES(4, reg_D); cycleLength(8); } // CBA2		RES 4,D
+void CBA3(void) {  reg_E = RES(4, reg_E); cycleLength(8); } // CBA3		RES 4,E
+void CBA4(void) { put_rH(RES(4, get_rH())); cycleLength(8); } // CBA4	 	RES 4,H
+void CBA5(void) {  put_rL(RES(4, get_rL())); cycleLength(8); } // CBA5	 	RES 4,L
+void CBA6(void) {  WriteMEM(reg_HL, RES(4, ReadMEM(reg_HL))); cycleLength(16); } // CBA6	 	RES 4,(HL)
+void CBA7(void) {  reg_A = RES(4, reg_A); cycleLength(8); } // CBA7	 	RES 4,A
 
-void CBF0(void) {  reg_B = SET(6, reg_B); } // CBF0		SET 6,B
-void CBF1(void) {  reg_C = SET(6, reg_C); } // CBF1		SET 6,C
-void CBF2(void) {  reg_D = SET(6, reg_D); } // CBF2		SET 6,D
-void CBF3(void) {  reg_E = SET(6, reg_E); } // CBF3		SET 6,E
-void CBF4(void) {  put_rH(SET(6, get_rH())); } // CBF4	 	SET 6,H
-void CBF5(void) {  put_rL(SET(6, get_rL())); } // CBF5	 	SET 6,L
-void CBF6(void) {  WriteMEM(reg_HL, SET(6, ReadMEM(reg_HL))); } // CBF6	 	SET 6,(HL)
-void CBF7(void) { reg_A = SET(6, reg_A); } // CBF7	 	SET 6,A
+void CBA8(void) {  reg_B = RES(5, reg_B); cycleLength(8); } // CBA8	 	RES 5,B
+void CBA9(void) {  reg_C = RES(5, reg_C); cycleLength(8); } // CBA9	 	RES 5,C
+void CBAA(void) {  reg_D = RES(5, reg_D); cycleLength(8); } // CBAA	 	RES 5,D
+void CBAB(void) {  reg_E = RES(5, reg_E); cycleLength(8); } // CBAB	 	RES 5,E
+void CBAC(void) {  put_rH(RES(5, get_rH())); cycleLength(8); } // CBAC	 	RES 5,H
+void CBAD(void) {  put_rL(RES(5, get_rL())); cycleLength(8); } // CBAD	 	RES 5,L
+void CBAE(void) {  WriteMEM(reg_HL, RES(5, ReadMEM(reg_HL))); cycleLength(16); } // CBAE	 	RES 5,(HL)
+void CBAF(void) {  reg_A = RES(5, reg_A); cycleLength(8); } // CBAF	 	RES 5,A
 
-void CBF8(void) {  reg_B = SET(7, reg_B); } // CBF8	 	SET 7,B
-void CBF9(void) {  reg_C = SET(7, reg_C); } // CBF9	 	SET 7,C
-void CBFA(void) {  reg_D = SET(7, reg_D); } // CBFA	 	SET 7,D
-void CBFB(void) {  reg_E = SET(7, reg_E); } // CBFB	 	SET 7,E
-void CBFC(void) {  put_rH(SET(7, get_rH())); } // CBFC	 	SET 7,H
-void CBFD(void) {  put_rL(SET(7, get_rL())); } // CBFD	 	SET 7,L
-void CBFE(void) {  WriteMEM(reg_HL, SET(7, ReadMEM(reg_HL))); } // CBFE	 	SET 7,(HL)
-void CBFF(void) {  reg_A = SET(7, reg_A); } // CBFF	 	SET 7,A
+void CBB0(void) {  reg_B = RES(6, reg_B); cycleLength(8); } // CBB0		RES 6,B
+void CBB1(void) {  reg_C = RES(6, reg_C); cycleLength(8); } // CBB1		RES 6,C
+void CBB2(void) {  reg_D = RES(6, reg_D); cycleLength(8); } // CBB2		RES 6,D
+void CBB3(void) {  reg_E = RES(6, reg_E); cycleLength(8); } // CBB3		RES 6,E
+void CBB4(void) {  put_rH(RES(6, get_rH())); cycleLength(8); } // CBB4	 	RES 6,H
+void CBB5(void) {  put_rL(RES(6, get_rL())); cycleLength(8); } // CBB5	 	RES 6,L
+void CBB6(void) {  WriteMEM(reg_HL, RES(6, ReadMEM(reg_HL))); cycleLength(16); } // CBB6	 	RES 6,(HL)
+void CBB7(void) {  reg_A = RES(6, reg_A); cycleLength(8); } // CBB7	 	RES 6,A
+
+void CBB8(void) {  reg_B = RES(7, reg_B); cycleLength(8); } // CBB8	 	RES 7,B
+void CBB9(void) {  reg_C = RES(7, reg_C); cycleLength(8); } // CBB9	 	RES 7,C
+void CBBA(void) {  reg_D = RES(7, reg_D); cycleLength(8); } // CBBA	 	RES 7,D
+void CBBB(void) {  reg_E = RES(7, reg_E); cycleLength(8); } // CBBB	 	RES 7,E
+void CBBC(void) { put_rH(RES(7, get_rH())); cycleLength(8); } // CBBC	 	RES 7,H
+void CBBD(void) {  put_rL(RES(7, get_rL())); cycleLength(8); } // CBBD	 	RES 7,L
+void CBBE(void) {  WriteMEM(reg_HL, RES(7, ReadMEM(reg_HL))); cycleLength(16); } // CBBE	 	RES 7,(HL)
+void CBBF(void) {  reg_A = RES(7, reg_A); cycleLength(8); } // CBBF	 	RES 7,A
+
+void CBC0(void) {  reg_B = SET(0, reg_B); cycleLength(8); } // CBC0		SET 0,B
+void CBC1(void) {  reg_C = SET(0, reg_C); cycleLength(8); } // CBC1		SET 0,C
+void CBC2(void) {  reg_D = SET(0, reg_D); cycleLength(8); } // CBC2		SET 0,D
+void CBC3(void) {  reg_E = SET(0, reg_E); cycleLength(8); } // CBC3		SET 0,E
+void CBC4(void) {  put_rH(SET(0, get_rH())); cycleLength(8); } // CBC4	 	SET 0,H
+void CBC5(void) {  put_rL(SET(0, get_rL())); cycleLength(8); } // CBC5	 	SET 0,L
+void CBC6(void) {  WriteMEM(reg_HL, SET(0, ReadMEM(reg_HL))); cycleLength(16); } // CBC6	 	SET 0,(HL)
+void CBC7(void) {  reg_A = SET(0, reg_A); cycleLength(8); } // CBC7	 	SET 0,A
+
+void CBC8(void) { reg_B = SET(1, reg_B); cycleLength(8); } // CBC8	 	SET 1,B
+void CBC9(void) {  reg_C = SET(1, reg_C); cycleLength(8); } // CBC9	 	SET 1,C
+void CBCA(void) {  reg_D = SET(1, reg_D); cycleLength(8); } // CBCA	 	SET 1,D
+void CBCB(void) {  reg_E = SET(1, reg_E); cycleLength(8); } // CBCB	 	SET 1,E
+void CBCC(void) {  put_rH(SET(1, get_rH())); cycleLength(8); } // CBCC	 	SET 1,H
+void CBCD(void) {  put_rL(SET(1, get_rL())); cycleLength(8); } // CBCD	 	SET 1,L
+void CBCE(void) {  WriteMEM(reg_HL, SET(1, ReadMEM(reg_HL))); cycleLength(16); } // CBCE	 	SET 1,(HL)
+void CBCF(void) {  reg_A = SET(1, reg_A); cycleLength(8); } // CBCF	 	SET 1,A
+
+void CBD0(void) {  reg_B = SET(2, reg_B); cycleLength(8); } // CBD0		SET 2,B
+void CBD1(void) {  reg_C = SET(2, reg_C); cycleLength(8); } // CBD1		SET 2,C
+void CBD2(void) {  reg_D = SET(2, reg_D); cycleLength(8); } // CBD2		SET 2,D
+void CBD3(void) {  reg_E = SET(2, reg_E); cycleLength(8); } // CBD3		SET 2,E
+void CBD4(void) {  put_rH(SET(2, get_rH())); cycleLength(8); } // CBD4	 	SET 2,H
+void CBD5(void) {  put_rL(SET(2, get_rL())); cycleLength(8); } // CBD5	 	SET 2,L
+void CBD6(void) {  WriteMEM(reg_HL, SET(2, ReadMEM(reg_HL))); cycleLength(16); } // CBD6	 	SET 2,(HL)
+void CBD7(void) {  reg_A = SET(2, reg_A); cycleLength(8); } // CBD7	 	SET 2,A
+
+void CBD8(void) {  reg_B = SET(3, reg_B); cycleLength(8); } // CBD8	 	SET 3,B
+void CBD9(void) {  reg_C = SET(3, reg_C); cycleLength(8); } // CBD9	 	SET 3,C
+void CBDA(void) {  reg_D = SET(3, reg_D); cycleLength(8); } // CBDA	 	SET 3,D
+void CBDB(void) {  reg_E = SET(3, reg_E); cycleLength(8); } // CBDB	 	SET 3,E
+void CBDC(void) {  put_rH(SET(3, get_rH())); cycleLength(8); } // CBDC	 	SET 3,H
+void CBDD(void) {  put_rL(SET(3, get_rL())); cycleLength(8); } // CBDD	 	SET 3,L
+void CBDE(void) {  WriteMEM(reg_HL, SET(3, ReadMEM(reg_HL))); cycleLength(16); } // CBDE	 	SET 3,(HL)
+void CBDF(void) {  reg_A = SET(3, reg_A); cycleLength(8); } // CBDF	 	SET 3,A
+
+void CBE0(void) { reg_B = SET(4, reg_B); cycleLength(8); } // CBE0		SET 4,B
+void CBE1(void) {  reg_C = SET(4, reg_C); cycleLength(8); } // CBE1		SET 4,C
+void CBE2(void) {  reg_D = SET(4, reg_D); cycleLength(8); } // CBE2		SET 4,D
+void CBE3(void) {  reg_E = SET(4, reg_E); cycleLength(8); } // CBE3		SET 4,E
+void CBE4(void) {  put_rH(SET(4, get_rH())); cycleLength(8); } // CBE4	 	SET 4,H
+void CBE5(void) {  put_rL(SET(4, get_rL())); cycleLength(8); } // CBE5	 	SET 4,L
+void CBE6(void) {  WriteMEM(reg_HL, SET(4, ReadMEM(reg_HL))); cycleLength(16); } // CBE6	 	SET 4,(HL)
+void CBE7(void) {  reg_A = SET(4, reg_A); cycleLength(8); } // CBE7	 	SET 4,A
+
+void CBE8(void) {  reg_B = SET(5, reg_B); cycleLength(8); } // CBE8	 	SET 5,B
+void CBE9(void) {  reg_C = SET(5, reg_C); cycleLength(8); } // CBE9	 	SET 5,C
+void CBEA(void) {  reg_D = SET(5, reg_D); cycleLength(8); } // CBEA	 	SET 5,D
+void CBEB(void) {  reg_E = SET(5, reg_E); cycleLength(8); } // CBEB	 	SET 5,E
+void CBEC(void) {  put_rH(SET(5, get_rH())); cycleLength(8); } // CBEC	 	SET 5,H
+void CBED(void) {  put_rL(SET(5, get_rL())); cycleLength(8); } // CBED	 	SET 5,L
+void CBEE(void) {  WriteMEM(reg_HL, SET(5, ReadMEM(reg_HL))); cycleLength(16); } // CBEE	 	SET 5,(HL)
+void CBEF(void) {  reg_A = SET(5, reg_A); cycleLength(8); } // CBEF	 	SET 5,A
+
+void CBF0(void) {  reg_B = SET(6, reg_B); cycleLength(8); } // CBF0		SET 6,B
+void CBF1(void) {  reg_C = SET(6, reg_C); cycleLength(8); } // CBF1		SET 6,C
+void CBF2(void) {  reg_D = SET(6, reg_D); cycleLength(8); } // CBF2		SET 6,D
+void CBF3(void) {  reg_E = SET(6, reg_E); cycleLength(8); } // CBF3		SET 6,E
+void CBF4(void) {  put_rH(SET(6, get_rH())); cycleLength(8); } // CBF4	 	SET 6,H
+void CBF5(void) {  put_rL(SET(6, get_rL())); cycleLength(8); } // CBF5	 	SET 6,L
+void CBF6(void) {  WriteMEM(reg_HL, SET(6, ReadMEM(reg_HL))); cycleLength(16); } // CBF6	 	SET 6,(HL)
+void CBF7(void) { reg_A = SET(6, reg_A); cycleLength(8); } // CBF7	 	SET 6,A
+
+void CBF8(void) {  reg_B = SET(7, reg_B); cycleLength(8); } // CBF8	 	SET 7,B
+void CBF9(void) {  reg_C = SET(7, reg_C); cycleLength(8); } // CBF9	 	SET 7,C
+void CBFA(void) {  reg_D = SET(7, reg_D); cycleLength(8); } // CBFA	 	SET 7,D
+void CBFB(void) {  reg_E = SET(7, reg_E); cycleLength(8); } // CBFB	 	SET 7,E
+void CBFC(void) {  put_rH(SET(7, get_rH())); cycleLength(8); } // CBFC	 	SET 7,H
+void CBFD(void) {  put_rL(SET(7, get_rL())); cycleLength(8); } // CBFD	 	SET 7,L
+void CBFE(void) {  WriteMEM(reg_HL, SET(7, ReadMEM(reg_HL))); cycleLength(16); } // CBFE	 	SET 7,(HL)
+void CBFF(void) {  reg_A = SET(7, reg_A); cycleLength(8); } // CBFF	 	SET 7,A
 
 // Opcode dispatch tables. These are real (initialized) definitions, so they
 // live in exactly one translation unit; emu.h only carries the extern

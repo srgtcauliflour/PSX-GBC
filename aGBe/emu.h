@@ -1,9 +1,22 @@
-#define S_FLAG  0x80
-#define Z_FLAG  0x40
-#define H_FLAG  0x10
-#define PV_FLAG 0x04
-#define N_FLAG  0x02
-#define C_FLAG  0x01
+// BUG FIX: these were the Zilog Z80's flag bit positions (S,Z,H,PV,N,C at
+// 0x80,0x40,0x10,0x04,0x02,0x01), not the Sharp LR35902 (Game Boy CPU)'s
+// actual layout, which only has four flags, at different positions:
+// bit 7 = Z, bit 6 = N, bit 5 = H, bit 4 = C, bits 3-0 always 0.
+// Internally self-consistent code (setZ paired with getZ, etc.) mostly
+// tolerated this, since jumps/branches only ever go through the accessor
+// functions - but it silently broke anything that reads or compares the
+// raw F byte directly: PUSH AF / POP AF interop with real save states,
+// and critically every test ROM (and no small number of real games) that
+// checks flags by comparing F's raw bit pattern against the real hardware
+// positions. It was also already self-contradictory on its own terms: the
+// post-reset flag value below (0xB0) was written assuming the *correct*
+// hardware bit positions (Z=1,H=1,C=1 -> 0xB0), so with the old wrong
+// masks, getZ() read back false immediately after reset despite the
+// intended state being Z=true.
+#define Z_FLAG  0x80
+#define N_FLAG  0x40
+#define H_FLAG  0x20
+#define C_FLAG  0x10
 
 /*  REGISTERS
 Bit 7:	The S flag: if the result of the operation is negative, this flag is high. This is a copy of the MSB of the result of the operation.
