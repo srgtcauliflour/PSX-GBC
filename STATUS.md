@@ -110,33 +110,33 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   verified with standard ISO9660 tooling (`isoinfo`, after de-interleaving
   the raw sectors) that the disc structure is correct and every file on
   it is byte-identical to its source — not just trusting the build.
+- **Real ROM-select menu.** `gui.c` is a genuine (if plain, text-only)
+  working menu now: lists `.GB`/`.GBC` files actually on the disc,
+  Up/Down + Cross/Start to pick one, then loads and runs it. `main.c` no
+  longer has a fixed ROM filename — the player picks. Re-verified the
+  same way as the CD-loading milestone: rebuilt the disc, confirmed
+  every file on it byte-identical to source via `isoinfo`.
 
 ## What's next (roughly in priority order)
 
-1. **ROM-select menu.** `main.c` currently loads a fixed filename
-   (`GAME.GB`); `ListRootDirectory()` (via `CdOpenDir`/`CdReadDir`) is
-   already implemented and ready for a menu to call, list what's on the
-   disc, and let the player pick. This is the natural next step now that
-   loading itself is real, and unblocks the GUI/menu rewrite below.
-2. **GUI/menu.** `gui.c` (splash screen, ROM select menu) is still the
-   old GsLib version and isn't part of the current build at all — needs
-   its own from-scratch rewrite against raw `psxgpu.h` primitives, same
-   as `psx.c` got this session.
-3. **Sprite X/Y flipping.** `iflipx`/`iflipy` are read from OAM in
+1. **Visual polish for the menu.** Current menu is plain `FntPrint` text
+   - functional, not pretty. A real background/graphics layer can build
+   on top of what's here now without touching the menu logic itself.
+2. **Sprite X/Y flipping.** `iflipx`/`iflipy` are read from OAM in
    `DrawOBJline` but never actually applied to pixel indexing — real gap,
    found alongside the other sprite bugs but out of scope for that fix.
-4. **Double buffering.** `Draw_Buffer` currently blits straight into the
+3. **Double buffering.** `Draw_Buffer` currently blits straight into the
    displayed VRAM area — works, but can tear. Needs a second buffer and
    `PutDispEnv` flip, alternating like the PSn00bSDK template examples do.
-5. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
+4. **Saves.** No `BuWrite`/`BuRead` (memory card) calls exist anywhere yet
    — needed for battery-backed cart RAM.
-6. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
+5. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
    (RGBDS toolchain needed to build them from source; wasn't readily
    available as a binary this session).
-7. **GBC support and sound** — explicitly deprioritized per the person's
+6. **GBC support and sound** — explicitly deprioritized per the person's
    direction earlier this session; sound especially can wait until
    everything else is solid.
-8. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
+7. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
    flat, fully-resident pointer with no partial loading — fine for the
    large majority of the GB/GBC library (32KB-512KB), but the small
    number of very large late-era GBC games (up to 4-8MB) won't fit
