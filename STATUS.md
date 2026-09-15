@@ -147,39 +147,68 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   underneath the existing `FntPrint` text. `Draw_Buffer`'s double-buffer
   logic was factored into reusable `BeginFrame`/`PresentFrame` calls so
   the menu shares the same VRAM buffers as the emulator's own screen.
+- **Real commercial-game validation — and a severe bug found because of
+  it.** The user supplied two real, commercial ROMs (Pokemon Red and
+  Pokemon Yellow, not included in this repo/archive for copyright
+  reasons — ask the person for copies again if you need to re-run this
+  testing) for local testing. Pokemon Red hung completely under a
+  second into booting; traced it to the dedicated VBlank interrupt (IF
+  bit 0) being incorrectly gated on a STAT register bit that most real
+  games never set, meaning it could essentially never fire — arguably
+  the single most common interrupt-wait pattern in the entire GB/GBC
+  library was completely broken, and no synthetic/Blargg test this
+  project had run happened to exercise it. Fixed, and confirmed by
+  actually watching Pokemon Red and Pokemon Yellow (a different cart
+  type — MBC3 vs. MBC5 — and Yellow is CGB-flagged too) both boot all
+  the way to their own correct, recognizable title screens. Almost
+  certainly the highest real-world-compatibility-impact fix of the
+  entire session. Also bumped `MAX_ROM_SIZE` from 512KB to 1.5MB in the
+  same pass — both Pokemon ROMs are exactly 1MB and would have been
+  rejected outright by the old cap before ever getting a chance to hit
+  the bug above.
 
 ## What's next (roughly in priority order)
 
-1. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
+1. **More real-ROM testing, if more real ROMs become available.** This
+   session's one round of real-commercial-game testing found the
+   single highest-impact bug of the whole project by a wide margin,
+   despite extensive synthetic/Blargg test coverage already being in
+   place — strong evidence that testing against a broader slice of the
+   real library (different genres, different MBC types, GBC titles)
+   would keep finding real things worth fixing. Note for continuing
+   this: don't commit ROM files themselves to this repo or bundle them
+   in any output archive (copyright) — keep them local/sandbox-only,
+   the way this session's Pokemon ROMs were handled.
+2. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
    (RGBDS toolchain needed to build them from source; wasn't readily
    available as a binary this session).
-2. **GBC support and sound** — explicitly deprioritized per the person's
+3. **GBC support and sound** — explicitly deprioritized per the person's
    direction earlier this session; sound especially can wait until
    everything else is solid.
-3. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
-   flat, fully-resident pointer with no partial loading — fine for the
-   large majority of the GB/GBC library (32KB-512KB), but the small
-   number of very large late-era GBC games (up to 4-8MB) won't fit
-   resident in the PS1's 2MB of RAM. Only worth doing if support for
-   those specific large titles is wanted; most of the library doesn't
-   need it.
-4. **8x16 sprite mode** (`LCDC` bit 2) isn't supported — `DrawOBJline`'s
+4. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
+   flat, fully-resident pointer with no partial loading. 1.5MB (see
+   above) covers the large majority of the real library including both
+   Pokemon Red and Yellow, but the small number of even larger late-era
+   GBC games (up to 4-8MB) still won't fit resident in the PS1's 2MB of
+   RAM. Only worth doing if support for those specific large titles is
+   wanted.
+5. **8x16 sprite mode** (`LCDC` bit 2) isn't supported — `DrawOBJline`'s
    line-range check assumes 8-tall sprites only. Most GB/GBC games use
    8x8 sprites predominantly; a real, separate gap if a specific game
    needs tall-sprite mode.
-5. **MBC3 RTC isn't persisted.** The RTC registers implemented earlier
+6. **MBC3 RTC isn't persisted.** The RTC registers implemented earlier
    this session (clock/calendar for games like Pokémon Gold/Silver)
    reset every boot rather than saving alongside cart RAM — a real,
    separate gap from plain cart RAM save/load, lower priority since it
    only affects real-time-clock-dependent game features, not save data
    itself.
-6. **Very large cart RAM won't fit a single memory card.** A standard
+7. **Very large cart RAM won't fit a single memory card.** A standard
    PS1 card has 15 usable 8KB blocks (120KB total); `SaveCartRAM`
    requests exactly the blocks a cart needs, but a 128KB-RAM MBC5 game
    would need every single block on the card, and anything larger
    wouldn't fit at all. Affects a small minority of RAM-heavy titles;
    not fixed proactively since most games use far less.
-7. **Real visual confirmation** (screenshot/video from actual hardware
+8. **Real visual confirmation** (screenshot/video from actual hardware
    or a working emulator session) — every emulator-boot attempt in this
    sandbox has hung or stalled (see the note below); not something to
    keep spending sandbox time on, but worth doing whenever a real
