@@ -1,0 +1,9 @@
+*.obj
+*.o
+*.cpe
+*.sym
+*.map
+*.bak
+build/
+toolchain/
+test-harness/build/

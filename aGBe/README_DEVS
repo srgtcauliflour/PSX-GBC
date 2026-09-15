@@ -1,0 +1,26 @@
+This README is for Developpers of aGBe.
+---------------------------------------
+
+Thank you for helping to dev aGBe. As it will make life easier for everyone please take 
+into consideration when making changes to the code, or using CVS.
+
+	o Please keep code properly formatted, and Nicely spaced. (Makes the +diff tool 
+more effective.)
+	o Please Comment on big changes when commiting Files to the CVS.
+	o Please do not post anything that should be here: (Like)
+		- Anything that shouldn't be in the CVS
+		- Binaries
+		- Batch Files
+		- Tmp/Obj Files
+		- Any Scripts that arent official.
+		- Any Files that arent directly involved with the project.
+
+(this may sound obvious, but Its tough to erase these files once they're up, so its best 
+to take procaution and keep your directories clean, and not upload anything bad!)
+
+Also, Please make use of the Sourceforge Project page, as well as the Gambase forums. 
+These things are great tools for communication. We might as well take advantage of them!
+
+Thank you all.
+
+gxd (Project Leader) 

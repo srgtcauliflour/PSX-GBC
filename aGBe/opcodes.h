@@ -1,0 +1,34 @@
+BYTE INCreg(BYTE reg);
+BYTE DECreg(BYTE reg);
+BYTE ANDreg(BYTE regA, BYTE regB);
+BYTE ADDreg(BYTE regA, BYTE regB);
+BYTE ADCreg(BYTE regA, BYTE regB);
+BYTE SBCreg(BYTE regA, BYTE regB);
+BYTE SUBreg(BYTE regA, BYTE regB);
+BYTE ORreg (BYTE regA, BYTE regB);
+BYTE XORreg(BYTE regA, BYTE regB);
+void CPreg (BYTE regA, BYTE regB);
+BYTE CPLreg(BYTE regA);
+WORD jr(WORD reg, BYTE off);
+WORD jp(WORD reg);
+WORD ADDWreg(WORD regA, WORD regB);
+BYTE RLA(BYTE reg);
+BYTE RRA(BYTE reg);
+BYTE RLC(BYTE reg);
+BYTE RL (BYTE reg);
+BYTE RRC(BYTE reg);
+BYTE RR (BYTE reg);
+BYTE SLA(BYTE reg);
+BYTE SRA(BYTE reg);
+BYTE SLL(BYTE reg);
+BYTE SRL(BYTE reg);
+BYTE SET(int i, BYTE reg);
+BYTE RES(int i, BYTE reg);
+void BIT(int i, BYTE reg);
+
+extern BYTE  INC(BYTE reg);
+extern BYTE  DEC(BYTE reg);
+extern BYTE  ADD(BYTE reg1, BYTE reg2);
+extern BYTE  ADC(BYTE reg);
+extern BYTE  SUB(BYTE reg1, BYTE reg2);
+

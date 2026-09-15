@@ -1,0 +1,625 @@
+#define S_FLAG  0x80
+#define Z_FLAG  0x40
+#define H_FLAG  0x10
+#define PV_FLAG 0x04
+#define N_FLAG  0x02
+#define C_FLAG  0x01
+
+/*  REGISTERS
+Bit 7:	The S flag: if the result of the operation is negative, this flag is high. This is a copy of the MSB of the result of the operation.
+Bit 6:	The Z flag: if the result is zero, this flag is high.
+Bit 5:	This bit has no official name. Throughout this document it is referred to as 'b5'. It is a copy of bit 5 of the result of the operation.
+Bit 4:	The H flag. This is the carry from bit 3 to bit 4 of the operation. Used with DAA instruction.
+Bit 3:	This bit has no official name. Throughout this document it is referred to as 'b3'. It is a copy of bit 3 of the result of the operation.
+Bit 2:	The P/V flag. It contains the overflow (high if two's complements result does not fit in register) or the parity (parity of number of high bits in result of operation). See description of instructions for which one.
+Bit 1:	The N flag. It is high if the last operation was an subtraction, otherwise it was an addition. Used with DAA instruction.
+Bit 0:	The C flag. If the result of the operation does not fit in the register, this bit is high.
+
+*/
+
+// ProtoTypes //
+void runEmu(void);
+
+void reset_Z80(void);
+void loadRom(void);
+void Allocate_Memory(void);
+void UnAllocate_Memory(void);
+BYTE ReadMEM(WORD loc);
+void WriteMEM(WORD loc, BYTE b);
+void ShowTiles(int);
+void DrawTile(int, int, int);
+void DrawBG(void);
+void DrawWindow(void);
+// methods ////////////////////////////////////////////////////
+void cycleLength(int);
+void doCycles(void);
+int CyclesLeft(void);
+
+WORD get_rAF(void);
+WORD get_rBC(void);
+WORD get_rDE(void);
+BYTE get_rH(void);
+BYTE get_rL(void);
+
+void put_rAF(WORD);
+void put_rBC(WORD);
+void put_rDE(WORD);
+void put_rH(BYTE);
+void put_rL(BYTE);
+
+int getZ(void);
+int getN(void);
+int getH(void);
+int getC(void);
+void setZ(int);
+void setN(int);
+void setH(int);
+void setC(int);
+
+void push(WORD);
+WORD pop(void);
+WORD ReadWord(WORD);
+
+void call(void);
+WORD ret(void);
+WORD rst(WORD);
+
+void interrupt(void);
+void doDMA(BYTE addr);
+
+void hblank(void);
+void DrawBGline(int line, int BGaddr, int TILEaddr);
+void DrawWINline(int line, int WINaddr, int TILEaddr);
+void DrawOBJline(int line, int TILEaddr);
+void vblank(void);
+
+typedef void (*funcPtr)(void);
+
+
+void OP00(void);
+void OP01(void);
+void OP02(void);
+void OP03(void);
+void OP04(void);
+void OP05(void);
+void OP06(void);
+void OP07(void);
+void OP08(void);
+void OP09(void);
+void OP0A(void);
+void OP0B(void);
+void OP0C(void);
+void OP0D(void);
+void OP0E(void);
+void OP0F(void);
+void OP10(void);
+void OP11(void);
+void OP12(void);
+void OP13(void);
+void OP14(void);
+void OP15(void);
+void OP16(void);
+void OP17(void);
+void OP18(void);
+void OP19(void);
+void OP1A(void);
+void OP1B(void);
+void OP1C(void);
+void OP1D(void);
+void OP1E(void);
+void OP1F(void);
+void OP20(void);
+void OP21(void);
+void OP22(void);
+void OP23(void);
+void OP24(void);
+void OP25(void);
+void OP26(void);
+void OP27(void);
+void OP28(void);
+void OP29(void);
+void OP2A(void);
+void OP2B(void);
+void OP2C(void);
+void OP2D(void);
+void OP2E(void);
+void OP2F(void);
+void OP30(void);
+void OP31(void);
+void OP32(void);
+void OP33(void);
+void OP34(void);
+void OP35(void);
+void OP36(void);
+void OP37(void);
+void OP38(void);
+void OP39(void);
+void OP3A(void);
+void OP3B(void);
+void OP3C(void);
+void OP3D(void);
+void OP3E(void);
+void OP3F(void);
+void OP40(void);
+void OP41(void);
+void OP42(void);
+void OP43(void);
+void OP44(void);
+void OP45(void);
+void OP46(void);
+void OP47(void);
+void OP48(void);
+void OP49(void);
+void OP4A(void);
+void OP4B(void);
+void OP4C(void);
+void OP4D(void);
+void OP4E(void);
+void OP4F(void);
+void OP50(void);
+void OP51(void);
+void OP52(void);
+void OP53(void);
+void OP54(void);
+void OP55(void);
+void OP56(void);
+void OP57(void);
+void OP58(void);
+void OP59(void);
+void OP5A(void);
+void OP5B(void);
+void OP5C(void);
+void OP5D(void);
+void OP5E(void);
+void OP5F(void);
+void OP60(void);
+void OP61(void);
+void OP62(void);
+void OP63(void);
+void OP64(void);
+void OP65(void);
+void OP66(void);
+void OP67(void);
+void OP68(void);
+void OP69(void);
+void OP6A(void);
+void OP6B(void);
+void OP6C(void);
+void OP6D(void);
+void OP6E(void);
+void OP6F(void);
+void OP70(void);
+void OP71(void);
+void OP72(void);
+void OP73(void);
+void OP74(void);
+void OP75(void);
+void OP76(void);
+void OP77(void);
+void OP78(void);
+void OP79(void);
+void OP7A(void);
+void OP7B(void);
+void OP7C(void);
+void OP7D(void);
+void OP7E(void);
+void OP7F(void);
+void OP80(void);
+void OP81(void);
+void OP82(void);
+void OP83(void);
+void OP84(void);
+void OP85(void);
+void OP86(void);
+void OP87(void);
+void OP88(void);
+void OP89(void);
+void OP8A(void);
+void OP8B(void);
+void OP8C(void);
+void OP8D(void);
+void OP8E(void);
+void OP8F(void);
+void OP90(void);
+void OP91(void);
+void OP92(void);
+void OP93(void);
+void OP94(void);
+void OP95(void);
+void OP96(void);
+void OP97(void);
+void OP98(void);
+void OP99(void);
+void OP9A(void);
+void OP9B(void);
+void OP9C(void);
+void OP9D(void);
+void OP9E(void);
+void OP9F(void);
+void OPA0(void);
+void OPA1(void);
+void OPA2(void);
+void OPA3(void);
+void OPA4(void);
+void OPA5(void);
+void OPA6(void);
+void OPA7(void);
+void OPA8(void);
+void OPA9(void);
+void OPAA(void);
+void OPAB(void);
+void OPAC(void);
+void OPAD(void);
+void OPAE(void);
+void OPAF(void);
+void OPB0(void);
+void OPB1(void);
+void OPB2(void);
+void OPB3(void);
+void OPB4(void);
+void OPB5(void);
+void OPB6(void);
+void OPB7(void);
+void OPB8(void);
+void OPB9(void);
+void OPBA(void);
+void OPBB(void);
+void OPBC(void);
+void OPBD(void);
+void OPBE(void);
+void OPBF(void);
+void OPC0(void);
+void OPC1(void);
+void OPC2(void);
+void OPC3(void);
+void OPC4(void);
+void OPC5(void);
+void OPC6(void);
+void OPC7(void);
+void OPC8(void);
+void OPC9(void);
+void OPCA(void);
+void OPCB(void);
+void OPCC(void);
+void OPCD(void);
+void OPCE(void);
+void OPCF(void);
+void OPD0(void);
+void OPD1(void);
+void OPD2(void);
+void OPD3(void);
+void OPD4(void);
+void OPD5(void);
+void OPD6(void);
+void OPD7(void);
+void OPD8(void);
+void OPD9(void);
+void OPDA(void);
+void OPDB(void);
+void OPDC(void);
+void OPDD(void);
+void OPDE(void);
+void OPDF(void);
+void OPE0(void);
+void OPE1(void);
+void OPE2(void);
+void OPE3(void);
+void OPE4(void);
+void OPE5(void);
+void OPE6(void);
+void OPE7(void);
+void OPE8(void);
+void OPE9(void);
+void OPEA(void);
+void OPEB(void);
+void OPEC(void);
+void OPED(void);
+void OPEE(void);
+void OPEF(void);
+void OPF0(void);
+void OPF1(void);
+void OPF2(void);
+void OPF3(void);
+void OPF4(void);
+void OPF5(void);
+void OPF6(void);
+void OPF7(void);
+void OPF8(void);
+void OPF9(void);
+void OPFA(void);
+void OPFB(void);
+void OPFC(void);
+void OPFD(void);
+void OPFE(void);
+void OPFF(void);
+
+void CB00(void);
+void CB01(void);
+void CB02(void);
+void CB03(void);
+void CB04(void);
+void CB05(void);
+void CB06(void);
+void CB07(void);
+void CB08(void);
+void CB09(void);
+void CB0A(void);
+void CB0B(void);
+void CB0C(void);
+void CB0D(void);
+void CB0E(void);
+void CB0F(void);
+void CB10(void);
+void CB11(void);
+void CB12(void);
+void CB13(void);
+void CB14(void);
+void CB15(void);
+void CB16(void);
+void CB17(void);
+void CB18(void);
+void CB19(void);
+void CB1A(void);
+void CB1B(void);
+void CB1C(void);
+void CB1D(void);
+void CB1E(void);
+void CB1F(void);
+void CB20(void);
+void CB21(void);
+void CB22(void);
+void CB23(void);
+void CB24(void);
+void CB25(void);
+void CB26(void);
+void CB27(void);
+void CB28(void);
+void CB29(void);
+void CB2A(void);
+void CB2B(void);
+void CB2C(void);
+void CB2D(void);
+void CB2E(void);
+void CB2F(void);
+void CB30(void);
+void CB31(void);
+void CB32(void);
+void CB33(void);
+void CB34(void);
+void CB35(void);
+void CB36(void);
+void CB37(void);
+void CB38(void);
+void CB39(void);
+void CB3A(void);
+void CB3B(void);
+void CB3C(void);
+void CB3D(void);
+void CB3E(void);
+void CB3F(void);
+void CB40(void);
+void CB41(void);
+void CB42(void);
+void CB43(void);
+void CB44(void);
+void CB45(void);
+void CB46(void);
+void CB47(void);
+void CB48(void);
+void CB49(void);
+void CB4A(void);
+void CB4B(void);
+void CB4C(void);
+void CB4D(void);
+void CB4E(void);
+void CB4F(void);
+void CB50(void);
+void CB51(void);
+void CB52(void);
+void CB53(void);
+void CB54(void);
+void CB55(void);
+void CB56(void);
+void CB57(void);
+void CB58(void);
+void CB59(void);
+void CB5A(void);
+void CB5B(void);
+void CB5C(void);
+void CB5D(void);
+void CB5E(void);
+void CB5F(void);
+void CB60(void);
+void CB61(void);
+void CB62(void);
+void CB63(void);
+void CB64(void);
+void CB65(void);
+void CB66(void);
+void CB67(void);
+void CB68(void);
+void CB69(void);
+void CB6A(void);
+void CB6B(void);
+void CB6C(void);
+void CB6D(void);
+void CB6E(void);
+void CB6F(void);
+void CB70(void);
+void CB71(void);
+void CB72(void);
+void CB73(void);
+void CB74(void);
+void CB75(void);
+void CB76(void);
+void CB77(void);
+void CB78(void);
+void CB79(void);
+void CB7A(void);
+void CB7B(void);
+void CB7C(void);
+void CB7D(void);
+void CB7E(void);
+void CB7F(void);
+void CB80(void);
+void CB81(void);
+void CB82(void);
+void CB83(void);
+void CB84(void);
+void CB85(void);
+void CB86(void);
+void CB87(void);
+void CB88(void);
+void CB89(void);
+void CB8A(void);
+void CB8B(void);
+void CB8C(void);
+void CB8D(void);
+void CB8E(void);
+void CB8F(void);
+void CB90(void);
+void CB91(void);
+void CB92(void);
+void CB93(void);
+void CB94(void);
+void CB95(void);
+void CB96(void);
+void CB97(void);
+void CB98(void);
+void CB99(void);
+void CB9A(void);
+void CB9B(void);
+void CB9C(void);
+void CB9D(void);
+void CB9E(void);
+void CB9F(void);
+void CBA0(void);
+void CBA1(void);
+void CBA2(void);
+void CBA3(void);
+void CBA4(void);
+void CBA5(void);
+void CBA6(void);
+void CBA7(void);
+void CBA8(void);
+void CBA9(void);
+void CBAA(void);
+void CBAB(void);
+void CBAC(void);
+void CBAD(void);
+void CBAE(void);
+void CBAF(void);
+void CBB0(void);
+void CBB1(void);
+void CBB2(void);
+void CBB3(void);
+void CBB4(void);
+void CBB5(void);
+void CBB6(void);
+void CBB7(void);
+void CBB8(void);
+void CBB9(void);
+void CBBA(void);
+void CBBB(void);
+void CBBC(void);
+void CBBD(void);
+void CBBE(void);
+void CBBF(void);
+void CBC0(void);
+void CBC1(void);
+void CBC2(void);
+void CBC3(void);
+void CBC4(void);
+void CBC5(void);
+void CBC6(void);
+void CBC7(void);
+void CBC8(void);
+void CBC9(void);
+void CBCA(void);
+void CBCB(void);
+void CBCC(void);
+void CBCD(void);
+void CBCE(void);
+void CBCF(void);
+void CBD0(void);
+void CBD1(void);
+void CBD2(void);
+void CBD3(void);
+void CBD4(void);
+void CBD5(void);
+void CBD6(void);
+void CBD7(void);
+void CBD8(void);
+void CBD9(void);
+void CBDA(void);
+void CBDB(void);
+void CBDC(void);
+void CBDD(void);
+void CBDE(void);
+void CBDF(void);
+void CBE0(void);
+void CBE1(void);
+void CBE2(void);
+void CBE3(void);
+void CBE4(void);
+void CBE5(void);
+void CBE6(void);
+void CBE7(void);
+void CBE8(void);
+void CBE9(void);
+void CBEA(void);
+void CBEB(void);
+void CBEC(void);
+void CBED(void);
+void CBEE(void);
+void CBEF(void);
+void CBF0(void);
+void CBF1(void);
+void CBF2(void);
+void CBF3(void);
+void CBF4(void);
+void CBF5(void);
+void CBF6(void);
+void CBF7(void);
+void CBF8(void);
+void CBF9(void);
+void CBFA(void);
+void CBFB(void);
+void CBFC(void);
+void CBFD(void);
+void CBFE(void);
+void CBFF(void);
+
+funcPtr instructions[]= {OP00, OP01, OP02, OP03, OP04, OP05, OP06, OP07, OP08, OP09, OP0A, OP0B, OP0C, OP0D, OP0E, OP0F,
+						 OP10, OP11, OP12, OP13, OP14, OP15, OP16, OP17, OP18, OP19, OP1A, OP1B, OP1C, OP1D, OP1E, OP1F,
+						 OP20, OP21, OP22, OP23, OP24, OP25, OP26, OP27, OP28, OP29, OP2A, OP2B, OP2C, OP2D, OP2E, OP2F,
+						 OP30, OP31, OP32, OP33, OP34, OP35, OP36, OP37, OP38, OP39, OP3A, OP3B, OP3C, OP3D, OP3E, OP3F,
+						 OP40, OP41, OP42, OP43, OP44, OP45, OP46, OP47, OP48, OP49, OP4A, OP4B, OP4C, OP4D, OP4E, OP4F,
+						 OP50, OP51, OP52, OP53, OP54, OP55, OP56, OP57, OP58, OP59, OP5A, OP5B, OP5C, OP5D, OP5E, OP5F,
+						 OP60, OP61, OP62, OP63, OP64, OP65, OP66, OP67, OP68, OP69, OP6A, OP6B, OP6C, OP6D, OP6E, OP6F,
+						 OP70, OP71, OP72, OP73, OP74, OP75, OP76, OP77, OP78, OP79, OP7A, OP7B, OP7C, OP7D, OP7E, OP7F,
+						 OP80, OP81, OP82, OP83, OP84, OP85, OP86, OP87, OP88, OP89, OP8A, OP8B, OP8C, OP8D, OP8E, OP8F,
+						 OP90, OP91, OP92, OP93, OP94, OP95, OP96, OP97, OP98, OP99, OP9A, OP9B, OP9C, OP9D, OP9E, OP9F,
+						 OPA0, OPA1, OPA2, OPA3, OPA4, OPA5, OPA6, OPA7, OPA8, OPA9, OPAA, OPAB, OPAC, OPAD, OPAE, OPAF,
+						 OPB0, OPB1, OPB2, OPB3, OPB4, OPB5, OPB6, OPB7, OPB8, OPB9, OPBA, OPBB, OPBC, OPBD, OPBE, OPBF,
+						 OPC0, OPC1, OPC2, OPC3, OPC4, OPC5, OPC6, OPC7, OPC8, OPC9, OPCA, OPCB, OPCC, OPCD, OPCE, OPCF,
+						 OPD0, OPD1, OPD2, OPD3, OPD4, OPD5, OPD6, OPD7, OPD8, OPD9, OPDA, OPDB, OPDC, OPDD, OPDE, OPDF,
+						 OPE0, OPE1, OPE2, OPE3, OPE4, OPE5, OPE6, OPE7, OPE8, OPE9, OPEA, OPEB, OPEC, OPED, OPEE, OPEF,
+						 OPF0, OPF1, OPF2, OPF3, OPF4, OPF5, OPF6, OPF7, OPF8, OPF9, OPFA, OPFB, OPFC, OPFD, OPFE, OPFF};
+
+funcPtr CBinst[]= { CB00, CB01, CB02, CB03, CB04, CB05, CB06, CB07, CB08, CB09, CB0A, CB0B, CB0C, CB0D, CB0E, CB0F,
+						 CB10, CB11, CB12, CB13, CB14, CB15, CB16, CB17, CB18, CB19, CB1A, CB1B, CB1C, CB1D, CB1E, CB1F,
+						 CB20, CB21, CB22, CB23, CB24, CB25, CB26, CB27, CB28, CB29, CB2A, CB2B, CB2C, CB2D, CB2E, CB2F,
+						 CB30, CB31, CB32, CB33, CB34, CB35, CB36, CB37, CB38, CB39, CB3A, CB3B, CB3C, CB3D, CB3E, CB3F,
+						 CB40, CB41, CB42, CB43, CB44, CB45, CB46, CB47, CB48, CB49, CB4A, CB4B, CB4C, CB4D, CB4E, CB4F,
+						 CB50, CB51, CB52, CB53, CB54, CB55, CB56, CB57, CB58, CB59, CB5A, CB5B, CB5C, CB5D, CB5E, CB5F,
+						 CB60, CB61, CB62, CB63, CB64, CB65, CB66, CB67, CB68, CB69, CB6A, CB6B, CB6C, CB6D, CB6E, CB6F,
+						 CB70, CB71, CB72, CB73, CB74, CB75, CB76, CB77, CB78, CB79, CB7A, CB7B, CB7C, CB7D, CB7E, CB7F,
+						 CB80, CB81, CB82, CB83, CB84, CB85, CB86, CB87, CB88, CB89, CB8A, CB8B, CB8C, CB8D, CB8E, CB8F,
+						 CB90, CB91, CB92, CB93, CB94, CB95, CB96, CB97, CB98, CB99, CB9A, CB9B, CB9C, CB9D, CB9E, CB9F,
+						 CBA0, CBA1, CBA2, CBA3, CBA4, CBA5, CBA6, CBA7, CBA8, CBA9, CBAA, CBAB, CBAC, CBAD, CBAE, CBAF,
+						 CBB0, CBB1, CBB2, CBB3, CBB4, CBB5, CBB6, CBB7, CBB8, CBB9, CBBA, CBBB, CBBC, CBBD, CBBE, CBBF,
+						 CBC0, CBC1, CBC2, CBC3, CBC4, CBC5, CBC6, CBC7, CBC8, CBC9, CBCA, CBCB, CBCC, CBCD, CBCE, CBCF,
+						 CBD0, CBD1, CBD2, CBD3, CBD4, CBD5, CBD6, CBD7, CBD8, CBD9, CBDA, CBDB, CBDC, CBDD, CBDE, CBDF,
+						 CBE0, CBE1, CBE2, CBE3, CBE4, CBE5, CBE6, CBE7, CBE8, CBE9, CBEA, CBEB, CBEC, CBED, CBEE, CBEF,
+						 CBF0, CBF1, CBF2, CBF3, CBF4, CBF5, CBF6, CBF7, CBF8, CBF9, CBFA, CBFB, CBFC, CBFD, CBFE, CBFF};
