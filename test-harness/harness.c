@@ -86,8 +86,8 @@ int main(int argc, char **argv) {
         }
 
         if (do_trace) {
-            printf("i=%ld PC=%04X SP=%04X A=%02X F=%02X B=%02X C=%02X D=%02X E=%02X H=%02X L=%02X op=%02X opnd=%02X\n",
-                   i, reg_PC, reg_SP, reg_A, reg_F, reg_B, reg_C, reg_D, reg_E, get_rH(), get_rL(), ReadMEM(reg_PC), ReadMEM(reg_PC+1));
+            printf("i=%ld PC=%04X SP=%04X A=%02X F=%02X B=%02X C=%02X D=%02X E=%02X H=%02X L=%02X LY=%02X STAT=%02X op=%02X opnd=%02X\n",
+                   i, reg_PC, reg_SP, reg_A, reg_F, reg_B, reg_C, reg_D, reg_E, get_rH(), get_rL(), LCDY, LCDSTATUS, ReadMEM(reg_PC), ReadMEM(reg_PC+1));
         }
 
         // Detect the classic "test finished" spin loop (JR $FE, i.e. jump to self)

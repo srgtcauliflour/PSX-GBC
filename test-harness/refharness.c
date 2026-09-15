@@ -42,10 +42,10 @@ int main(int argc, char **argv) {
     if (ret != GB_INIT_NO_ERROR) { fprintf(stderr, "gb_init failed: %d\n", ret); return 2; }
 
     for (long i = 0; i < maxi; i++) {
-        printf("i=%ld PC=%04X SP=%04X A=%02X F=%02X B=%02X C=%02X D=%02X E=%02X H=%02X L=%02X op=%02X\n",
+        printf("i=%ld PC=%04X SP=%04X A=%02X F=%02X B=%02X C=%02X D=%02X E=%02X H=%02X L=%02X LY=%02X STAT=%02X op=%02X\n",
                i, gb.cpu_reg.pc.reg, gb.cpu_reg.sp.reg, gb.cpu_reg.a, gb.cpu_reg.f.reg,
                gb.cpu_reg.bc.bytes.b, gb.cpu_reg.bc.bytes.c, gb.cpu_reg.de.bytes.d, gb.cpu_reg.de.bytes.e,
-               gb.cpu_reg.hl.bytes.h, gb.cpu_reg.hl.bytes.l, rb(&gb, gb.cpu_reg.pc.reg));
+               gb.cpu_reg.hl.bytes.h, gb.cpu_reg.hl.bytes.l, gb.hram_io[IO_LY], gb.hram_io[IO_STAT], rb(&gb, gb.cpu_reg.pc.reg));
         __gb_step_cpu(&gb);
     }
     return 0;
