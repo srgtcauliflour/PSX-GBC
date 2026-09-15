@@ -12,8 +12,6 @@ BYTE CPLreg(BYTE regA);
 WORD jr(WORD reg, BYTE off);
 WORD jp(WORD reg);
 WORD ADDWreg(WORD regA, WORD regB);
-WORD INCWreg(WORD reg);
-WORD DECWreg(WORD reg);
 BYTE RLA(BYTE reg);
 BYTE RRA(BYTE reg);
 BYTE RLC(BYTE reg);
