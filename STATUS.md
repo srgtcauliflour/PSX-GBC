@@ -166,22 +166,57 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   same pass — both Pokemon ROMs are exactly 1MB and would have been
   rejected outright by the old cap before ever getting a chance to hit
   the bug above.
+- **Mooneye's authoritative MBC test suite — a step up in rigor from
+  Blargg's.** Set up WLA-DX (built from source) and RGBDS (prebuilt) to
+  assemble Mooneye's emulator-only/mbc1 and emulator-only/mbc5 test
+  ROMs. Found and fixed two more real, severe bugs — both genuine
+  memory-safety issues (heap corruption, segfaults, a division-by-zero)
+  in the host test harness, not just logic errors: cart-RAM and ROM
+  bank numbers were both masked only against their protocol-level bit
+  width, never against how many banks a specific cartridge actually
+  has, so an in-range-per-protocol but physically-nonexistent bank
+  number read/wrote straight past the end of the real buffer. Fixed by
+  masking both against the cartridge's actual reported size (and fixed
+  a related gap: the ROM-size lookup table stopped at 2MB, leaving
+  larger carts with a bank count of zero — which turned the new masking
+  fix into a division-by-zero until this was also completed). **MBC5
+  now passes Mooneye's entire suite 100% clean** (all 8 ROM-size tests
+  plus every bank-register test). MBC1 passes its bank-register/RAM
+  tests cleanly (6 of 13) but still fails 6 ROM-size-specific tests
+  (512kb through 16Mb) — investigated in depth, including an isolated
+  hand-replication of the exact failing input that confirmed the core
+  bank-switching arithmetic itself is correct in isolation, so whatever
+  remains is a subtler state-interaction issue across the test's full
+  128-iteration sequence rather than a basic addressing bug. Not yet
+  root-caused; a real, narrower remaining gap, tracked below.
 
 ## What's next (roughly in priority order)
 
-1. **More real-ROM testing, if more real ROMs become available.** This
-   session's one round of real-commercial-game testing found the
-   single highest-impact bug of the whole project by a wide margin,
-   despite extensive synthetic/Blargg test coverage already being in
-   place — strong evidence that testing against a broader slice of the
-   real library (different genres, different MBC types, GBC titles)
-   would keep finding real things worth fixing. Note for continuing
-   this: don't commit ROM files themselves to this repo or bundle them
-   in any output archive (copyright) — keep them local/sandbox-only,
-   the way this session's Pokemon ROMs were handled.
-2. Run Mooneye's MBC1/MBC5 test ROMs to further validate bank-switching
-   (RGBDS toolchain needed to build them from source; wasn't readily
-   available as a binary this session).
+1. **MBC1 ROM-size test failures (512kb-16Mb).** Real, unresolved gap
+   found via Mooneye. Confirmed NOT a basic address-masking bug (an
+   isolated single-shot test replicating the exact failing bank_number/
+   mode/lower_upper combination from a live trace produces the
+   correct result). The failure only manifests partway through
+   Mooneye's full 128-bank-number x 2-mode x 2-address-range test
+   sequence, suggesting some form of state carried across iterations
+   (MBCMODE, RAMBANKNUMBER, or the ROMBANKNUMBER bit-field update order
+   between consecutive test cases) diverges from real hardware in a way
+   a single isolated write/read pair doesn't reveal. Next step: extend
+   the harness tracing used this session to log every BANK1/BANK2 write
+   across the *entire* test sequence (not just around one bank_number)
+   and diff against where the Mooneye source's own expected-value
+   table predicts the emulator should be at each step, rather than
+   spot-checking individual cases. Practically low-impact — genuine
+   MBC1 carts needing more than 512KB (32 banks addressable by the
+   base 5-bit register alone) are a minority of the real library — but
+   worth closing out for full Mooneye compliance.
+2. More real-ROM testing, if more real ROMs become available. This
+   session's rounds of real-commercial-game and authoritative-suite
+   testing found the highest-impact bugs of the entire project by a
+   wide margin, despite extensive synthetic/Blargg test coverage
+   already being in place. Note for continuing this: don't commit ROM
+   files themselves to this repo or bundle them in any output archive
+   (copyright) — keep them local/sandbox-only.
 3. **GBC support and sound** — explicitly deprioritized per the person's
    direction earlier this session; sound especially can wait until
    everything else is solid.
