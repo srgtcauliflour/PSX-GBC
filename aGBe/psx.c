@@ -323,12 +323,20 @@ static void SetVoiceVolumeForChannel(int voice, int currentVolume, int enabled, 
 static uint16_t PulsePitch(int freq11) {
 	if (freq11 >= 2048) return 0;
 	int hz_x64 = 131072 * 64 / (2048 - freq11); // keep some fractional precision
-	return (uint16_t) (((int64_t) hz_x64 * 8 * 4096) / (44100 * 64));
+	int64_t pitch = ((int64_t) hz_x64 * 8 * 4096) / (44100 * 64);
+	// Clamp rather than let a very high GB frequency (rare in real
+	// music, but real SFX sometimes briefly use near-extreme values)
+	// silently overflow the SPU's 16-bit pitch register and wrap
+	// around to a garbage low value instead of a merely very high one.
+	if (pitch > 0xFFFF) pitch = 0xFFFF;
+	return (uint16_t) pitch;
 }
 static uint16_t WavePitch(int freq11) {
 	if (freq11 >= 2048) return 0;
 	int hz_x64 = 65536 * 64 / (2048 - freq11);
-	return (uint16_t) (((int64_t) hz_x64 * 32 * 4096) / (44100 * 64));
+	int64_t pitch = ((int64_t) hz_x64 * 32 * 4096) / (44100 * 64);
+	if (pitch > 0xFFFF) pitch = 0xFFFF;
+	return (uint16_t) pitch;
 }
 
 void UpdateAudio(void) {
