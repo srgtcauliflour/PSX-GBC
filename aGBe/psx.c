@@ -20,8 +20,10 @@
 #include <psxpad.h>
 #include <psxapi.h>
 #include <psxcd.h>
+#include <psxspu.h>
 #include <sys/fcntl.h>
 #include "main.h"
+#include "emu.h"
 #include "pad.h"
 #include "psx.h"
 
@@ -132,6 +134,281 @@ void Draw_Buffer(int *screenBuffer, unsigned short *screenBufferColor, int gbcMo
 void PrepScreen(void) {}
 void RenderWorld(BYTE re, BYTE gr, BYTE bl) { (void) re; (void) gr; (void) bl; }
 
+// ---- Audio (GB APU -> PS1 SPU) -----------------------------------------
+//
+// IMPORTANT CAVEAT, stated up front: unlike essentially everything else in
+// this project, this code has not been verified against actual audible
+// sound - every attempt to get a screenshot/recording from an interactive
+// emulator or real hardware in this sandbox has failed (see STATUS.md's
+// "note on emulator verification" section), and that limitation applies
+// doubly to audio, which this sandbox has no way to play back or capture
+// at all. What *is* verified: the GB APU core itself (register behavior,
+// triggering, DAC-off, length counters, envelope timing) via synthetic
+// test ROMs checking internal state through the CPU - see STATUS.md. This
+// file is the least-tested part of that chain: a principled, from-
+// documentation implementation of real PS1 SPU hardware usage, not
+// something confirmed to actually sound right yet.
+//
+// Approach: rather than mixing PCM in software and streaming it to the
+// SPU (which would mean re-encoding a constantly-changing waveform to
+// ADPCM every frame - expensive, and duplicates work the SPU's hardware
+// already does), this drives 4 real SPU voices - one per GB channel -
+// continuously updating each voice's pitch and volume to track the GB
+// channel's current frequency/volume envelope, and lets the SPU's own
+// hardware handle the actual waveform playback and mixing:
+//   - Channels 1/2 (pulse): each of the 4 possible duty cycles (12.5/25/
+//     50/75%) is pre-encoded once at init as a self-looping ADPCM sample
+//     and uploaded to a fixed SPU RAM address; the voice's sample address
+//     switches (with a re-trigger) when the duty cycle changes.
+//   - Channel 3 (wave): re-encoded and re-uploaded to SPU RAM whenever
+//     the GB's wave RAM actually changes (checked once per frame via a
+//     content comparison, not on every write) - most games only change it
+//     occasionally, not every frame.
+//   - Channel 4 (noise): uses the SPU's own hardware noise generator
+//     (SPU_NOISE_MODE) instead of an uploaded sample - real PS1 hardware
+//     has one, and it's a much closer match in spirit to the GB's noise
+//     channel than trying to synthesize a fixed noise sample would be.
+//     The SPU's noise frequency is a single global setting shared by all
+//     noise-mode voices, not per-voice - fine here since only one GB
+//     channel ever uses it.
+//
+// All 4 voices' ADSR is configured once at init to be "flat" (instant
+// attack, no decay, full sustain) so real hardware's own envelope
+// generator never fights with the volume values this code writes every
+// frame to track the GB's own envelope/sweep - this code is the only
+// thing controlling perceived volume over time, not the SPU's ADSR unit.
+//
+// Known limitation: this updates once per frame (from vblank()), not
+// continuously - very short notes or multiple triggers of the same
+// channel within one frame won't be individually reflected, only
+// whatever the channel's state happens to be at the moment each frame's
+// update runs. A real, acknowledged simplification, not an oversight.
+
+#define AUDIO_VOICE_CH1 0
+#define AUDIO_VOICE_CH2 1
+#define AUDIO_VOICE_CH3 2
+#define AUDIO_VOICE_CH4 3
+
+// Sample data lives in a fixed, small block near the start of SPU RAM -
+// well clear of address 0 (reserved by hardware for a fixed 16-byte
+// silence block) and small enough that there's no real risk of
+// colliding with anything else, since nothing else in this project uses
+// SPU RAM at all.
+#define AUDIO_SPU_BASE      0x1010
+#define AUDIO_DUTY_BYTES    32  // 2 ADPCM blocks (7 periods of the 8-step duty waveform)
+#define AUDIO_WAVE_BYTES    128 // 8 ADPCM blocks (7 periods of the 32-sample GB wave table)
+#define AUDIO_DUTY_ADDR(n)  (AUDIO_SPU_BASE + (n) * AUDIO_DUTY_BYTES)
+#define AUDIO_WAVE_ADDR     (AUDIO_SPU_BASE + 4 * AUDIO_DUTY_BYTES)
+
+// Real GB duty waveforms, 8 steps each, 0/1 amplitude (matches
+// APU_DUTY_TABLE in emu.c - kept as a separate literal here rather than
+// sharing the byte-packed table, since encoding wants one value per
+// array element rather than packed bits).
+static const int AUDIO_DUTY_PATTERNS[4][8] = {
+	{0, 0, 0, 0, 0, 0, 0, 1}, // 12.5%
+	{1, 0, 0, 0, 0, 0, 0, 1}, // 25%
+	{1, 0, 0, 0, 0, 1, 1, 1}, // 50%
+	{0, 1, 1, 1, 1, 1, 1, 0}, // 75%
+};
+
+static BYTE lastWaveRAM[16];
+static int audioInitialized = 0;
+
+// Encodes 28 4-bit sample values (0-15) into one 16-byte PS1 ADPCM
+// block at dst. Always uses filter=0, shift=0: with source samples
+// already 4-bit (16 levels), this maps 1:1 onto ADPCM's per-nibble
+// range (nibble = sample-8, giving an exact, lossless encoding with no
+// need for a general adaptive/predictive encoder).
+static void EncodeADPCMBlock(uint8_t *dst, const int *samples4bit, int flags) {
+	int i;
+	dst[0] = 0x00; // filter 0, shift 0
+	dst[1] = (uint8_t) flags;
+	for (i = 0; i < 14; i++) {
+		int lo = samples4bit[i * 2] - 8;
+		int hi = samples4bit[i * 2 + 1] - 8;
+		dst[2 + i] = (uint8_t) ((lo & 0x0F) | ((hi & 0x0F) << 4));
+	}
+}
+
+// Builds and uploads a self-looping ADPCM sample from a repeating
+// pattern of `patternLen` 4-bit values, repeated `repeats` times to
+// fill exactly `blocks` ADPCM blocks (so patternLen * repeats must
+// equal blocks * 28) - the exact repeat count that lets the loop point
+// land precisely on a pattern boundary, avoiding any click or pitch
+// wobble at the loop seam.
+static void UploadLoopingSample(uint32_t spuAddr, const int *pattern, int patternLen, int repeats, int blocks) {
+	// Static rather than stack-local: called every frame for the wave
+	// channel whenever its data changes, so avoids repeated stack
+	// allocation of a ~1KB combined buffer on a platform with limited
+	// RAM - same reasoning as the RTC save buffers in emu.c.
+	static uint8_t buf[8 * 16]; // largest case here is 8 blocks (the wave channel)
+	static int samples[8 * 28];
+	int totalSamples = patternLen * repeats;
+	int i;
+	for (i = 0; i < totalSamples; i++) {
+		samples[i] = pattern[i % patternLen];
+	}
+	for (i = 0; i < blocks; i++) {
+		int flags = 0;
+		if (i == 0) flags |= 0x04;                 // LOOP: this block is the loop start
+		if (i == blocks - 1) flags |= 0x03;        // END | REPEAT: loop back at the end
+		EncodeADPCMBlock(&buf[i * 16], &samples[i * 28], flags);
+	}
+	SpuSetTransferMode(SPU_TRANSFER_BY_DMA);
+	SpuSetTransferStartAddr(spuAddr);
+	SpuWrite((const uint32_t *) buf, blocks * 16);
+	SpuIsTransferCompleted(SPU_TRANSFER_WAIT);
+}
+
+void InitAudio(void) {
+	SpuInit();
+	SPU_MASTER_VOL_L = 0x3FFF;
+	SPU_MASTER_VOL_R = 0x3FFF;
+
+	int d;
+	for (d = 0; d < 4; d++) {
+		int samples[8];
+		int i;
+		for (i = 0; i < 8; i++) {
+			samples[i] = AUDIO_DUTY_PATTERNS[d][i] ? 15 : 0;
+		}
+		UploadLoopingSample(AUDIO_DUTY_ADDR(d), samples, 8, 7, 2);
+	}
+	// Wave channel starts silent (all zero) until the game writes its
+	// own data and this gets refreshed by UpdateAudio() below.
+	int silent[32] = {0};
+	UploadLoopingSample(AUDIO_WAVE_ADDR, silent, 32, 7, 8);
+	memset(lastWaveRAM, 0, sizeof(lastWaveRAM));
+
+	// Flat ADSR on all 4 voices: instant attack, no decay, full sustain,
+	// instant release - so only this code's own per-frame volume writes
+	// control perceived volume, never the SPU's own envelope hardware.
+	int v;
+	for (v = AUDIO_VOICE_CH1; v <= AUDIO_VOICE_CH4; v++) {
+		SpuSetVoiceADSR(v, 0x0F, 0x00, 0x00, 0x1F, 0x0F);
+	}
+
+	SpuSetVoiceStartAddr(AUDIO_VOICE_CH1, AUDIO_DUTY_ADDR(2)); // default 50% duty
+	SpuSetVoiceStartAddr(AUDIO_VOICE_CH2, AUDIO_DUTY_ADDR(2));
+	SpuSetVoiceStartAddr(AUDIO_VOICE_CH3, AUDIO_WAVE_ADDR);
+
+	// Channel 4 uses the SPU's hardware noise generator instead of a
+	// sample - SPU_NOISE_MODE is a bitmask, one bit per voice.
+	SPU_NOISE_MODE1 = (1 << AUDIO_VOICE_CH4);
+	SPU_NOISE_MODE2 = 0;
+
+	audioInitialized = 1;
+}
+
+// Converts a GB channel's current volume (0-15) and the master volume/
+// panning registers into this voice's actual left/right volume values.
+// Scaled so 4 simultaneous full-volume channels sum to within the SPU's
+// signed 16-bit range without clipping, mirroring the real headroom
+// margin analog hardware mixing four channels together would also need.
+static void SetVoiceVolumeForChannel(int voice, int currentVolume, int enabled, int panLeftBit, int panRightBit) {
+	int masterLeft = (NR50 >> 4) & 0x07;
+	int masterRight = NR50 & 0x07;
+	int base = enabled ? (currentVolume * 0x2000) / 15 : 0;
+	int left = ((NR51 & panLeftBit) && enabled) ? (base * (masterLeft + 1)) / 8 : 0;
+	int right = ((NR51 & panRightBit) && enabled) ? (base * (masterRight + 1)) / 8 : 0;
+	SpuSetVoiceVolume(voice, (int16_t) left, (int16_t) right);
+}
+
+// GB pulse/wave frequency-to-Hz formulas (Pan Docs) converted directly
+// to an SPU pitch value: pitch = (Hz * samplesPerPeriod * 4096) / 44100,
+// where samplesPerPeriod is 8 for the pulse duty samples and 32 for the
+// wave channel (see UploadLoopingSample's repeat counts above - the
+// loop always contains exactly 7 periods regardless of samplesPerPeriod,
+// so this only depends on the per-period sample count, not block count).
+static uint16_t PulsePitch(int freq11) {
+	if (freq11 >= 2048) return 0;
+	int hz_x64 = 131072 * 64 / (2048 - freq11); // keep some fractional precision
+	return (uint16_t) (((int64_t) hz_x64 * 8 * 4096) / (44100 * 64));
+}
+static uint16_t WavePitch(int freq11) {
+	if (freq11 >= 2048) return 0;
+	int hz_x64 = 65536 * 64 / (2048 - freq11);
+	return (uint16_t) (((int64_t) hz_x64 * 32 * 4096) / (44100 * 64));
+}
+
+void UpdateAudio(void) {
+	if (!audioInitialized) {
+		return;
+	}
+	if (!(NR52 & 0x80)) {
+		// Master APU off - silence everything and skip further updates
+		// until it's back on.
+		SpuSetKey(0, (1 << AUDIO_VOICE_CH1) | (1 << AUDIO_VOICE_CH2) |
+			(1 << AUDIO_VOICE_CH3) | (1 << AUDIO_VOICE_CH4));
+		return;
+	}
+
+	// Channel 1 (pulse + sweep)
+	{
+		int duty = (apuCh1.nrX1 >> 6) & 0x03;
+		int freq = apuCh1.nrX3 | ((apuCh1.nrX4 & 0x07) << 8);
+		SpuSetVoiceStartAddr(AUDIO_VOICE_CH1, AUDIO_DUTY_ADDR(duty));
+		SpuSetVoicePitch(AUDIO_VOICE_CH1, PulsePitch(freq));
+		SetVoiceVolumeForChannel(AUDIO_VOICE_CH1, apuCh1.currentVolume, apuCh1.enabled, 0x10, 0x01);
+		SpuSetKey(apuCh1.enabled ? 1 : 0, 1 << AUDIO_VOICE_CH1);
+	}
+	// Channel 2 (pulse, no sweep)
+	{
+		int duty = (apuCh2.nrX1 >> 6) & 0x03;
+		int freq = apuCh2.nrX3 | ((apuCh2.nrX4 & 0x07) << 8);
+		SpuSetVoiceStartAddr(AUDIO_VOICE_CH2, AUDIO_DUTY_ADDR(duty));
+		SpuSetVoicePitch(AUDIO_VOICE_CH2, PulsePitch(freq));
+		SetVoiceVolumeForChannel(AUDIO_VOICE_CH2, apuCh2.currentVolume, apuCh2.enabled, 0x20, 0x02);
+		SpuSetKey(apuCh2.enabled ? 1 : 0, 1 << AUDIO_VOICE_CH2);
+	}
+	// Channel 3 (wave) - re-encode/upload only if the wave table
+	// actually changed since the last frame.
+	{
+		if (memcmp(WAVERAM, lastWaveRAM, 16) != 0) {
+			int samples[32];
+			int i;
+			for (i = 0; i < 32; i++) {
+				BYTE byte = WAVERAM[i / 2];
+				samples[i] = (i % 2 == 0) ? (byte >> 4) : (byte & 0x0F);
+			}
+			UploadLoopingSample(AUDIO_WAVE_ADDR, samples, 32, 7, 8);
+			memcpy(lastWaveRAM, WAVERAM, 16);
+		}
+		int freq = apuCh3.nrX3 | ((apuCh3.nrX4 & 0x07) << 8);
+		int shift;
+		switch ((apuCh3.nrX2 >> 5) & 0x03) {
+			case 0: shift = 4; break;
+			case 1: shift = 0; break;
+			case 2: shift = 1; break;
+			default: shift = 2; break;
+		}
+		int ch3Volume = apuCh3.enabled ? (15 >> shift) : 0;
+		SpuSetVoicePitch(AUDIO_VOICE_CH3, WavePitch(freq));
+		SetVoiceVolumeForChannel(AUDIO_VOICE_CH3, ch3Volume, apuCh3.enabled, 0x40, 0x04);
+		SpuSetKey(apuCh3.enabled ? 1 : 0, 1 << AUDIO_VOICE_CH3);
+	}
+	// Channel 4 (noise) - hardware noise generator; approximate the GB's
+	// clock-shift/divisor pair as a single noise frequency/step value in
+	// SPU_CTRL. This is a real, acknowledged approximation - the SPU's
+	// noise generator is not bit-for-bit the same algorithm as the GB's
+	// LFSR, just similar broadband noise in spirit.
+	{
+		int shift = (apuCh4.nrX3 >> 4) & 0x0F;
+		int div = apuCh4.nrX3 & 0x07;
+		int noiseFreq = (shift << 2) | (div >> 1); // fold into SPU_CTRL's 6-bit noise frequency field
+		if (noiseFreq > 0x3F) noiseFreq = 0x3F;
+		// Only touches the noise-frequency/step bits - leaves every
+		// other SPU_CTRL bit (master enable, reverb, etc.) exactly as
+		// SpuInit() and the rest of this file already set them. The
+		// per-voice SPU_NOISE_MODE1 bit set in InitAudio() is what
+		// actually turns noise generation on for this voice at all;
+		// this only tunes its perceived pitch.
+		SPU_CTRL = (SPU_CTRL & ~0x003F) | noiseFreq;
+		SetVoiceVolumeForChannel(AUDIO_VOICE_CH4, apuCh4.currentVolume, apuCh4.enabled, 0x80, 0x08);
+		SpuSetKey(apuCh4.enabled ? 1 : 0, 1 << AUDIO_VOICE_CH4);
+	}
+}
+
 // ---- Controller input -------------------------------------------------
 // PSn00bSDK doesn't wrap the BIOS's pad driver the way the official Sony
 // SDK's PadInit()/PadRead() did (see psxpad.h's own comments) - but the
@@ -217,6 +494,8 @@ void init_PSX(void) {
 	// Initializes the BIOS's memory card filesystem driver so the
 	// bu00:/bu10: device paths used by Save/LoadCartRAM below work.
 	_bu_init();
+
+	InitAudio();
 }
 
 // ---- CD-ROM ROM loading (multi-game disc support) ----------------------

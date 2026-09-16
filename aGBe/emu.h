@@ -47,6 +47,28 @@ extern BYTE BGPAL, OBJPAL0, OBJPAL1;
 extern int FRAMECOUNT;
 extern int RAM_DIRTY;
 extern int EI_PENDING;
+
+// APU (sound) state - see the APUChannel struct and channel globals in
+// emu.c for the full field list; declared here so psx.c's UpdateAudio()
+// can read current channel state each frame.
+typedef struct {
+	BYTE nrX0, nrX1, nrX2, nrX3, nrX4;
+	int enabled;
+	int dacEnabled;
+	int freqTimer;
+	int dutyPos;
+	int lengthCounter;
+	int envelopeTimer;
+	int currentVolume;
+	int sweepTimer;
+	int sweepEnabled;
+	int shadowFreq;
+	int wavePos;
+	int lfsr;
+} APUChannel;
+extern APUChannel apuCh1, apuCh2, apuCh3, apuCh4;
+extern BYTE WAVERAM[16];
+extern BYTE NR50, NR51, NR52;
 int CartHasBattery(void);
 int CartHasRTC(void);
 int GetCartSaveSize(void);

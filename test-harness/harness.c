@@ -81,6 +81,31 @@ void Draw_Buffer(int *screenBuffer, unsigned short *screenBufferColor, int gbcMo
 void Draw_Buffer_SPRT(int *screenBuffer) { (void)screenBuffer; }
 void Draw_Buffer_Pixel_Blitting(int *screenBuffer) { (void)screenBuffer; }
 
+// Host stub for the real PS1 SPU-driving UpdateAudio() in psx.c (which
+// this harness doesn't build at all - it uses real PSn00bSDK headers
+// that don't compile on the host). No actual audio hardware exists here
+// to drive, but TRACE_AUDIO=1 dumps each channel's current
+// frequency/volume/enabled state once per frame, which is the one way
+// to sanity-check the APU core's behavior over time without real
+// playback - e.g. confirming a music-playing ROM's channels actually
+// change frequency/volume over time instead of sitting static.
+void UpdateAudio(void) {
+	static int callCount = 0;
+	callCount++;
+	if (!getenv("TRACE_AUDIO")) {
+		return;
+	}
+	int freq1 = apuCh1.nrX3 | ((apuCh1.nrX4 & 0x07) << 8);
+	int freq2 = apuCh2.nrX3 | ((apuCh2.nrX4 & 0x07) << 8);
+	int freq3 = apuCh3.nrX3 | ((apuCh3.nrX4 & 0x07) << 8);
+	fprintf(stderr, "[audio] frame=%d NR52=%02X ch1(en=%d f=%d v=%d dt=%d) ch2(en=%d f=%d v=%d dt=%d) ch3(en=%d f=%d) ch4(en=%d v=%d)\n",
+		callCount, NR52,
+		apuCh1.enabled, freq1, apuCh1.currentVolume, (apuCh1.nrX1 >> 6) & 3,
+		apuCh2.enabled, freq2, apuCh2.currentVolume, (apuCh2.nrX1 >> 6) & 3,
+		apuCh3.enabled, freq3,
+		apuCh4.enabled, apuCh4.currentVolume);
+}
+
 // ---- Real save/load for testing purposes ----
 // Plain host files (one per sanitized cart title, matching the same
 // naming idea the real psx.c memory-card implementation uses) rather

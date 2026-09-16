@@ -148,6 +148,30 @@ BYTE BCPS, OCPS;
 BYTE BGPALRAM[64];
 BYTE OBJPALRAM[64];
 
+// ---- APU (sound) support --------------------------------------------
+// APUChannel is declared in emu.h (shared with psx.c's UpdateAudio()).
+// One struct per channel holds both the raw, CPU-visible NRxx register
+// bytes and the internal state real hardware keeps that software never
+// reads back directly - the running length/envelope/sweep counters,
+// waveform position, and (for channel 4) the noise LFSR. Grouped into
+// a struct despite the rest of this codebase using flat globals
+// throughout, since the sheer number of interdependent per-channel
+// values here is much more manageable this way.
+APUChannel apuCh1, apuCh2, apuCh3, apuCh4;
+BYTE WAVERAM[16]; // $FF30-$FF3F - channel 3's 32 4-bit samples, 2 per byte
+BYTE NR50, NR51, NR52;
+// Frame sequencer: real hardware steps this 512Hz/8-step sequencer from
+// falling edges of a specific DIV bit, which means DIV-resetting writes
+// can shift its timing - a real, documented hardware quirk. This
+// project instead free-runs a dedicated cycle counter that overflows at
+// the same 512Hz rate, which is simpler and correct for the vast
+// majority of real game behavior, at the cost of not reproducing that
+// one specific DIV-interaction quirk exactly.
+int apuFrameSeqCounter = 0;
+int apuFrameSeqStep = 0;
+// Runs the actual sample-generation clock - see GenerateAudioSample().
+int apuSampleCycleAccumulator = 0;
+
 int ROMBANKNUMBER = 1;// Bank register powers on selecting bank 1 (MBC1/2/3/5)
 int RAMBANKNUMBER = 0;
 int MBCMODE = 0;
@@ -557,6 +581,257 @@ void doDMA(BYTE addr) {
 	}
 }
 
+// ---- APU (sound) core -------------------------------------------------
+// Implements the 4 real Game Boy sound channels (2 pulse, 1 custom wave,
+// 1 noise) at the register/timing level: trigger behavior, length
+// counters, volume envelopes, frequency sweep (channel 1 only), and
+// per-channel waveform generation. This is the hardware-accurate core;
+// see psx.c for how its output actually reaches the PS1's SPU.
+//
+// Deliberately not chasing every documented edge case (obscure wave-RAM
+// corruption-on-retrigger timing, the exact APU-DIV phase a NRx4 write
+// needs to land on for an extra length clock, etc.) - the goal is
+// correct behavior for the vast majority of real games, not a
+// cycle-exact reproduction of every corner of real hardware.
+
+static const int APU_DIVISORS[8] = {8, 16, 32, 48, 64, 80, 96, 112};
+
+int APUDacEnabled12(BYTE nrX2) {
+	// Channels 1/2/4 share this NRx2 layout: bits 7-4 = initial volume,
+	// bit 3 = envelope direction. The DAC (and so the whole channel) is
+	// off whenever both the volume and direction bits are all zero.
+	return (nrX2 & 0xF8) != 0;
+}
+
+void APUSetNR52Status(void) {
+	NR52 = (NR52 & 0x80) | 0x70
+		| (apuCh1.enabled ? 0x01 : 0)
+		| (apuCh2.enabled ? 0x02 : 0)
+		| (apuCh3.enabled ? 0x04 : 0)
+		| (apuCh4.enabled ? 0x08 : 0);
+}
+
+void APUTriggerPulse(APUChannel *ch, int hasSweep) {
+	ch->dacEnabled = APUDacEnabled12(ch->nrX2);
+	ch->enabled = ch->dacEnabled;
+	if (ch->lengthCounter == 0) {
+		ch->lengthCounter = 64;
+	}
+	int freq = ch->nrX3 | ((ch->nrX4 & 0x07) << 8);
+	ch->freqTimer = (2048 - freq) * 4;
+	ch->envelopeTimer = (ch->nrX2 & 0x07) ? (ch->nrX2 & 0x07) : 8;
+	ch->currentVolume = (ch->nrX2 >> 4) & 0x0F;
+	if (hasSweep) {
+		ch->shadowFreq = freq;
+		int sweepPace = (ch->nrX0 >> 4) & 0x07;
+		int sweepShift = ch->nrX0 & 0x07;
+		ch->sweepTimer = sweepPace ? sweepPace : 8;
+		ch->sweepEnabled = (sweepPace != 0) || (sweepShift != 0);
+		if (sweepShift != 0) {
+			// Real hardware performs one sweep overflow check
+			// immediately on trigger, using the shift but not actually
+			// committing the new frequency anywhere - it only matters
+			// for whether this immediately disables the channel.
+			int newFreq = ch->shadowFreq >> sweepShift;
+			newFreq = (ch->nrX0 & 0x08) ? (ch->shadowFreq - newFreq) : (ch->shadowFreq + newFreq);
+			if (newFreq > 2047) {
+				ch->enabled = 0;
+			}
+		}
+	}
+}
+
+void APUTriggerWave(void) {
+	apuCh3.dacEnabled = (apuCh3.nrX0 & 0x80) != 0;
+	apuCh3.enabled = apuCh3.dacEnabled;
+	if (apuCh3.lengthCounter == 0) {
+		apuCh3.lengthCounter = 256;
+	}
+	int freq = apuCh3.nrX3 | ((apuCh3.nrX4 & 0x07) << 8);
+	apuCh3.freqTimer = (2048 - freq) * 2;
+	apuCh3.wavePos = 0;
+}
+
+void APUTriggerNoise(void) {
+	apuCh4.dacEnabled = APUDacEnabled12(apuCh4.nrX2);
+	apuCh4.enabled = apuCh4.dacEnabled;
+	if (apuCh4.lengthCounter == 0) {
+		apuCh4.lengthCounter = 64;
+	}
+	apuCh4.envelopeTimer = (apuCh4.nrX2 & 0x07) ? (apuCh4.nrX2 & 0x07) : 8;
+	apuCh4.currentVolume = (apuCh4.nrX2 >> 4) & 0x0F;
+	apuCh4.lfsr = 0x7FFF;
+	int shift = (apuCh4.nrX3 >> 4) & 0x0F;
+	int divisor = APU_DIVISORS[apuCh4.nrX3 & 0x07];
+	apuCh4.freqTimer = divisor << shift;
+}
+
+void APUStepLength(APUChannel *ch, int lengthEnableBit) {
+	if ((ch->nrX4 & lengthEnableBit) && ch->lengthCounter > 0) {
+		ch->lengthCounter--;
+		if (ch->lengthCounter == 0) {
+			ch->enabled = 0;
+		}
+	}
+}
+
+void APUStepSweep(void) {
+	if (apuCh1.sweepTimer > 0) {
+		apuCh1.sweepTimer--;
+	}
+	if (apuCh1.sweepTimer == 0) {
+		int sweepPace = (apuCh1.nrX0 >> 4) & 0x07;
+		apuCh1.sweepTimer = sweepPace ? sweepPace : 8;
+		int sweepShift = apuCh1.nrX0 & 0x07;
+		if (apuCh1.sweepEnabled && sweepPace != 0) {
+			int newFreq = apuCh1.shadowFreq >> sweepShift;
+			newFreq = (apuCh1.nrX0 & 0x08) ? (apuCh1.shadowFreq - newFreq) : (apuCh1.shadowFreq + newFreq);
+			if (newFreq > 2047) {
+				apuCh1.enabled = 0;
+			} else if (sweepShift != 0) {
+				apuCh1.shadowFreq = newFreq;
+				apuCh1.nrX3 = newFreq & 0xFF;
+				apuCh1.nrX4 = (apuCh1.nrX4 & 0xF8) | ((newFreq >> 8) & 0x07);
+				// Second overflow check with the new value, matching
+				// real hardware performing the calculation twice.
+				int checkFreq = apuCh1.shadowFreq >> sweepShift;
+				checkFreq = (apuCh1.nrX0 & 0x08) ? (apuCh1.shadowFreq - checkFreq) : (apuCh1.shadowFreq + checkFreq);
+				if (checkFreq > 2047) {
+					apuCh1.enabled = 0;
+				}
+			}
+		}
+	}
+}
+
+void APUStepEnvelope(APUChannel *ch) {
+	int pace = ch->nrX2 & 0x07;
+	if (pace == 0) {
+		return; // envelope disabled entirely while pace is 0
+	}
+	if (ch->envelopeTimer > 0) {
+		ch->envelopeTimer--;
+	}
+	if (ch->envelopeTimer == 0) {
+		ch->envelopeTimer = pace;
+		int increasing = (ch->nrX2 & 0x08) != 0;
+		if (increasing && ch->currentVolume < 15) {
+			ch->currentVolume++;
+		} else if (!increasing && ch->currentVolume > 0) {
+			ch->currentVolume--;
+		}
+	}
+}
+
+// Called once every 8192 T-cycles (512Hz) - see APUClock() below for
+// where that period comes from.
+void APUStepFrameSequencer(void) {
+	// Step 0,2,4,6: length (256Hz). Steps 2,6: sweep (128Hz), after
+	// length. Step 7: envelope (64Hz).
+	if ((apuFrameSeqStep % 2) == 0) {
+		APUStepLength(&apuCh1, 0x40);
+		APUStepLength(&apuCh2, 0x40);
+		APUStepLength(&apuCh3, 0x40);
+		APUStepLength(&apuCh4, 0x40);
+	}
+	if (apuFrameSeqStep == 2 || apuFrameSeqStep == 6) {
+		APUStepSweep();
+	}
+	if (apuFrameSeqStep == 7) {
+		APUStepEnvelope(&apuCh1);
+		APUStepEnvelope(&apuCh2);
+		APUStepEnvelope(&apuCh4);
+	}
+	apuFrameSeqStep = (apuFrameSeqStep + 1) % 8;
+}
+
+// Advances all 4 channels' own waveform-generation timers by `cycles`
+// T-cycles, and the 512Hz frame sequencer alongside them. Called once
+// per instruction from cycleLength(), the same place DIV/the CPU timer/
+// the PPU are all driven from.
+void APUClock(int cycles) {
+	if (!(NR52 & 0x80)) {
+		return; // master sound off - real hardware halts all APU clocking
+	}
+
+	apuFrameSeqCounter += cycles;
+	while (apuFrameSeqCounter >= 8192) {
+		apuFrameSeqCounter -= 8192;
+		APUStepFrameSequencer();
+	}
+
+	apuCh1.freqTimer -= cycles;
+	while (apuCh1.freqTimer <= 0) {
+		int freq = apuCh1.nrX3 | ((apuCh1.nrX4 & 0x07) << 8);
+		apuCh1.freqTimer += (2048 - freq) * 4;
+		apuCh1.dutyPos = (apuCh1.dutyPos + 1) % 8;
+	}
+	apuCh2.freqTimer -= cycles;
+	while (apuCh2.freqTimer <= 0) {
+		int freq = apuCh2.nrX3 | ((apuCh2.nrX4 & 0x07) << 8);
+		apuCh2.freqTimer += (2048 - freq) * 4;
+		apuCh2.dutyPos = (apuCh2.dutyPos + 1) % 8;
+	}
+	apuCh3.freqTimer -= cycles;
+	while (apuCh3.freqTimer <= 0) {
+		int freq = apuCh3.nrX3 | ((apuCh3.nrX4 & 0x07) << 8);
+		apuCh3.freqTimer += (2048 - freq) * 2;
+		apuCh3.wavePos = (apuCh3.wavePos + 1) % 32;
+	}
+	apuCh4.freqTimer -= cycles;
+	while (apuCh4.freqTimer <= 0) {
+		int shift = (apuCh4.nrX3 >> 4) & 0x0F;
+		int divisor = APU_DIVISORS[apuCh4.nrX3 & 0x07];
+		apuCh4.freqTimer += divisor << shift;
+		int xorBit = (apuCh4.lfsr & 0x01) ^ ((apuCh4.lfsr >> 1) & 0x01);
+		apuCh4.lfsr = (apuCh4.lfsr >> 1) | (xorBit << 14);
+		if (apuCh4.nrX3 & 0x08) { // narrow (7-bit) mode
+			apuCh4.lfsr = (apuCh4.lfsr & ~0x40) | (xorBit << 6);
+		}
+	}
+
+	APUSetNR52Status();
+}
+
+static const BYTE APU_DUTY_TABLE[4] = {0x01, 0x81, 0x87, 0x7E}; // 12.5/25/50/75%, MSB-first per step
+
+// Returns this channel's current output, 0-15 (before NR50/NR51 mixing),
+// or -1 if its DAC is off (silent, contributes nothing - matches real
+// hardware's DAC producing no signal at all rather than a "0" sample).
+int APUChannelOutput(int channelNum) {
+	switch (channelNum) {
+		case 1: {
+			if (!apuCh1.enabled || !apuCh1.dacEnabled) return -1;
+			int bit = (APU_DUTY_TABLE[(apuCh1.nrX1 >> 6) & 0x03] >> (7 - apuCh1.dutyPos)) & 0x01;
+			return bit ? apuCh1.currentVolume : 0;
+		}
+		case 2: {
+			if (!apuCh2.enabled || !apuCh2.dacEnabled) return -1;
+			int bit = (APU_DUTY_TABLE[(apuCh2.nrX1 >> 6) & 0x03] >> (7 - apuCh2.dutyPos)) & 0x01;
+			return bit ? apuCh2.currentVolume : 0;
+		}
+		case 3: {
+			if (!apuCh3.enabled || !apuCh3.dacEnabled) return -1;
+			BYTE sampleByte = WAVERAM[apuCh3.wavePos / 2];
+			int sample4bit = (apuCh3.wavePos % 2 == 0) ? (sampleByte >> 4) : (sampleByte & 0x0F);
+			int shift;
+			switch ((apuCh3.nrX2 >> 5) & 0x03) {
+				case 0: shift = 4; break; // mute
+				case 1: shift = 0; break; // 100%
+				case 2: shift = 1; break; // 50%
+				default: shift = 2; break; // 25%
+			}
+			return sample4bit >> shift;
+		}
+		case 4: {
+			if (!apuCh4.enabled || !apuCh4.dacEnabled) return -1;
+			int bit = (~apuCh4.lfsr) & 0x01;
+			return bit ? apuCh4.currentVolume : 0;
+		}
+	}
+	return -1;
+}
+
 void cycleLength(int cycle) {
 	// GBC double-speed mode: the CPU core runs twice as fast, but the
 	// PPU/DIV/Timer are driven by the fixed system clock, which does
@@ -585,6 +860,7 @@ void cycleLength(int cycle) {
 			}
 		}
 	}
+	APUClock(sysCycle);
 	VideoCyclesLeft -= sysCycle;
 	if(VideoCyclesLeft <= 0) { // Video
 		if((videoMode == HBLANKMODE) || (videoMode == VBLANKMODE)){
@@ -1145,6 +1421,10 @@ void vblank(void){
 //	if(curframe < 0) {
 //		curframe = frameskip;
 		FRAMECOUNT++;
+		// Audio update runs every frame regardless of LCD state - sound
+		// is independent of the display, and a game with the LCD off
+		// but sound playing (rare but real) should still be heard.
+		UpdateAudio();
 		if ((LCDCONTROL >> 7) == 0x01) { // LCD ON
 
 			// BUG FIX: Draw_Buffer (via DrawBG()) was only ever called
@@ -1553,6 +1833,10 @@ BYTE ReadMEM(WORD loc) {
 		}
 		if ( ( loc >= 0xFF00 ) &&  ( loc <= 0xFF7F ) ) { // $FF00-$FF7F - Hardware I/O Registers
 
+			if (loc >= 0xFF30 && loc <= 0xFF3F) { // Wave RAM
+				return WAVERAM[loc - 0xFF30];
+			}
+
 			switch (loc) {
 				case 0xFF00: return (BYTE)P1; break; // P1 (R/W)
 				case 0xFF01: return (BYTE)SERIALDATA; break; // Serial transfer data (R/W)
@@ -1563,30 +1847,36 @@ BYTE ReadMEM(WORD loc) {
 				case 0xFF07: return (BYTE)TIMCONT; break; // Timer Control
 				case 0xFF0F: return (BYTE)IFLAG; break; // Interrupt Flag (R/W)
 
-				// SOUND
-				case 0xFF10: break; // Sound Mode 1 register, Sweep register (R/W)
-				case 0xFF11: break; // Sound Mode 1 register, Sound length/Wave pattern duty (R/W)
-				case 0xFF12: break; // Sound Mode 1 register, Envelope (R/W)
-				case 0xFF13: break; // Sound Mode 1 register, Frequency lo (W)
-				case 0xFF14: break; // Sound Mode 1 register, Frequency hi (R/W)
+				// SOUND - many bits across these registers are
+				// write-only on real hardware and read back as 1
+				// regardless of what was last written; the OR masks
+				// below reproduce that exactly (Pan Docs' documented
+				// per-register read masks).
+				case 0xFF10: return apuCh1.nrX0 | 0x80; break; // NR10 sweep
+				case 0xFF11: return apuCh1.nrX1 | 0x3F; break; // NR11 duty/length
+				case 0xFF12: return apuCh1.nrX2; break;        // NR12 envelope
+				case 0xFF13: return 0xFF; break;                // NR13 freq lo (write-only)
+				case 0xFF14: return apuCh1.nrX4 | 0xBF; break; // NR14 freq hi/trigger/length-enable
 
-				case 0xFF16: break; // Sound Mode 2 register, Sound Length; Wave Pattern Duty (R/W)
-				case 0xFF17: break; // Sound Mode 2 register, envelope (R/W)
-				case 0xFF18: break; // Sound Mode 2 register, frequency lo data (W)
-				case 0xFF19: break; // Sound Mode 2 register, frequency hi data (R/W)
-				case 0xFF1A: break; // Sound Mode 3 register, Sound on/off (R/W)
-				case 0xFF1B: break; // Sound Mode 3 register, sound length (R/W)
-				case 0xFF1C: break; // Sound Mode 3 register, Select output level
-				case 0xFF1D: break; // Sound Mode 3 register, frequency's lower data (W)
-				case 0xFF1E: break; // Sound Mode 3 register, frequency's higher data (R/W)
-				case 0xFF20: break; // Sound Mode 4 register, sound length (R/W)
-				case 0xFF21: break; // Sound Mode 4 register, envelope (R/W)
-				case 0xFF22: break; // Sound Mode 4 register, polynomial counter (R/W)
-				case 0xFF30: break; // Sound Mode 4 register, counter/consecutive; inital (R/W)
+				case 0xFF16: return apuCh2.nrX1 | 0x3F; break; // NR21
+				case 0xFF17: return apuCh2.nrX2; break;        // NR22
+				case 0xFF18: return 0xFF; break;                // NR23 (write-only)
+				case 0xFF19: return apuCh2.nrX4 | 0xBF; break; // NR24
 
-				case 0xFF24: break; // Channel control / ON-OFF / Volume (R/W)
-				case 0xFF25: break; // Selection of Sound output terminal (R/W)
-				case 0xFF26: break; // Sound on/off (R/W)
+				case 0xFF1A: return apuCh3.nrX0 | 0x7F; break; // NR30 DAC on/off
+				case 0xFF1B: return 0xFF; break;                // NR31 (write-only)
+				case 0xFF1C: return apuCh3.nrX2 | 0x9F; break; // NR32 output level
+				case 0xFF1D: return 0xFF; break;                // NR33 (write-only)
+				case 0xFF1E: return apuCh3.nrX4 | 0xBF; break; // NR34
+
+				case 0xFF20: return 0xFF; break;                // NR41 (write-only)
+				case 0xFF21: return apuCh4.nrX2; break;        // NR42
+				case 0xFF22: return apuCh4.nrX3; break;        // NR43
+				case 0xFF23: return apuCh4.nrX4 | 0xBF; break; // NR44
+
+				case 0xFF24: return NR50; break;
+				case 0xFF25: return NR51; break;
+				case 0xFF26: APUSetNR52Status(); return NR52 | 0x70; break;
 
 
 
@@ -1798,6 +2088,10 @@ void WriteMEM(WORD loc, BYTE b){
 	} else if ( ( loc >= 0xFE00 ) &&  ( loc <= 0xFE9F ) ) { // $FE00-$FE9F - Object Attribute Memory (OAM)
 		OAMRAM[loc - 0xFE00] = b;
 	} else if ( ( loc >= 0xFF00 ) &&  ( loc <= 0xFF7F ) ) { // $FF00-$FF7F - Hardware I/O Registers
+		if (loc >= 0xFF30 && loc <= 0xFF3F) { // Wave RAM - writable regardless of APU power state
+			WAVERAM[loc - 0xFF30] = b;
+			return;
+		}
 		switch (loc) {
 			case 0xFF00: if (b == 0x03) { P1 = 0xF1; // Register for reading joy pad info and determining system type.    (R/W)
 					} else {
@@ -1845,30 +2139,87 @@ void WriteMEM(WORD loc, BYTE b){
 							break; // Timer Control
 			case 0xFF0F: IFLAG = b; break; // Interrupt Flag (R/W)
 
-			// SOUND
-			case 0xFF10: break; // Sound Mode 1 register, Sweep register (R/W)
-			case 0xFF11: break; // Sound Mode 1 register, Sound length/Wave pattern duty (R/W)
-			case 0xFF12: break; // Sound Mode 1 register, Envelope (R/W)
-			case 0xFF13: break; // Sound Mode 1 register, Frequency lo (W)
-			case 0xFF14: break; // Sound Mode 1 register, Frequency hi (R/W)
+			// SOUND - $FF10-$FF25 writes are ignored while the master
+			// APU switch (NR52 bit 7) is off, matching real hardware;
+			// NR52 itself and Wave RAM remain writable regardless.
+			case 0xFF10: if (NR52 & 0x80) { apuCh1.nrX0 = b; } break; // NR10 sweep
+			case 0xFF11: if (NR52 & 0x80) { apuCh1.nrX1 = b; apuCh1.lengthCounter = 64 - (b & 0x3F); } break; // NR11
+			case 0xFF12: // NR12 envelope - writing the DAC-off pattern immediately silences the channel
+				if (NR52 & 0x80) {
+					apuCh1.nrX2 = b;
+					if (!APUDacEnabled12(b)) { apuCh1.enabled = 0; apuCh1.dacEnabled = 0; }
+				}
+				break;
+			case 0xFF13: if (NR52 & 0x80) { apuCh1.nrX3 = b; } break; // NR13 freq lo
+			case 0xFF14: // NR14 freq hi/trigger/length-enable
+				if (NR52 & 0x80) {
+					apuCh1.nrX4 = b;
+					if (b & 0x80) { APUTriggerPulse(&apuCh1, 1); }
+				}
+				break;
 
-			case 0xFF16: break; // Sound Mode 2 register, Sound Length; Wave Pattern Duty (R/W)
-			case 0xFF17: break; // Sound Mode 2 register, envelope (R/W)
-			case 0xFF18: break; // Sound Mode 2 register, frequency lo data (W)
-			case 0xFF19: break; // Sound Mode 2 register, frequency hi data (R/W)
-			case 0xFF1A: break; // Sound Mode 3 register, Sound on/off (R/W)
-			case 0xFF1B: break; // Sound Mode 3 register, sound length (R/W)
-			case 0xFF1C: break; // Sound Mode 3 register, Select output level
-			case 0xFF1D: break; // Sound Mode 3 register, frequency's lower data (W)
-			case 0xFF1E: break; // Sound Mode 3 register, frequency's higher data (R/W)
-			case 0xFF20: break; // Sound Mode 4 register, sound length (R/W)
-			case 0xFF21: break; // Sound Mode 4 register, envelope (R/W)
-			case 0xFF22: break; // Sound Mode 4 register, polynomial counter (R/W)
-			case 0xFF30: break; // Sound Mode 4 register, counter/consecutive; inital (R/W)
+			case 0xFF16: if (NR52 & 0x80) { apuCh2.nrX1 = b; apuCh2.lengthCounter = 64 - (b & 0x3F); } break; // NR21
+			case 0xFF17:
+				if (NR52 & 0x80) {
+					apuCh2.nrX2 = b;
+					if (!APUDacEnabled12(b)) { apuCh2.enabled = 0; apuCh2.dacEnabled = 0; }
+				}
+				break;
+			case 0xFF18: if (NR52 & 0x80) { apuCh2.nrX3 = b; } break; // NR23
+			case 0xFF19:
+				if (NR52 & 0x80) {
+					apuCh2.nrX4 = b;
+					if (b & 0x80) { APUTriggerPulse(&apuCh2, 0); }
+				}
+				break;
 
-			case 0xFF24: break; // Channel control / ON-OFF / Volume (R/W)
-			case 0xFF25: break; // Selection of Sound output terminal (R/W)
-			case 0xFF26: break; // Sound on/off (R/W)
+			case 0xFF1A: // NR30 DAC on/off
+				if (NR52 & 0x80) {
+					apuCh3.nrX0 = b;
+					apuCh3.dacEnabled = (b & 0x80) != 0;
+					if (!apuCh3.dacEnabled) { apuCh3.enabled = 0; }
+				}
+				break;
+			case 0xFF1B: if (NR52 & 0x80) { apuCh3.nrX1 = b; apuCh3.lengthCounter = 256 - b; } break; // NR31 (full 8-bit length)
+			case 0xFF1C: if (NR52 & 0x80) { apuCh3.nrX2 = b; } break; // NR32 output level
+			case 0xFF1D: if (NR52 & 0x80) { apuCh3.nrX3 = b; } break; // NR33
+			case 0xFF1E:
+				if (NR52 & 0x80) {
+					apuCh3.nrX4 = b;
+					if (b & 0x80) { APUTriggerWave(); }
+				}
+				break;
+
+			case 0xFF20: if (NR52 & 0x80) { apuCh4.nrX1 = b; apuCh4.lengthCounter = 64 - (b & 0x3F); } break; // NR41
+			case 0xFF21:
+				if (NR52 & 0x80) {
+					apuCh4.nrX2 = b;
+					if (!APUDacEnabled12(b)) { apuCh4.enabled = 0; apuCh4.dacEnabled = 0; }
+				}
+				break;
+			case 0xFF22: if (NR52 & 0x80) { apuCh4.nrX3 = b; } break; // NR43
+			case 0xFF23:
+				if (NR52 & 0x80) {
+					apuCh4.nrX4 = b;
+					if (b & 0x80) { APUTriggerNoise(); }
+				}
+				break;
+
+			case 0xFF24: if (NR52 & 0x80) { NR50 = b; } break;
+			case 0xFF25: if (NR52 & 0x80) { NR51 = b; } break;
+			case 0xFF26: // NR52 - only the master power bit is actually writable
+				NR52 = (NR52 & 0x0F) | (b & 0x80);
+				if (!(b & 0x80)) {
+					// Real hardware clears every sound register (but not
+					// Wave RAM) when powered off this way, and channels
+					// immediately stop.
+					apuCh1 = (APUChannel){0};
+					apuCh2 = (APUChannel){0};
+					apuCh3 = (APUChannel){0};
+					apuCh4 = (APUChannel){0};
+					NR50 = 0; NR51 = 0;
+				}
+				break;
 
 			// VIDEO
 			case 0xFF40:

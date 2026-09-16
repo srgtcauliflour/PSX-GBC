@@ -28,6 +28,11 @@ void init_PSX(void);
 // gbcMode always 0, and screenBufferColor can be NULL in that case.
 void Draw_Buffer(int *screenBuffer, unsigned short *screenBufferColor, int gbcMode);
 void PrepScreen(void);
+// Called once per frame from vblank() - reads the core's current APU
+// channel state (see emu.h's APUChannel externs) and drives the PS1
+// SPU's hardware voices to approximate it. See psx.c for the full
+// design rationale and known limitations.
+void UpdateAudio(void);
 void RenderWorld(BYTE re, BYTE gr, BYTE bl);
 unsigned long PadRead(int pad_num);
 
