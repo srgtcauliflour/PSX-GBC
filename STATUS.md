@@ -1,9 +1,12 @@
-# aGBe Modernization — Status
+# PSX-GBC (aGBe Modernization) — Status
 
 This is a from-scratch git repo (`git log` has full history with detailed
 rationale per commit) rebuilding **aGBe**, an early-2000s Game Boy/Game Boy
 Color emulator for the original PlayStation, from an unbuildable CVS dump
-into something on a path to a real Release build.
+into something on a path to a real Release build. The project now goes by
+the name **PSX-GBC**; `aGBe` remains the name of the original codebase this
+project is built on and modernizes, referenced throughout this document and
+the commit history.
 
 ## Layout
 
