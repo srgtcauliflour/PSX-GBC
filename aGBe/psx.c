@@ -92,10 +92,20 @@ void PresentFrame(void) {
 	db = !db;
 }
 
-void Draw_Buffer(int *screenBuffer) {
+void Draw_Buffer(int *screenBuffer, unsigned short *screenBufferColor, int gbcMode) {
 	int i;
-	for (i = 0; i < GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT; i++) {
-		gb_framebuffer[i] = gb_shade_colors[screenBuffer[i] & 0x03];
+	if (gbcMode) {
+		// CGB colors are already stored 15-bit RGB555, little-endian,
+		// bits 14-10/9-5/4-0 = B/G/R - the exact same layout the PS1 GPU
+		// itself uses for direct 16bpp color, so no conversion is needed
+		// at all, just a straight copy.
+		for (i = 0; i < GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT; i++) {
+			gb_framebuffer[i] = screenBufferColor[i];
+		}
+	} else {
+		for (i = 0; i < GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT; i++) {
+			gb_framebuffer[i] = gb_shade_colors[screenBuffer[i] & 0x03];
+		}
 	}
 
 	int offsetX, offsetY;

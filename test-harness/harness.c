@@ -26,7 +26,7 @@
 unsigned long PadRead(int pad_num) { (void)pad_num; return 0; }
 void PadInit(int mode) { (void)mode; }
 static int draw_buffer_call_count = 0;
-void Draw_Buffer(int *screenBuffer) {
+void Draw_Buffer(int *screenBuffer, unsigned short *screenBufferColor, int gbcMode) {
     draw_buffer_call_count++;
     if (getenv("TRACE")) fprintf(stderr, "[Draw_Buffer] call #%d\n", draw_buffer_call_count);
     if (getenv("ROWSUMMARY")) {
@@ -47,12 +47,32 @@ void Draw_Buffer(int *screenBuffer) {
     if (dump_path && (dump_at < 0 || dump_at == draw_buffer_call_count)) {
         FILE *f = fopen(dump_path, "wb");
         if (f) {
-            fprintf(f, "P5\n160 144\n255\n");
             int i;
-            for (i = 0; i < 160*144; i++) {
-                unsigned char shade = screenBuffer[i] & 0x03;
-                unsigned char gray = 255 - (shade * 85); // 0->255(white),1->170,2->85,3->0(black)
-                fputc(gray, f);
+            if (gbcMode && screenBufferColor) {
+                // Real color dump (P6) - each pixel is a 15-bit RGB555
+                // value (5 bits per channel); scale each channel to 8
+                // bits by replicating its top bits into the low bits
+                // (c5<<3 | c5>>2) rather than a plain multiply, which
+                // maps the full 0-31 range onto the full 0-255 range
+                // evenly instead of leaving the brightest value short of
+                // 255.
+                fprintf(f, "P6\n160 144\n255\n");
+                for (i = 0; i < 160*144; i++) {
+                    unsigned short c = screenBufferColor[i];
+                    unsigned char r5 = c & 0x1F;
+                    unsigned char g5 = (c >> 5) & 0x1F;
+                    unsigned char b5 = (c >> 10) & 0x1F;
+                    fputc((r5 << 3) | (r5 >> 2), f);
+                    fputc((g5 << 3) | (g5 >> 2), f);
+                    fputc((b5 << 3) | (b5 >> 2), f);
+                }
+            } else {
+                fprintf(f, "P5\n160 144\n255\n");
+                for (i = 0; i < 160*144; i++) {
+                    unsigned char shade = screenBuffer[i] & 0x03;
+                    unsigned char gray = 255 - (shade * 85); // 0->255(white),1->170,2->85,3->0(black)
+                    fputc(gray, f);
+                }
             }
             fclose(f);
         }

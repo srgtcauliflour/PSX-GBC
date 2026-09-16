@@ -84,6 +84,12 @@ double CLOCKSPEED = 4.123;
 
 //char buff[200];
 int screenBuffer[160*144];
+// Parallel to screenBuffer, only ever populated when GBC_MODE is set:
+// the actual 15-bit RGB555 color (little-endian, matching how it's
+// stored in BGPALRAM/OBJPALRAM) for each pixel, rather than a 0-3 DMG
+// shade index. The platform layer picks whichever of the two buffers
+// is relevant based on GBC_MODE - a DMG cart never touches this at all.
+WORD screenBufferColor[160*144];
 int runto = 0;
 
 int Voff;
@@ -101,6 +107,28 @@ BYTE P1;
 BYTE TIMEMOD, TIMCONT;
 int TIMECNT;
 int MAXTIME, TIMECOUNTER;
+
+// ---- GBC (Game Boy Color) support ----------------------------------
+// GBC_MODE is set once at ROM load time from the cartridge header's CGB
+// flag ($0143): $80 (CGB-enhanced, still DMG-compatible) or $C0
+// (CGB-only) both mean this cart expects to run in CGB mode; anything
+// else means plain DMG. Every CGB-specific register/buffer below is
+// only ever touched when GBC_MODE is set - a DMG cart's behavior is
+// completely unaffected by any of this.
+int GBC_MODE = 0;
+BYTE VBK;   // $FF4F - VRAM bank select (bit 0 only; bits 1-7 read as 1)
+BYTE SVBK;  // $FF70 - WRAM bank select for $D000-$DFFF (bits 0-2; 0 behaves as 1)
+BYTE KEY1;  // $FF4D - speed switch (prepare/current speed flags)
+// BCPS/OCPS ($FF68/$FF6A): bit0-5 = palette RAM byte index (0-63),
+// bit7 = auto-increment the index after each BCPD/OCPD write.
+BYTE BCPS, OCPS;
+// 8 palettes x 4 colors x 2 bytes (little-endian RGB555) each = 64
+// bytes, for BG/window and OBJ respectively - real hardware's actual
+// CGB palette RAM, read/written through the BCPS/OCPS index above via
+// the BCPD/OCPD data ports ($FF69/$FF6B).
+BYTE BGPALRAM[64];
+BYTE OBJPALRAM[64];
+
 int ROMBANKNUMBER = 1;// Bank register powers on selecting bank 1 (MBC1/2/3/5)
 int RAMBANKNUMBER = 0;
 int MBCMODE = 0;
@@ -184,6 +212,32 @@ void reset_Z80() {
 		BGPAL = 0xFC;
 		OBJPAL0 = 0xFF;
 		OBJPAL1 = 0xFF;
+		// Same idea, for CGB's separate palette RAM: real hardware's CGB
+		// boot ROM establishes a reasonable default palette state before
+		// handing off to the game (part of its DMG-compatibility-mode
+		// setup, though it leaves the hardware in a sane state generally
+		// too) - without this, CGB palette RAM starts at all-zero
+		// (calloc'd), which maps every possible tile pixel value to
+		// black, showing a solid black screen instead of whatever the
+		// game's own tile data actually contains until it gets around to
+		// setting its own colors. Uses the same white/light-gray/dark-
+		// gray/black progression as the DMG default above, replicated
+		// across all 8 palettes, as a reasonable "nothing is definitely
+		// wrong yet" starting point - a real game sets its own palette
+		// data almost immediately regardless.
+		if (GBC_MODE) {
+			int p;
+			WORD defaultColors[4] = {0x7FFF, 0x56B5, 0x2D6B, 0x0000};
+			for (p = 0; p < 8; p++) {
+				int c;
+				for (c = 0; c < 4; c++) {
+					BGPALRAM[p * 8 + c * 2] = defaultColors[c] & 0xFF;
+					BGPALRAM[p * 8 + c * 2 + 1] = (defaultColors[c] >> 8) & 0xFF;
+					OBJPALRAM[p * 8 + c * 2] = defaultColors[c] & 0xFF;
+					OBJPALRAM[p * 8 + c * 2 + 1] = (defaultColors[c] >> 8) & 0xFF;
+				}
+			}
+		}
 		// Confirmed against the reference core (Peanut-GB)'s exact reset
 		// mechanics: the documented power-up STAT byte ($85, mode=VBlank)
 		// is the functionally real starting mode, not just cosmetic - its
@@ -320,6 +374,63 @@ void interrupt(void){
 	}
 }
 
+// ---- GBC WRAM/VRAM banking helpers ----------------------------------
+// CGB has 8 banks of 4KB internal RAM ($C000-$CFFF is always fixed to
+// bank 0; $D000-$DFFF switches among banks 1-7 via SVBK, with a value
+// of 0 behaving the same as 1 - there's no way to select bank 0 for the
+// switchable half, matching real hardware). A plain DMG cart never
+// touches SVBK (GBC_MODE gates the write handler), so GetWRAMBank()
+// always returns 1 for DMG, giving the exact same fixed 8KB-total WRAM
+// layout this project already had before CGB support existed.
+// Same idea as GetWRAMBank() above, for CGB's 2-bank VRAM. A DMG cart
+// never touches VBK (GBC_MODE gates the write handler), so this always
+// returns 0 for DMG, giving the exact same single-8KB-bank VRAM layout
+// this project always had.
+int GetVRAMBank(void) {
+	return GBC_MODE ? (VBK & 0x01) : 0;
+}
+
+// Reads directly from a specific VRAM bank regardless of the CPU's own
+// current VBK selection - needed because CGB's BG/window tile
+// attributes always live in bank 1 at the exact same map address the
+// tile number itself occupies in bank 0, accessed "in parallel" by the
+// PPU rather than through the CPU's bank-switched view of VRAM. addr
+// must be in the normal $8000-$9FFF range.
+BYTE ReadVRAMBank(int bank, WORD addr) {
+	return VRAM[bank * 0x2000 + (addr - 0x8000)];
+}
+
+// Combines a CGB palette RAM entry into the 15-bit RGB555 color it
+// represents - palRAM is BGPALRAM or OBJPALRAM, paletteNum is 0-7,
+// colorNum is 0-3 (the same tile-pixel 2-bit value DMG rendering uses
+// as a direct shade index instead).
+WORD GetCGBColor(BYTE *palRAM, int paletteNum, int colorNum) {
+	int idx = paletteNum * 8 + colorNum * 2;
+	return palRAM[idx] | (palRAM[idx + 1] << 8);
+}
+
+int GetWRAMBank(void) {
+	if (!GBC_MODE) {
+		return 1;
+	}
+	int bank = SVBK & 0x07;
+	return bank ? bank : 1;
+}
+
+// Returns a pointer into the 32KB RAM buffer for any address in either
+// the real $C000-$DFFF WRAM window or its $E000-$FDFF echo (which
+// mirrors it exactly, including which WRAM bank is currently switched
+// in for the upper half) - the one place that needs to know about WRAM
+// banking, so ReadMEM/WriteMEM's several C000/D000/echo cases all stay
+// consistent with each other automatically.
+BYTE *WRAMPtr(WORD loc) {
+	WORD addr = (loc >= 0xE000) ? (loc - 0x2000) : loc;
+	if (addr < 0xD000) {
+		return &RAM[addr - 0xC000];
+	}
+	return &RAM[GetWRAMBank() * 0x1000 + (addr - 0xD000)];
+}
+
 // Real size in bytes of the EXTRNRAM buffer for the current cartridge -
 // shared by Allocate_Memory (to size the allocation) and the save/load
 // calls (to know how much to persist), so the two can never disagree.
@@ -365,8 +476,16 @@ void Allocate_Memory(void){
 	// check and pixel-loop bugs fixed alongside this). calloc() zeroes as
 	// it allocates, at the same cost as malloc()+memset().
 	HIRAM  = (BYTE *)calloc(128, sizeof(BYTE));
-	VRAM   = (BYTE *)calloc(8 * 1024, sizeof(BYTE));
-	RAM    = (BYTE *)calloc(8 * 1024, sizeof(BYTE)); //TODO: Check this out
+	// 16KB (2 banks of 8KB) - CGB's VRAM banking (see VBK/VRAMPtr). A DMG
+	// cart never switches banks (VBK stays 0 forever, gated by GBC_MODE
+	// in the write handler), so it only ever sees the first 8KB, the
+	// exact same buffer size and layout this project always had.
+	VRAM   = (BYTE *)calloc(16 * 1024, sizeof(BYTE));
+	// 32KB (8 banks of 4KB) - CGB's WRAM banking (see SVBK/WRAMPtr). A
+	// DMG cart's GetWRAMBank() always returns 1, so it only ever sees
+	// the first 8KB (bank 0 fixed + bank 1 fixed) - the exact same
+	// buffer size and layout this project always had.
+	RAM    = (BYTE *)calloc(32 * 1024, sizeof(BYTE));
 	OAMRAM = (BYTE *)calloc(160, sizeof(BYTE));
 	EXTRNRAM = (BYTE *)calloc(GetCartRAMSize(), sizeof(BYTE));
 }
@@ -599,6 +718,58 @@ void DrawBGline(int line, int BGaddr, int TILEaddr) {
 	// that range walks off into unrelated memory (the other tile map at
 	// $9C00, or beyond it) once the sum exceeds 255.
 	by = (SCRY + LCDY) & 0xFF;
+
+	if (GBC_MODE) {
+		// CGB adds a per-tile attribute byte (palette, VRAM bank for
+		// tile data, X/Y flip, BG-to-OBJ priority) stored in VRAM bank 1
+		// at the exact same map address the tile number itself occupies
+		// in bank 0. This is a genuinely separate code path from the
+		// DMG one below, rather than threading CGB-only branches through
+		// it, since the attribute byte changes several things at once
+		// (which bank the tile data comes from, which row/column of it
+		// to read) that would otherwise need re-deriving per pixel.
+		//
+		// BG-to-OBJ priority (attribute bit 7) is not yet applied here -
+		// a real, separate gap, since resolving it needs coordinating
+		// with sprite rendering in a later pass over the same line.
+		int mapAddr = 0;
+		BYTE attr = 0;
+		for (i = 0; i < 160; i++) {
+			int newMapAddr = BGaddr + (by / 8) * 32 + (i + bx) / 8;
+			if (newMapAddr != mapAddr) {
+				mapAddr = newMapAddr;
+				tileNo = ReadVRAMBank(0, mapAddr);
+				attr = ReadVRAMBank(1, mapAddr);
+				int tileBank = (attr >> 3) & 0x01;
+				int yflip = (attr >> 6) & 0x01;
+				int tileRow = by % 8;
+				if (yflip) {
+					tileRow = 7 - tileRow;
+				}
+				// Tile number is signed (range -128..127, relative to
+				// TILEaddr=$9000) or unsigned (0..255, relative to
+				// TILEaddr=$8000) depending on LCDC bit 4, which is what
+				// TILEaddr itself already encodes here.
+				int effTileNo = (TILEaddr == 0x8000) ? (unsigned char) tileNo : (signed char) tileNo;
+				int tileDataAddr = TILEaddr + effTileNo * 16 + tileRow * 2;
+				B1 = ReadVRAMBank(tileBank, tileDataAddr);
+				B2 = ReadVRAMBank(tileBank, tileDataAddr + 1);
+			}
+			int xflip = (attr >> 5) & 0x01;
+			int bitPos = xflip ? (i % 8) : (7 - (i % 8));
+			int colorNum;
+			if (((B1 >> bitPos) & 0x01) == 1) {
+				colorNum = ((B2 >> bitPos) & 0x01) == 1 ? 3 : 2;
+			} else {
+				colorNum = ((B2 >> bitPos) & 0x01) == 1 ? 1 : 0;
+			}
+			int paletteNum = attr & 0x07;
+			screenBufferColor[(LCDY * 160) + i] = GetCGBColor(BGPALRAM, paletteNum, colorNum);
+			screenBuffer[(LCDY * 160) + i] = colorNum;
+		}
+		return;
+	}
+
 	for (i = 0; i < 160; i++) {
 		if (BGaddr == 0x9C00) {//
 			tileNo = (signed int)ReadMEM(BGaddr + (by/8) * 32 + (i+ bx)/8);
@@ -631,6 +802,45 @@ void DrawWINline(int line, int WINaddr, int TILEaddr) {
 	BYTE B1, B2;
 	int Transparency = LCDCONTROL & 0x1;
 	by = LCDY - WNDY;
+
+	if (GBC_MODE) {
+		// Same treatment as DrawBGline's CGB path - see its comments for
+		// why this is a separate code path rather than threading CGB
+		// branches through the DMG loop below.
+		int mapAddr = 0;
+		BYTE attr = 0;
+		for (i = 0; i < 160; i++) {
+			int newMapAddr = WINaddr + (by / 8) * 32 + (i) / 8;
+			if (newMapAddr != mapAddr) {
+				mapAddr = newMapAddr;
+				tileNo = ReadVRAMBank(0, mapAddr);
+				attr = ReadVRAMBank(1, mapAddr);
+				int tileBank = (attr >> 3) & 0x01;
+				int yflip = (attr >> 6) & 0x01;
+				int tileRow = by % 8;
+				if (yflip) {
+					tileRow = 7 - tileRow;
+				}
+				int effTileNo = (TILEaddr == 0x8000) ? (unsigned char) tileNo : (signed char) tileNo;
+				int tileDataAddr = TILEaddr + effTileNo * 16 + tileRow * 2;
+				B1 = ReadVRAMBank(tileBank, tileDataAddr);
+				B2 = ReadVRAMBank(tileBank, tileDataAddr + 1);
+			}
+			int xflip = (attr >> 5) & 0x01;
+			int bitPos = xflip ? (i % 8) : (7 - (i % 8));
+			int colorNum;
+			if (((B1 >> bitPos) & 0x01) == 1) {
+				colorNum = ((B2 >> bitPos) & 0x01) == 1 ? 3 : 2;
+			} else {
+				colorNum = ((B2 >> bitPos) & 0x01) == 1 ? 1 : 0;
+			}
+			int paletteNum = attr & 0x07;
+			screenBufferColor[(LCDY * 160) + i + WNDX - 7] = GetCGBColor(BGPALRAM, paletteNum, colorNum);
+			screenBuffer[(LCDY * 160) + i + WNDX - 7] = colorNum;
+		}
+		return;
+	}
+
 	for (i = 0; i < 160; i++) {
 		if (WINaddr == 0x9C00) {
 			tileNo = (signed int)ReadMEM(WINaddr + (by/8) * 32 + (i)/8);
@@ -642,16 +852,22 @@ void DrawWINline(int line, int WINaddr, int TILEaddr) {
 			 B2 = (unsigned char)ReadMEM(TILEaddr + ((tileNo) * 16)  + (by%8)*2 + 1 );
 			 oldtileNo = tileNo;
 		}
+		// BUG FIX: window tiles never went through the BGP palette
+		// lookup at all - real hardware uses the same BGP register for
+		// both background and window rendering, so a game whose BGP
+		// isn't the identity mapping ($E4) would see the window's
+		// colors come out wrong (a plain 0-3 shade index instead of
+		// whatever BGP actually maps that index to).
 		if (((B1 >> (7-(i%8))) & 0x01) == 1) {
-			if (((B2 >> (7-(i%8))) &0x01) == 1) { colour = 3;
-			} else { colour = 2;
+			if (((B2 >> (7-(i%8))) &0x01) == 1) { colour = (BGPAL >> 6) & 0x3;
+			} else { colour = (BGPAL >> 4) & 0x3;
 			}
-		} else if (((B2 >> (7-(i%8))) &0x01) == 1) { colour = 1;
+		} else if (((B2 >> (7-(i%8))) &0x01) == 1) { colour = (BGPAL >> 2) & 0x3;
 		} else {
 			if(Transparency == 1){
 				colour = screenBuffer[(LCDY * 160) + i + WNDX - 7]; // Or Better yet, skip the output.
 			} else {
-				colour = 0;
+				colour = BGPAL & 0x3;
 			}
 		}
 		screenBuffer[(LCDY * 160) + i + WNDX - 7] = colour;
@@ -751,6 +967,44 @@ void DrawOBJline(int line, int TILEaddr) {
 
 			//Hidden (Priority Bit 7)
 
+			if (GBC_MODE) {
+				// CGB sprites use a 3-bit palette index (bflag bits 0-2,
+				// selecting one of OBJPALRAM's 8 palettes) instead of
+				// DMG's 1-bit OBJPAL0/OBJPAL1 selector, and bit3 selects
+				// which VRAM bank the tile data itself comes from - same
+				// idea as the BG/window attribute byte in DrawBGline/
+				// DrawWINline, just packed into the sprite's own OAM
+				// flags byte instead of a separate per-tile attribute.
+				int tileBank = (bflag >> 3) & 0x01;
+				B1 = ReadVRAMBank(tileBank, TILEaddr + effectiveTileNo * 16 + spriteRow * 2);
+				B2 = ReadVRAMBank(tileBank, TILEaddr + effectiveTileNo * 16 + spriteRow * 2 + 1);
+				int paletteNum = bflag & 0x07;
+				for (j = 0; j < 8; j++) {
+					int bit = iflipx ? j : (7 - j);
+					int colorNum;
+					if (((B1 >> bit) & 0x01) == 1) {
+						colorNum = ((B2 >> bit) & 0x01) == 1 ? 3 : 2;
+					} else {
+						colorNum = ((B2 >> bit) & 0x01) == 1 ? 1 : 0;
+					}
+					// BUG FIX: sprite color 0 is always transparent on
+					// real hardware (shows whatever's underneath) - this
+					// was never actually skipped, just drawn like any
+					// other color. Much more visually obvious for CGB,
+					// where OBJPALRAM's color 0 has no reason to happen
+					// to match the background the way DMG's usual
+					// white-ish color 0 often visually does.
+					if (colorNum == 0) {
+						continue;
+					}
+					if ((bx - 7 + j < 160) && (bx - 7 + j >= 0)) {
+						screenBufferColor[(line * 160) + bx - 7 + j] = GetCGBColor(OBJPALRAM, paletteNum, colorNum);
+						screenBuffer[(line * 160) + bx - 7 + j] = colorNum;
+					}
+				}
+				continue;
+			}
+
 			for (j = 0; j < 8; j++) {
 
 				// BUG FIX: X-flip was computed above but never actually
@@ -759,32 +1013,21 @@ void DrawOBJline(int line, int TILEaddr) {
 				// regardless of the flip flag. Flipping horizontally
 				// just means reading bit j itself instead of its mirror.
 				int bit = iflipx ? j : (7 - j);
+				int colorNum;
 				if (((B1 >> bit) & 0x01) == 0x01) {
-					if (((B2 >> bit) & 0x01) == 0x01) {
-						if (ipal) { // Use OBJPAL1
-								colour = (OBJPAL1 >>6) & 0x3; //3;
-						} else {
-								colour = (OBJPAL0 >>6) & 0x3;
-						}
-					} else {
-						if (ipal) { // Use OBJPAL1
-								colour = (OBJPAL1 >>4) & 0x3; //3;
-						} else {
-								colour = (OBJPAL0 >>4) & 0x3;
-						}
-					}
-				} else if (((B2 >> bit) & 0x01) == 0x01) {
-						if (ipal) { // Use OBJPAL1
-								colour = (OBJPAL1 >>2) & 0x3; //3;
-						} else {
-								colour = (OBJPAL0 >>2) & 0x3;
-						}
-					} else {
-						if (ipal) { // Use OBJPAL1
-								colour = OBJPAL1  & 0x3; //3;
-						} else {
-								colour = OBJPAL0  & 0x3;
-						}
+					colorNum = ((B2 >> bit) & 0x01) == 0x01 ? 3 : 2;
+				} else {
+					colorNum = ((B2 >> bit) & 0x01) == 0x01 ? 1 : 0;
+				}
+				// BUG FIX: see the CGB branch above - color 0 is always
+				// transparent on real hardware, never drawn at all.
+				if (colorNum == 0) {
+					continue;
+				}
+				if (ipal) { // Use OBJPAL1
+					colour = (OBJPAL1 >> (colorNum * 2)) & 0x3;
+				} else {
+					colour = (OBJPAL0 >> (colorNum * 2)) & 0x3;
 				}
 				if ((bx - 7 + j < 160) && (bx -7 + j >= 0)) {
 					screenBuffer[(line * 160) + bx - 7 + j] = colour;
@@ -1044,6 +1287,11 @@ void loadRom(void){
 	for (i = 0; i < 16; i++){
 		CARTTITLE[i] = ROM[0x134+i];
 	}
+	// GBC detection: $80 = CGB-enhanced but still DMG-compatible, $C0 =
+	// CGB-only. Anything else (including the common case of this byte
+	// simply being part of an older-style 16-byte title with no CGB
+	// flag at all) means a plain DMG cart.
+	GBC_MODE = (ROM[0x143] == 0x80) || (ROM[0x143] == 0xC0);
 	CARTTYPE = ROM[0x147];
 	ROMSIZE  = ROM[0x148];
 	RAMSIZE  = ROM[0x149];
@@ -1154,7 +1402,7 @@ BYTE ReadMEM(WORD loc) {
         	return ROM[loc + ((ROMBANKNUMBER % (iROMSIZE ? iROMSIZE : 1)) - 1 ) * 0x4000];
 		}
 		if ( loc < 0xA000 ) { // $8000-$9FFF - VRAM
-			return VRAM[loc - 0x8000];
+			return VRAM[GetVRAMBank() * 0x2000 + (loc - 0x8000)];
 		}
 		if ( loc < 0xC000 ) { // $A000-$BFFF - External (cartridge) RAM / MBC3 RTC
 			if (( CARTTYPE >= 0x0F ) && ( CARTTYPE <= 0x13 ) && ( RTCSELECT >= 0x08 )) {
@@ -1194,10 +1442,10 @@ BYTE ReadMEM(WORD loc) {
 			return EXTRNRAM[loc - 0xA000 + (WORD)((RAMBANKNUMBER % GetCartRAMBankCount()) * 0x2000)];
 		}
 		if ( loc < 0xE000 ) { // $C000-$DFFF - Internal RAM
-			return RAM[loc - 0xC000];
+			return *WRAMPtr(loc);
 		}
 		if ( loc < 0xFE00  ) { // $E000-$FDFF - Reserved Area/Echo RAM
-	        return RAM[loc - 0xE000];
+	        return *WRAMPtr(loc);
 		}
 		if ( loc < 0xFEA0  ) { // $FE00-$FE9F - Object Attribute Memory (OAM)
 			return OAMRAM[loc - 0xFE00];
@@ -1254,6 +1502,16 @@ BYTE ReadMEM(WORD loc) {
 				case 0xFF49: return (BYTE)OBJPAL1; break; // Object Palette 1 Data (W)
 				case 0xFF4A: return (BYTE)WNDY; break; // Window Y Position  (R/W)
 				case 0xFF4B: return (BYTE)WNDX; break; // Window X Position  (R/W)
+				// GBC registers - real hardware returns these with their
+				// unused upper bits read back as 1, which some games'
+				// hardware-detection code checks for.
+				case 0xFF4D: return (BYTE)(KEY1 | 0x7E); break; // KEY1 - speed switch (R/W)
+				case 0xFF4F: return (BYTE)(VBK | 0xFE); break; // VBK - VRAM bank (R/W)
+				case 0xFF68: return (BYTE)(BCPS | 0x40); break; // BCPS/BGPI - BG palette index (R/W)
+				case 0xFF69: return BGPALRAM[BCPS & 0x3F]; break; // BCPD/BGPD - BG palette data (R/W)
+				case 0xFF6A: return (BYTE)(OCPS | 0x40); break; // OCPS/OBPI - OBJ palette index (R/W)
+				case 0xFF6B: return OBJPALRAM[OCPS & 0x3F]; break; // OCPD/OBPD - OBJ palette data (R/W)
+				case 0xFF70: return (BYTE)(SVBK | 0xF8); break; // SVBK - WRAM bank (R/W)
 
 				default: return 0x00; break;
 			}
@@ -1386,7 +1644,7 @@ void WriteMEM(WORD loc, BYTE b){
 			}
 		}
 	} else if ( ( loc >= 0x8000 ) &&  ( loc <= 0x9FFF ) ) { // $8000-$9FFF VRAM
-		VRAM[loc - 0x8000] = b;
+		VRAM[GetVRAMBank() * 0x2000 + (loc - 0x8000)] = b;
 	} else if ( ( loc >= 0xA000 ) &&  ( loc <= 0xBFFF ) ) { // $A000-$BFFF - External (cartridge) RAM / MBC3 RTC
 		if (( CARTTYPE >= 0x0F ) && ( CARTTYPE <= 0x13 ) && ( RTCSELECT >= 0x08 )) {
 			// BUG FIX: writes to the RTC registers never marked the save
@@ -1427,9 +1685,9 @@ void WriteMEM(WORD loc, BYTE b){
 			}
 		}
 	} else if ( ( loc >= 0xC000 ) &&  ( loc <= 0xDFFF ) ) { // $C000-$DFFF - Internal RAM
-		RAM[loc - 0xC000] = b;
+		*WRAMPtr(loc) = b;
 	} else if ( ( loc >= 0xE000 ) &&  ( loc <= 0xFDFF ) ) { // $E000-$FDFF - Reserved Area/Echo RAM
-		RAM[loc - 0xE000] = b;
+		*WRAMPtr(loc) = b;
 	} else if ( ( loc >= 0xFE00 ) &&  ( loc <= 0xFE9F ) ) { // $FE00-$FE9F - Object Attribute Memory (OAM)
 		OAMRAM[loc - 0xFE00] = b;
 	} else if ( ( loc >= 0xFF00 ) &&  ( loc <= 0xFF7F ) ) { // $FF00-$FF7F - Hardware I/O Registers
@@ -1528,6 +1786,31 @@ void WriteMEM(WORD loc, BYTE b){
 			case 0xFF49: OBJPAL1 = b; break; // Object Palette 1 Data (W)
 			case 0xFF4A: WNDY = b; break; // Window Y Position  (R/W)
 			case 0xFF4B: WNDX = b; break; // Window X Position  (R/W)
+			// GBC registers - all gated on GBC_MODE, so a DMG cart
+			// writing to one of these addresses (which real DMG
+			// hardware would just ignore, since they're CGB-only) has
+			// no effect at all, same as real hardware.
+			case 0xFF4D: if (GBC_MODE) { KEY1 = (KEY1 & 0x80) | (b & 0x01); } break; // KEY1 - speed switch prepare bit (R/W)
+			case 0xFF4F: if (GBC_MODE) { VBK = b & 0x01; } break; // VBK - VRAM bank (R/W)
+			case 0xFF68: if (GBC_MODE) { BCPS = b & 0xBF; } break; // BCPS/BGPI - BG palette index (R/W)
+			case 0xFF69: // BCPD/BGPD - BG palette data (R/W)
+				if (GBC_MODE) {
+					BGPALRAM[BCPS & 0x3F] = b;
+					if (BCPS & 0x80) {
+						BCPS = (BCPS & 0x80) | ((BCPS + 1) & 0x3F);
+					}
+				}
+				break;
+			case 0xFF6A: if (GBC_MODE) { OCPS = b & 0xBF; } break; // OCPS/OBPI - OBJ palette index (R/W)
+			case 0xFF6B: // OCPD/OBPD - OBJ palette data (R/W)
+				if (GBC_MODE) {
+					OBJPALRAM[OCPS & 0x3F] = b;
+					if (OCPS & 0x80) {
+						OCPS = (OCPS & 0x80) | ((OCPS + 1) & 0x3F);
+					}
+				}
+				break;
+			case 0xFF70: if (GBC_MODE) { SVBK = b & 0x07; } break; // SVBK - WRAM bank (R/W)
 			default: break;
 		}
 
@@ -1547,7 +1830,7 @@ WORD ReadWord(WORD reg){
 void DrawBG(){
 	//////////////here
 	//printf("DrawBG\n");
-	Draw_Buffer(screenBuffer);
+	Draw_Buffer(screenBuffer, screenBufferColor, GBC_MODE);
 }
 void DrawWindow(){
 

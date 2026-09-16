@@ -21,7 +21,12 @@ extern BYTE *ROM;
 
 // Platform hooks the emulator core calls into.
 void init_PSX(void);
-void Draw_Buffer(int *screenBuffer);
+// screenBuffer holds 0-3 DMG shade indices; screenBufferColor holds
+// real 15-bit RGB555 colors (little-endian, matching how the core
+// stores them internally) and is only ever populated - and only ever
+// looked at here - when gbcMode is set. A DMG cart calls this with
+// gbcMode always 0, and screenBufferColor can be NULL in that case.
+void Draw_Buffer(int *screenBuffer, unsigned short *screenBufferColor, int gbcMode);
 void PrepScreen(void);
 void RenderWorld(BYTE re, BYTE gr, BYTE bl);
 unsigned long PadRead(int pad_num);
