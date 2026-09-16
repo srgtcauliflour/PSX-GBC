@@ -280,8 +280,24 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   exactly, including the H-Blank mode only after running long enough for
   every needed H-Blank to actually occur. **Implementing both did not
   get Pokemon Crystal past its hardware-compatibility screen** - see
-  below for what's still unknown there. BG-to-OBJ priority override
-  remains unimplemented — a real, separate follow-up (see below).
+  below for what's still unknown there.
+- **Sprite-vs-background priority implemented (DMG + CGB) — closes the
+  last known GBC rendering gap.** The OAM flags byte's priority bit had
+  never actually been read anywhere before this - every sprite always
+  drew on top of everything regardless of the bit, on both DMG and CGB.
+  Now correctly resolves the sprite's own priority bit against the BG/
+  window color underneath (never hidden behind BG color 0, only colors
+  1-3), plus CGB's per-tile BG-priority attribute and its
+  reinterpretation of LCDC bit 0 as BG/Window Master Priority. Verified
+  with three synthetic ROMs (sprite over blank BG; sprite correctly
+  hidden behind an opaque BG tile; sprite correctly visible in front of
+  one) each producing exactly the expected pixel. **Also found and
+  fixed while verifying this**: sprite X positioning used `bx - 7 + j`
+  instead of the real-hardware-correct `bx - 8 + j` (OAM's X byte is
+  the screen column plus 8) - shifting every sprite one pixel right of
+  its correct position, in every game, for this entire project's
+  history until now. Found because it made two deliberately different
+  priority test cases produce identical (wrong) output.
 
 ## What's next (roughly in priority order)
 
@@ -295,19 +311,17 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    (MBC2, EI timing) nothing else had touched. Don't commit ROM files
    themselves to this repo or bundle them in any output archive
    (copyright) — keep them local/sandbox-only.
-3. **GBC follow-up: BG-to-OBJ priority override** (CGB attribute bit 7)
-   is the one remaining known gap in the GBC support implemented this
-   session - noted inline in DrawBGline/DrawWINline, since resolving it
-   needs coordinating with sprite rendering in a later pass over the
-   same line. Double-speed mode timing and HDMA/GDMA are both now
-   implemented and verified (see above) - implementing both did *not*
-   get Pokemon Crystal past its "designed only for use on the Game Boy
-   Color" hardware-compatibility screen, so whatever that specific
-   check actually depends on remains unidentified; further progress on
-   that exact screen would need disassembling/tracing Crystal's own
-   detection routine, a bigger undertaking than guessing at candidate
-   features. Sound remains separately deprioritized per the person's
-   direction earlier this session.
+3. **GBC support is now functionally complete** for rendering purposes -
+   sprite-vs-background priority (the last known gap, including the
+   CGB-specific BG-to-OBJ override) is implemented and verified (see
+   above). Pokemon Crystal still doesn't get past its "designed only
+   for use on the Game Boy Color" hardware-compatibility screen despite
+   double-speed mode and HDMA/GDMA both being implemented - whatever
+   that specific check actually depends on remains unidentified;
+   further progress on that exact screen would need disassembling/
+   tracing Crystal's own detection routine, a bigger undertaking than
+   guessing at candidate features. Sound remains separately
+   deprioritized per the person's direction earlier this session.
 4. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
    flat, fully-resident pointer with no partial loading. 1.5MB covers
    the large majority of the real library, but the small number of
