@@ -151,7 +151,7 @@ int main(int argc, char **argv) {
     // test runs) instead of calling runEmu() directly, so it needs its
     // own copy of this bit to genuinely exercise save/load in tests.
     if (CartHasBattery()) {
-        LoadCartRAM((const char *)CARTTITLE, EXTRNRAM, GetCartRAMSize());
+        LoadCartRAMAndRTC((const char *)CARTTITLE);
         RAM_DIRTY = 0;
     }
 

@@ -48,6 +48,10 @@ extern int FRAMECOUNT;
 extern int RAM_DIRTY;
 extern int EI_PENDING;
 int CartHasBattery(void);
+int CartHasRTC(void);
+int GetCartSaveSize(void);
+int SaveCartRAMAndRTC(const char *saveId);
+int LoadCartRAMAndRTC(const char *saveId);
 int GetCartRAMSize(void);
 int GetCartRAMBankCount(void);
 

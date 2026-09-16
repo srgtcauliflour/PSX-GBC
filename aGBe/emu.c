@@ -837,7 +837,7 @@ void runEmu(){
 	// EXTRNRAM is already zeroed by Allocate_Memory(), the same blank
 	// state a fresh, never-saved-to real cartridge would present.
 	if (CartHasBattery()) {
-		LoadCartRAM((const char *)CARTTITLE, EXTRNRAM, GetCartRAMSize());
+		LoadCartRAMAndRTC((const char *)CARTTITLE);
 		RAM_DIRTY = 0;
 	}
 
@@ -967,6 +967,74 @@ int CartHasBattery(void) {
 		default:
 			return 0;
 	}
+}
+
+// Whether this cartridge has the MBC3 real-time-clock chip - only the
+// two MBC3+TIMER variants (games like Pokemon Gold/Silver/Crystal use
+// this for their day-night cycle and breeding features), not the
+// RAM-only MBC3 types (0x11-0x13, e.g. Pokemon Red/Blue's actual cart
+// type, 0x13, has no RTC at all despite being "close" in the type list).
+int CartHasRTC(void) {
+	return (CARTTYPE == 0x0F) || (CARTTYPE == 0x10);
+}
+
+// Number of extra bytes CartHasRTC() carts need alongside their normal
+// cart RAM in a save file - the five live RTC registers. This project's
+// RTC is software-controlled only (games set it directly; there's no
+// real-time-driven auto-increment simulated), so persisting it is just
+// carrying these five bytes across a save/load round trip like any other
+// piece of save state - no wall-clock/elapsed-time math involved.
+#define RTC_SAVE_BYTES 5
+
+int GetCartSaveSize(void) {
+	return GetCartRAMSize() + (CartHasRTC() ? RTC_SAVE_BYTES : 0);
+}
+
+// Combines EXTRNRAM with the five RTC registers (if this cart has an
+// RTC) into one buffer and hands it to the platform's SaveCartRAM, so
+// carts with a real-time clock (Pokemon Gold/Silver/Crystal and similar)
+// don't lose their in-game clock every time the console is turned off -
+// previously only plain cart RAM was ever saved, silently resetting the
+// RTC to power-on defaults on every single boot regardless of whether
+// the cartridge actually has a battery-backed clock chip.
+int SaveCartRAMAndRTC(const char *saveId) {
+	int ramSize = GetCartRAMSize();
+	int totalSize = GetCartSaveSize();
+	// static, not stack-local: 32KB covers the largest real MBC3 RAM size,
+	// but that's a substantial chunk to put on the stack on a platform
+	// with as little RAM as the PS1, especially since this can be called
+	// from inside WriteMEM (itself potentially called from fairly deep
+	// interrupt-handling contexts) - a static buffer costs the same BSS
+	// space either way but carries no stack-depth risk.
+	static BYTE buf[32 * 1024 + RTC_SAVE_BYTES];
+	memcpy(buf, EXTRNRAM, ramSize);
+	if (CartHasRTC()) {
+		buf[ramSize + 0] = RTC_S;
+		buf[ramSize + 1] = RTC_M;
+		buf[ramSize + 2] = RTC_H;
+		buf[ramSize + 3] = RTC_DL;
+		buf[ramSize + 4] = RTC_DH;
+	}
+	return SaveCartRAM(saveId, buf, totalSize);
+}
+
+int LoadCartRAMAndRTC(const char *saveId) {
+	int ramSize = GetCartRAMSize();
+	int totalSize = GetCartSaveSize();
+	static BYTE buf[32 * 1024 + RTC_SAVE_BYTES]; // see SaveCartRAMAndRTC above
+	int ok = LoadCartRAM(saveId, buf, totalSize);
+	if (!ok) {
+		return 0;
+	}
+	memcpy(EXTRNRAM, buf, ramSize);
+	if (CartHasRTC()) {
+		RTC_S  = buf[ramSize + 0];
+		RTC_M  = buf[ramSize + 1];
+		RTC_H  = buf[ramSize + 2];
+		RTC_DL = buf[ramSize + 3];
+		RTC_DH = buf[ramSize + 4];
+	}
+	return 1;
 }
 
 void loadRom(void){
@@ -1212,7 +1280,7 @@ void WriteMEM(WORD loc, BYTE b){
 			// the memory card, rather than saving on every single write
 			// or trying to guess some other "the game is done" moment.
 			if (wasEnabled && !RAMENABLED && RAM_DIRTY && CartHasBattery()) {
-				if (SaveCartRAM((const char *)CARTTITLE, EXTRNRAM, GetCartRAMSize())) {
+				if (SaveCartRAMAndRTC((const char *)CARTTITLE)) {
 					RAM_DIRTY = 0;
 				}
 			}
@@ -1321,6 +1389,14 @@ void WriteMEM(WORD loc, BYTE b){
 		VRAM[loc - 0x8000] = b;
 	} else if ( ( loc >= 0xA000 ) &&  ( loc <= 0xBFFF ) ) { // $A000-$BFFF - External (cartridge) RAM / MBC3 RTC
 		if (( CARTTYPE >= 0x0F ) && ( CARTTYPE <= 0x13 ) && ( RTCSELECT >= 0x08 )) {
+			// BUG FIX: writes to the RTC registers never marked the save
+			// state dirty, unlike plain cart RAM writes just below - a
+			// game that only ever touches the RTC (setting the time once
+			// at first boot, say) without ever separately writing cart
+			// RAM would never trigger a save at all, even though there
+			// is now real RTC state worth persisting (see
+			// SaveCartRAMAndRTC/CartHasRTC above).
+			RAM_DIRTY = 1;
 			switch (RTCSELECT) {
 				case 0x08: RTC_S  = b; break;
 				case 0x09: RTC_M  = b; break;
