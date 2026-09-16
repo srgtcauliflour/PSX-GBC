@@ -336,19 +336,93 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   capture audio at all. Real hardware or a working interactive emulator
   session is the only way to close this gap.
 
+- **Fixed a real PPU frame-timing bug affecting every game: every mode
+  transition discarded overshoot cycles, making every frame run ~2%
+  long.** `VideoCyclesLeft -= sysCycle` regularly undershoots past zero
+  by a few cycles (GB instruction costs rarely divide the PPU mode-
+  length constants evenly), and every mode transition was doing a plain
+  `VideoCyclesLeft = <constant>` assignment that threw away that
+  overshoot instead of carrying it forward - happening several hundred
+  times a frame, compounding into a real, measured ~1600-2000 extra
+  cycles per frame (actual measured period ~71800-71840 instead of the
+  correct 70224). Found by adding a lightweight, always-on cumulative
+  cycle counter and measuring the actual elapsed cycles between
+  consecutive VBlank interrupts empirically, rather than continuing to
+  assume they matched the textbook constant. Fixed at all 5 mid-stream
+  transition sites; re-measured afterward and confirmed frame period
+  now lands almost exactly on 70224. This was found while re-
+  investigating the Kirby's Pinball Land hang, but does **not** resolve
+  it - re-tested afterward and the same ROM still hangs identically,
+  and the Timer-vs-VBlank starvation pattern is only marginally
+  improved (Timer's vector went from being reached once to twice in a
+  million instructions) - whatever is really keeping that ROM's Timer
+  interrupt starved remains open. The timing fix itself is real and
+  independently valuable regardless of that specific ROM's outcome.
+
+- **Newly discovered, large, real gap: sub-instruction cycle-accurate
+  memory timing has never been validated, and mostly fails.** Built and
+  ran Mooneye's `acceptance/ppu`, `acceptance/timer`, and `acceptance/
+  interrupts` test categories against this core for the first time ever
+  (previously only `emulator-only/mbc1` and `mbc5` had been tried) - 67
+  tests, only 11 passed. Some failures are expected (boot-ROM-dependent
+  tests - `boot_div*`, `boot_regs*`, `boot_hwio*` - this project
+  deliberately skips boot ROM emulation, an established prior
+  decision). But a large number are ordinary instruction-timing tests -
+  `call_timing`, `push_timing`, `pop_timing`, `ret_timing`,
+  `jp_timing`, `rst_timing`, both plain and conditional variants, plus
+  `ei_sequence`, `halt_ime1_timing2-GS`, `oam_dma_timing`, and more -
+  confirmed via direct trace to be genuine Mooneye `$42`-signature
+  failures, not harness timeouts or a false alarm. These test exactly
+  WHEN within a multi-cycle instruction's execution its memory accesses
+  happen (interactions with interrupts, OAM DMA, etc. depend on this),
+  not just an instruction's total cycle count and final register/memory
+  result - which is all `cpu_instrs` validates, and which this core
+  already passes cleanly (11/11). This core currently performs a memory
+  write, then accounts the whole instruction's cycle cost in one lump
+  sum afterward, with no notion of sub-instruction timing at all.
+  Fixing this comprehensively would mean restructuring how memory
+  accesses are timed across a very large fraction of the opcode table -
+  comparable in scope to this session's GBC-support or sound-
+  implementation efforts, not something to attempt piecemeal. Full list
+  of currently-failing tests (excluding the expected boot-ROM ones):
+  `add_sp_e_timing`, `call_cc_timing`, `call_cc_timing2`, `call_timing`,
+  `call_timing2`, `di_timing-GS`, `ei_sequence`, `halt_ime1_timing2-GS`,
+  `if_ie_registers`, `jp_cc_timing`, `jp_timing`, `ld_hl_sp_e_timing`,
+  `oam_dma_restart`, `oam_dma_start`, `oam_dma_timing`, `pop_timing`,
+  `push_timing`, `rapid_di_ei`, `ret_cc_timing`, `ret_timing`,
+  `reti_timing`, `rst_timing`, `ie_push`, `div_write`, `rapid_toggle`,
+  `tim00`, `tim01_div_trigger`, `tim10`, `tim10_div_trigger`, `tim11`,
+  `tima_reload`, `tima_write_reloading`, `tma_write_reloading`,
+  `hblank_ly_scx_timing-GS`, `intr_1_2_timing-GS`, `intr_2_0_timing`,
+  `intr_2_mode0_timing`, `intr_2_mode0_timing_sprites`,
+  `intr_2_mode3_timing`, `intr_2_oam_ok_timing`, `lcdon_timing-GS`,
+  `lcdon_write_timing-GS`, `stat_irq_blocking`, `stat_lyc_onoff`,
+  `vblank_stat_intr-GS`. Test source and a working build toolchain are
+  already set up at `/home/claude/mooneye-test-suite` (WLA-DX at
+  `/home/claude/wla-dx/build/binaries`) for whoever picks this up.
+
 ## What's next (roughly in priority order)
 
-1. **Kirby's Pinball Land hang (see above) — real, unresolved, deeply
+1. **Sub-instruction cycle-accurate memory timing (see above) — a
+   large, newly-discovered, real gap.** 56 of 67 Mooneye acceptance/
+   ppu+timer+interrupts tests fail, most for reasons unrelated to the
+   already-known boot-ROM limitation. Comparable in scope to the GBC-
+   support or sound-implementation efforts this session - a dedicated
+   pass, not a quick fix.
+2. **Kirby's Pinball Land hang (see above) — real, unresolved, deeply
    investigated but not fixed.** A genuine MBC2-cartridge compatibility
-   issue on the one MBC2 game tested so far. Worth resuming with fresh
-   eyes given how far the investigation already got.
-2. More real-ROM testing, if more real ROMs become available. Every
+   issue on the one MBC2 game tested so far. A real PPU frame-timing
+   bug found during a second investigation pass (see above) turned out
+   to be real and worth fixing in its own right, but didn't resolve
+   this specific hang - whatever's actually starving this ROM's Timer
+   interrupt remains open.
+3. More real-ROM testing, if more real ROMs become available. Every
    round of real-commercial-game and authoritative-suite testing this
    session found genuinely high-value bugs, including in code paths
    (MBC2, EI timing) nothing else had touched. Don't commit ROM files
    themselves to this repo or bundle them in any output archive
    (copyright) — keep them local/sandbox-only.
-3. **GBC support is functionally complete for rendering purposes** -
+4. **GBC support is functionally complete for rendering purposes** -
    sprite-vs-background priority (the last known gap, including the
    CGB-specific BG-to-OBJ override) is implemented and verified (see
    above). Pokemon Crystal still doesn't get past its "designed only
@@ -358,7 +432,7 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    further progress on that exact screen would need disassembling/
    tracing Crystal's own detection routine, a bigger undertaking than
    guessing at candidate features.
-4. **Sound is implemented (see above) but the PS1 SPU output half is
+5. **Sound is implemented (see above) but the PS1 SPU output half is
    unverified** - real hardware or a working interactive emulator
    session (neither available in this sandbox - see the existing note
    on this below) is needed to confirm it actually produces correct
@@ -366,7 +440,7 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    Worth prioritizing a real playback test above most other remaining
    items here, since it's the one part of this whole project that has
    never been confirmed to actually work as intended.
-5. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
+6. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
    flat, fully-resident pointer with no partial loading. 1.5MB covers
    the large majority of the real library, but the small number of
    even larger late-era GBC games (up to 4-8MB — Pokemon Crystal itself
@@ -374,13 +448,13 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    fit resident in the PS1's 2MB of RAM, now further reduced by GBC's
    larger VRAM/WRAM buffers (+32KB total) — worth re-checking total
    memory footprint if this cap is ever raised.
-6. **Very large cart RAM won't fit a single memory card.** A standard
+7. **Very large cart RAM won't fit a single memory card.** A standard
    PS1 card has 15 usable 8KB blocks (120KB total); `SaveCartRAM`
    requests exactly the blocks a cart needs, but a 128KB-RAM MBC5 game
    would need every single block on the card, and anything larger
    wouldn't fit at all. Affects a small minority of RAM-heavy titles;
    not fixed proactively since most games use far less.
-7. **Real visual confirmation** (screenshot/video from actual hardware
+8. **Real visual confirmation** (screenshot/video from actual hardware
    or a working emulator session) — every emulator-boot attempt in this
    sandbox has hung or stalled (see the note below); not something to
    keep spending sandbox time on, but worth doing whenever a real
