@@ -53,6 +53,27 @@ int videoMode = 0;
 int curframe = 0;
 int frameskip = 2;
 int IME;
+// BUG FIX (severe, real hardware CPU-timing quirk): real hardware delays
+// EI's effect by one full instruction - the instruction immediately
+// after EI always executes as if interrupts were still disabled, and
+// only the instruction after *that* can actually be interrupted. This
+// emulator previously set IME=1 immediately inside EI itself, with no
+// delay at all. Most games never notice, since they don't have anything
+// timing-critical happening in the single instruction right after EI -
+// but code that deliberately uses that exact guaranteed-atomic window
+// (a real, documented technique - "EI reti" and similar idioms rely on
+// it) can behave completely differently without this delay. Found via
+// Kirby's Pinball Land, whose interrupt-driven display update logic
+// never re-triggered after its first run in this emulator, while an
+// independent reference emulator (Peanut-GB) ran it correctly - this
+// was the actual root cause once traced through several other ruled-out
+// hypotheses (VBlank/Timer request-vs-service rates, IER toggling,
+// MBC2 RAM correctness) via a long series of side-by-side CPU trace
+// comparisons against that reference core.
+// EI_PENDING counts down 2->1->0 across the two loop iterations after
+// EI dispatches; IME only becomes 1 once it reaches 0, in the main
+// dispatch loop below (not here) - see runEmu().
+int EI_PENDING = 0;
 int EMULATING;
 BYTE *VRAM, *EXTRNRAM, *RAM, *OAMRAM, *HIRAM;
 int temp;
@@ -839,6 +860,17 @@ void runEmu(){
 
 		instructions[ReadMEM(reg_PC++)]();
 
+		// BUG FIX: apply EI's delayed effect here, after the instruction
+		// following EI has fully executed - see the EI_PENDING comment
+		// above its declaration for why this delay matters and how it
+		// was found.
+		if (EI_PENDING > 0) {
+			EI_PENDING--;
+			if (EI_PENDING == 0) {
+				IME = 1;
+			}
+		}
+
 		//if (cyclesLeft <= 0){
 		//	doCycles();
 		//}
@@ -1062,6 +1094,21 @@ BYTE ReadMEM(WORD loc) {
 					return EXTRNRAM[loc - 0xA000 ];
 				}
 			}
+			// BUG FIX (severe): MBC2's built-in RAM is only 512 bytes,
+			// but the generic "always bank via RAMBANKNUMBER" path below
+			// computes (loc - 0xA000) directly - up to 8191 for the full
+			// $A000-$BFFF window - reading (and, on the write side,
+			// writing) far past the end of the real 512-byte buffer.
+			// Real MBC2 hardware only has that much RAM physically
+			// present, wired so it mirrors (repeats) across the entire
+			// window rather than treating it as 8KB of distinct storage.
+			// Found by testing a real MBC2 game (Kirby's Pinball Land)
+			// that never progressed past a blank screen - most likely
+			// reading back garbage from past the buffer where real
+			// hardware would read its own mirrored data instead.
+			if (( CARTTYPE == 0x05 ) || ( CARTTYPE == 0x06 )) {
+				return EXTRNRAM[(loc - 0xA000) % 512];
+			}
 			// MBC2/3/5 - always bank via RAMBANKNUMBER
 			return EXTRNRAM[loc - 0xA000 + (WORD)((RAMBANKNUMBER % GetCartRAMBankCount()) * 0x2000)];
 		}
@@ -1273,6 +1320,19 @@ void WriteMEM(WORD loc, BYTE b){
 			if (( CARTTYPE == 0x01 ) || ( CARTTYPE == 0x02) || ( CARTTYPE == 0x03 )) {
 				if (MBCMODE) { EXTRNRAM[loc - 0xA000 + (WORD)((RAMBANKNUMBER % GetCartRAMBankCount()) * 0x2000)] = b; }
 				else { EXTRNRAM[loc - 0xA000] = b; }
+			} else if (( CARTTYPE == 0x05 ) || ( CARTTYPE == 0x06 )) {
+				// BUG FIX: see the matching read-side fix above - same
+				// missing mirroring/masking for MBC2's real 512-byte RAM.
+				// Real MBC2 hardware also only has 4 data lines wired to
+				// this RAM, so only the low nibble of any written byte is
+				// actually meaningful - the high nibble reads back as
+				// all 1s on real hardware. Masking writes to the low
+				// nibble (rather than just masking on read) keeps
+				// GetCartRAMSize()-based save files byte-for-byte
+				// consistent with what a save/load round trip should
+				// produce, rather than saving whatever's in the unused
+				// high nibble.
+				EXTRNRAM[(loc - 0xA000) % 512] = (b & 0x0F) | 0xF0;
 			} else {
 				EXTRNRAM[loc - 0xA000 + (WORD)((RAMBANKNUMBER % GetCartRAMBankCount()) * 0x2000)] = b;
 			}
@@ -1357,7 +1417,9 @@ void WriteMEM(WORD loc, BYTE b){
 			case 0xFF26: break; // Sound on/off (R/W)
 
 			// VIDEO
-			case 0xFF40: LCDCONTROL = b; break; // LCD Control (R/W)
+			case 0xFF40:
+				LCDCONTROL = b;
+				break; // LCD Control (R/W)
 			case 0xFF41:
 				// BUG FIX: bits 0-2 (mode + LYC-coincidence) are read-only,
 				// hardware-maintained status bits on real hardware - only
@@ -2529,7 +2591,7 @@ void OPFA(void){ // case  0xFA:
 } // FA    LD   A,(nnnn)
 
 void OPFB(void){ // case  0xFB:
-	IME = 1;
+	EI_PENDING = 2;
 	cycleLength(4);
 } // FB    EI
 
@@ -2540,7 +2602,7 @@ void OPFC(void){
 }
 
 void OPFD(void){ // case  0xFD:
-	IME = 1;
+	EI_PENDING = 2;
 	cycleLength(4);
 } // FD    EI?
 

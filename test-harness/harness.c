@@ -192,6 +192,16 @@ int main(int argc, char **argv) {
         }
 
         instructions[ReadMEM(reg_PC++)]();
+
+        // Mirrors the EI-delay fix in emu.c's real runEmu() - this
+        // harness has its own dispatch loop instead of calling runEmu()
+        // directly, so it needs its own copy to genuinely test it.
+        if (EI_PENDING > 0) {
+            EI_PENDING--;
+            if (EI_PENDING == 0) {
+                IME = 1;
+            }
+        }
     }
 
     if (i >= max_instr) {

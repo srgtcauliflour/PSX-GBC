@@ -46,6 +46,7 @@ extern BYTE LCDCONTROL, LCDSTATUS, LCDY, LYC, SCRX, SCRY;
 extern BYTE BGPAL, OBJPAL0, OBJPAL1;
 extern int FRAMECOUNT;
 extern int RAM_DIRTY;
+extern int EI_PENDING;
 int CartHasBattery(void);
 int GetCartRAMSize(void);
 int GetCartRAMBankCount(void);
