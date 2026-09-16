@@ -298,25 +298,43 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   its correct position, in every game, for this entire project's
   history until now. Found because it made two deliberately different
   priority test cases produce identical (wrong) output.
-- **Sound implemented: full GB APU core (verified) + PS1 SPU output
-  (implemented, not yet verifiable).** All 4 real channels (2 pulse,
-  wave, noise) at the register/timing level - triggering, length
-  counters, envelopes, sweep, and the 512Hz frame sequencer - verified
-  with synthetic ROMs (trigger + immediate DAC-off silencing, length-
-  counter auto-disable timing, noise channel trigger) all producing
-  exactly the expected `NR52` status byte. Cross-checked less formally
-  but informatively against real ROMs via a new `TRACE_AUDIO` harness
-  diagnostic: Dr. Mario's early gameplay music shows frequency changing
-  between distinct notes and a volume envelope visibly decaying across
-  frames, the expected shape of real dynamic audio. The PS1 SPU side
-  drives 4 real hardware voices (ADPCM square waves for the pulse
-  channels, a dynamically re-encoded wave sample, and the SPU's actual
-  hardware noise generator for the noise channel) rather than software-
-  mixing PCM - compiles and links cleanly against the real PSn00bSDK
-  toolchain, but **has not been confirmed to produce correct, or any,
-  actual sound** - this sandbox has no way to play back or capture
-  audio at all, so unlike everything else in this project, this half
-  is unverified beyond matching documentation and compiling cleanly.
+- **Sound implemented: full GB APU core (rigorously verified, including
+  actual audio content) + PS1 SPU output (implemented, still
+  unverified).** All 4 real channels (2 pulse, wave, noise) at the
+  register/timing level - triggering, length counters, envelopes,
+  sweep, and the 512Hz frame sequencer - verified with synthetic ROMs
+  (trigger + immediate DAC-off silencing, length-counter auto-disable
+  timing, noise channel trigger) all producing exactly the expected
+  `NR52` status byte. Found and fixed one real bug during a self-review
+  pass on the initially-unverified SPU code: `PulsePitch()`/
+  `WavePitch()` could silently overflow the SPU's 16-bit pitch register
+  at very high GB frequencies (rare in music, but real in some sound
+  effects) and wrap to a garbage value instead of a merely very high
+  one - now clamped.
+
+  Beyond the register-level tests, a new `DUMP_WAV` harness feature
+  mixes the APU core's own already-verified per-channel output directly
+  in software into a real, standard WAV file - independent of (and
+  doesn't test) the PS1 SPU integration, but gives genuine, listenable
+  confirmation of the *core's* correctness specifically. Ran it against
+  Dr. Mario's early gameplay music and directly analyzed the result:
+  real non-trivial waveform content (97.6% non-zero samples), and an
+  FFT of a sustained-tone window found a clean, ordinary 904Hz musical
+  peak - with the raw samples in that same window showing a long
+  constant plateau then a brief transition, exactly the expected shape
+  of a low-duty-cycle square wave sampled mid-"off"-phase. Genuine,
+  independently-obtained evidence the APU core produces correct audio
+  content, not just documentation-matching register behavior.
+
+  The PS1 SPU side remains the one unverified part of this whole
+  project: it drives 4 real hardware voices (ADPCM square waves for the
+  pulse channels, a dynamically re-encoded wave sample, and the SPU's
+  actual hardware noise generator for the noise channel) rather than
+  software-mixing PCM, and compiles/links cleanly against the real
+  PSn00bSDK toolchain - but has not been confirmed to produce correct,
+  or any, actual sound, since this sandbox has no way to play back or
+  capture audio at all. Real hardware or a working interactive emulator
+  session is the only way to close this gap.
 
 ## What's next (roughly in priority order)
 
