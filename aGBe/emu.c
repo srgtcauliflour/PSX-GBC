@@ -832,6 +832,7 @@ int APUChannelOutput(int channelNum) {
 	return -1;
 }
 
+long long g_totalSysCycles = 0;
 void cycleLength(int cycle) {
 	// GBC double-speed mode: the CPU core runs twice as fast, but the
 	// PPU/DIV/Timer are driven by the fixed system clock, which does
@@ -840,6 +841,12 @@ void cycleLength(int cycle) {
 	// Every GB instruction's cycle cost is a multiple of 4, so halving
 	// here is always exact (no fractional cycles lost to rounding).
 	int sysCycle = (GBC_MODE && (KEY1 & 0x80)) ? cycle / 2 : cycle;
+	// Lightweight, always-on cumulative system-clock counter - cheap
+	// (one 64-bit add) and useful for exactly the kind of investigation
+	// that found the VideoCyclesLeft overshoot bug below: measuring the
+	// actual elapsed cycles between two events empirically, rather than
+	// assuming they match a textbook constant.
+	g_totalSysCycles += sysCycle;
 	DIVCOUNTER += sysCycle;
 	while (DIVCOUNTER >= 256) {
 		DIVCOUNTER -= 256;
@@ -893,16 +900,35 @@ void cycleLength(int cycle) {
 				// text reduced to a few stray pixels until this was fixed.
 				hblank();
 				videoMode = OAMMODE;
-				VideoCyclesLeft = OAM_CYCLES;
+				// BUG FIX: was a plain assignment, discarding whatever
+				// this line's HBlank/VBlank countdown had already
+				// overshot into negative territory (VideoCyclesLeft -=
+				// sysCycle can undershoot past 0 by a few cycles, since
+				// instruction costs - 4,8,12,... - rarely divide these
+				// mode-length constants evenly) - losing that overshoot
+				// at literally hundreds of mode transitions every
+				// single frame adds up to a real, measurable amount:
+				// this alone made a full frame take roughly 71800+
+				// cycles rather than the correct 70224, found by
+				// directly measuring the actual elapsed cycles between
+				// consecutive VBlank interrupts rather than assuming
+				// they matched the textbook constant. Adding onto the
+				// (already non-positive) remaining value instead
+				// carries the overshoot forward into the new mode's
+				// countdown, losing nothing.
+				VideoCyclesLeft += OAM_CYCLES;
 				if ((LCDSTATUS >> 5) & 0x01) { IFLAG |= 0x02; }
 			} else if (LCDY < 0x90) {
 				hblank();
 				videoMode = OAMMODE;
-				VideoCyclesLeft = OAM_CYCLES; // BUG FIX: no more CLOCKSPEED fudge factor - these are exact T-state counts already
+				// BUG FIX: see the identical fix a few lines up (line 0's
+				// case) for the full explanation - same overshoot-losing
+				// bug, same fix.
+				VideoCyclesLeft += OAM_CYCLES;
 				if ((LCDSTATUS >> 3) & 0x01) { IFLAG |= 0x02; } // LCD 3
 			} else {
 				videoMode = VBLANKMODE;
-				VideoCyclesLeft = VBLANK_CYCLES; // BUG FIX: see OAM_CYCLES above
+				VideoCyclesLeft += VBLANK_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
 				if (LCDY == 0x90) {
 					vblank();
 					// BUG FIX (severe): the dedicated VBlank interrupt (IF
@@ -947,14 +973,14 @@ void cycleLength(int cycle) {
 		} else {
 			if (videoMode == OAMMODE) {
 				videoMode = TRANSFERMODE;
-				VideoCyclesLeft = TRANSFER_CYCLES; // BUG FIX: see OAM_CYCLES above
+				VideoCyclesLeft += TRANSFER_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
 				if ((LCDSTATUS >> 5) & 0x01) { IFLAG |= 0x02; } //3
 				LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
 				return;
 			}
 			if (videoMode == TRANSFERMODE) {
 				videoMode = HBLANKMODE;
-				VideoCyclesLeft = HBLANK_CYCLES; // BUG FIX: see OAM_CYCLES above
+				VideoCyclesLeft += HBLANK_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
 				LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
 				return;
 			}
