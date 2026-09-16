@@ -262,9 +262,23 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   screen), and with two real ROMs: Pokemon Crystal (CGB-only) now
   renders a correct, legible hardware-compatibility dialog instead of a
   black or frozen screen, and Pokemon Yellow (CGB-enhanced) renders
-  correctly under the new code path. Double-speed mode timing, HDMA/
-  GDMA, and BG-to-OBJ priority override remain unimplemented — real,
-  separate follow-ups (see below).
+  correctly under the new code path.
+- **GBC double-speed mode timing and HDMA/GDMA VRAM DMA implemented.**
+  `STOP` now correctly triggers the real speed-switch mechanism (toggles
+  `KEY1` bit 7, clears bit 0, only when the game armed it first) and
+  `cycleLength()` correctly halves DIV/timer/PPU timing advancement
+  relative to CPU cycles while double-speed is active - verified with a
+  synthetic ROM confirming `KEY1` reads exactly `$7E` before and `$FE`
+  after arming and executing `STOP`. Both General-Purpose (immediate)
+  and H-Blank-paced (16 bytes per scanline, continuing across multiple
+  `hblank()` calls) DMA modes work, reusing the normal memory read/write
+  path so source/destination banking resolves correctly - verified with
+  two synthetic ROMs (one per mode) confirming transferred bytes matched
+  exactly, including the H-Blank mode only after running long enough for
+  every needed H-Blank to actually occur. **Implementing both did not
+  get Pokemon Crystal past its hardware-compatibility screen** - see
+  below for what's still unknown there. BG-to-OBJ priority override
+  remains unimplemented — a real, separate follow-up (see below).
 
 ## What's next (roughly in priority order)
 
@@ -278,15 +292,19 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    (MBC2, EI timing) nothing else had touched. Don't commit ROM files
    themselves to this repo or bundle them in any output archive
    (copyright) — keep them local/sandbox-only.
-3. **GBC follow-ups** — double-speed mode timing (register I/O exists,
-   doesn't change CPU speed yet), HDMA/GDMA VRAM DMA, and BG-to-OBJ
-   priority override (CGB attribute bit 7) are the three known
-   remaining gaps in the GBC support implemented this session (see
-   above). Pokemon Crystal's hardware-compatibility warning is almost
-   certainly checking for double-speed mode or HDMA specifically -
-   implementing either could be what gets it (and other CGB-only games)
-   past that screen into real gameplay. Sound remains separately
-   deprioritized per the person's direction earlier this session.
+3. **GBC follow-up: BG-to-OBJ priority override** (CGB attribute bit 7)
+   is the one remaining known gap in the GBC support implemented this
+   session - noted inline in DrawBGline/DrawWINline, since resolving it
+   needs coordinating with sprite rendering in a later pass over the
+   same line. Double-speed mode timing and HDMA/GDMA are both now
+   implemented and verified (see above) - implementing both did *not*
+   get Pokemon Crystal past its "designed only for use on the Game Boy
+   Color" hardware-compatibility screen, so whatever that specific
+   check actually depends on remains unidentified; further progress on
+   that exact screen would need disassembling/tracing Crystal's own
+   detection routine, a bigger undertaking than guessing at candidate
+   features. Sound remains separately deprioritized per the person's
+   direction earlier this session.
 4. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
    flat, fully-resident pointer with no partial loading. 1.5MB covers
    the large majority of the real library, but the small number of
