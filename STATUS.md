@@ -298,6 +298,25 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   its correct position, in every game, for this entire project's
   history until now. Found because it made two deliberately different
   priority test cases produce identical (wrong) output.
+- **Sound implemented: full GB APU core (verified) + PS1 SPU output
+  (implemented, not yet verifiable).** All 4 real channels (2 pulse,
+  wave, noise) at the register/timing level - triggering, length
+  counters, envelopes, sweep, and the 512Hz frame sequencer - verified
+  with synthetic ROMs (trigger + immediate DAC-off silencing, length-
+  counter auto-disable timing, noise channel trigger) all producing
+  exactly the expected `NR52` status byte. Cross-checked less formally
+  but informatively against real ROMs via a new `TRACE_AUDIO` harness
+  diagnostic: Dr. Mario's early gameplay music shows frequency changing
+  between distinct notes and a volume envelope visibly decaying across
+  frames, the expected shape of real dynamic audio. The PS1 SPU side
+  drives 4 real hardware voices (ADPCM square waves for the pulse
+  channels, a dynamically re-encoded wave sample, and the SPU's actual
+  hardware noise generator for the noise channel) rather than software-
+  mixing PCM - compiles and links cleanly against the real PSn00bSDK
+  toolchain, but **has not been confirmed to produce correct, or any,
+  actual sound** - this sandbox has no way to play back or capture
+  audio at all, so unlike everything else in this project, this half
+  is unverified beyond matching documentation and compiling cleanly.
 
 ## What's next (roughly in priority order)
 
@@ -311,7 +330,7 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    (MBC2, EI timing) nothing else had touched. Don't commit ROM files
    themselves to this repo or bundle them in any output archive
    (copyright) — keep them local/sandbox-only.
-3. **GBC support is now functionally complete** for rendering purposes -
+3. **GBC support is functionally complete for rendering purposes** -
    sprite-vs-background priority (the last known gap, including the
    CGB-specific BG-to-OBJ override) is implemented and verified (see
    above). Pokemon Crystal still doesn't get past its "designed only
@@ -320,9 +339,16 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    that specific check actually depends on remains unidentified;
    further progress on that exact screen would need disassembling/
    tracing Crystal's own detection routine, a bigger undertaking than
-   guessing at candidate features. Sound remains separately
-   deprioritized per the person's direction earlier this session.
-4. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
+   guessing at candidate features.
+4. **Sound is implemented (see above) but the PS1 SPU output half is
+   unverified** - real hardware or a working interactive emulator
+   session (neither available in this sandbox - see the existing note
+   on this below) is needed to confirm it actually produces correct
+   audio, as opposed to just compiling and matching documentation.
+   Worth prioritizing a real playback test above most other remaining
+   items here, since it's the one part of this whole project that has
+   never been confirmed to actually work as intended.
+5. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
    flat, fully-resident pointer with no partial loading. 1.5MB covers
    the large majority of the real library, but the small number of
    even larger late-era GBC games (up to 4-8MB — Pokemon Crystal itself
@@ -330,17 +356,18 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    fit resident in the PS1's 2MB of RAM, now further reduced by GBC's
    larger VRAM/WRAM buffers (+32KB total) — worth re-checking total
    memory footprint if this cap is ever raised.
-5. **Very large cart RAM won't fit a single memory card.** A standard
+6. **Very large cart RAM won't fit a single memory card.** A standard
    PS1 card has 15 usable 8KB blocks (120KB total); `SaveCartRAM`
    requests exactly the blocks a cart needs, but a 128KB-RAM MBC5 game
    would need every single block on the card, and anything larger
    wouldn't fit at all. Affects a small minority of RAM-heavy titles;
    not fixed proactively since most games use far less.
-6. **Real visual confirmation** (screenshot/video from actual hardware
+7. **Real visual confirmation** (screenshot/video from actual hardware
    or a working emulator session) — every emulator-boot attempt in this
    sandbox has hung or stalled (see the note below); not something to
    keep spending sandbox time on, but worth doing whenever a real
-   console or an interactive emulator session is available.
+   console or an interactive emulator session is available. This is
+   also the only way to verify item 4 (actual SPU audio output) above.
 
 ## Known limitation: instr_timing.gb
 
