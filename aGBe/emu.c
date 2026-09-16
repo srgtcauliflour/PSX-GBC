@@ -90,6 +90,13 @@ int screenBuffer[160*144];
 // shade index. The platform layer picks whichever of the two buffers
 // is relevant based on GBC_MODE - a DMG cart never touches this at all.
 WORD screenBufferColor[160*144];
+// Also parallel to screenBuffer: whether the BG/window tile drawn at
+// this pixel had its CGB attribute byte's priority bit (bit 7) set -
+// only ever populated (and only ever consulted, from DrawOBJline) when
+// GBC_MODE is set. See the priority resolution comment in DrawOBJline
+// for what this means and how it combines with the sprite's own OAM
+// priority bit and LCDC bit 0's CGB-specific reinterpretation.
+BYTE bgAttrPriority[160*144];
 int runto = 0;
 
 int Voff;
@@ -807,6 +814,7 @@ void DrawBGline(int line, int BGaddr, int TILEaddr) {
 			int paletteNum = attr & 0x07;
 			screenBufferColor[(LCDY * 160) + i] = GetCGBColor(BGPALRAM, paletteNum, colorNum);
 			screenBuffer[(LCDY * 160) + i] = colorNum;
+			bgAttrPriority[(LCDY * 160) + i] = (attr >> 7) & 0x01;
 		}
 		return;
 	}
@@ -878,6 +886,7 @@ void DrawWINline(int line, int WINaddr, int TILEaddr) {
 			int paletteNum = attr & 0x07;
 			screenBufferColor[(LCDY * 160) + i + WNDX - 7] = GetCGBColor(BGPALRAM, paletteNum, colorNum);
 			screenBuffer[(LCDY * 160) + i + WNDX - 7] = colorNum;
+			bgAttrPriority[(LCDY * 160) + i + WNDX - 7] = (attr >> 7) & 0x01;
 		}
 		return;
 	}
@@ -1006,7 +1015,24 @@ void DrawOBJline(int line, int TILEaddr) {
 			iflipx = (bflag & 0x20) == 0x20;
 			ipal   = (bflag & 0x10) == 0x10;
 
-			//Hidden (Priority Bit 7)
+			// Sprite-vs-background priority (bflag bit 7, "OBJ-to-BG
+			// priority"): real hardware never actually hides a sprite
+			// pixel outright for this - it only affects whether the
+			// sprite draws on top of or behind BG/window colors 1-3 (BG
+			// color 0 never hides a sprite, on DMG or CGB, regardless of
+			// this bit). On CGB, LCDC bit 0 changes meaning entirely (it
+			// stops being "BG/window enable" and becomes "BG/Window
+			// Master Priority" instead) - when clear, sprites always
+			// draw on top of everything regardless of any other
+			// priority bit at all; when set, per-tile CGB BG-priority
+			// (bgAttrPriority, set in DrawBGline/DrawWINline) can
+			// additionally force specific BG/window tiles to draw over
+			// sprites even where the sprite's own priority bit says it
+			// should be on top. This was never implemented at all
+			// before - the comment previously here just said "Hidden
+			// (Priority Bit 7)" with no actual code reading that bit
+			// anywhere, so every sprite always drew on top of
+			// everything unconditionally.
 
 			if (GBC_MODE) {
 				// CGB sprites use a 3-bit palette index (bflag bits 0-2,
@@ -1038,9 +1064,32 @@ void DrawOBJline(int line, int TILEaddr) {
 					if (colorNum == 0) {
 						continue;
 					}
-					if ((bx - 7 + j < 160) && (bx - 7 + j >= 0)) {
-						screenBufferColor[(line * 160) + bx - 7 + j] = GetCGBColor(OBJPALRAM, paletteNum, colorNum);
-						screenBuffer[(line * 160) + bx - 7 + j] = colorNum;
+					// BUG FIX: real hardware's OAM X coordinate is the
+					// sprite's screen column plus 8 (X=8 means the
+					// sprite's left edge sits at screen column 0) - this
+					// was subtracting 7 instead of 8, shifting every
+					// single sprite one pixel to the right of where it
+					// should be, in every game, the whole time. Found
+					// via a synthetic priority test whose sprite and
+					// background pixels landed at different screen
+					// columns than intended, which made two deliberately
+					// different test cases produce identical output
+					// until this was found and fixed.
+					if ((bx - 8 + j < 160) && (bx - 8 + j >= 0)) {
+						int px = (line * 160) + bx - 8 + j;
+						int bgColorNum = screenBuffer[px];
+						// LCDC bit 0 as CGB Master Priority: sprites
+						// always win when it's clear, full stop.
+						if (LCDCONTROL & 0x01) {
+							if (bgAttrPriority[px] && bgColorNum != 0) {
+								continue; // BG tile's own priority wins
+							}
+							if ((bflag & 0x80) && bgColorNum != 0) {
+								continue; // sprite's own priority bit: behind BG 1-3
+							}
+						}
+						screenBufferColor[px] = GetCGBColor(OBJPALRAM, paletteNum, colorNum);
+						screenBuffer[px] = colorNum;
 					}
 				}
 				continue;
@@ -1070,8 +1119,18 @@ void DrawOBJline(int line, int TILEaddr) {
 				} else {
 					colour = (OBJPAL0 >> (colorNum * 2)) & 0x3;
 				}
-				if ((bx - 7 + j < 160) && (bx -7 + j >= 0)) {
-					screenBuffer[(line * 160) + bx - 7 + j] = colour;
+				// BUG FIX: see the CGB branch above - same X-coordinate
+				// off-by-one (subtracting 7 instead of 8).
+				if ((bx - 8 + j < 160) && (bx - 8 + j >= 0)) {
+					int px = (line * 160) + bx - 8 + j;
+					// DMG sprite-vs-BG priority (bflag bit 7): see the
+					// comment above the CGB branch - this hides the
+					// sprite behind BG/window colors 1-3 specifically,
+					// never behind BG color 0.
+					if ((bflag & 0x80) && screenBuffer[px] != 0) {
+						continue;
+					}
+					screenBuffer[px] = colour;
 				}
 			}
 		}
