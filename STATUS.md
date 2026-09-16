@@ -234,6 +234,23 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   emulator never does. Not yet root-caused; next step if resumed is
   auditing this specific ROM's actual VBlank/Timer handler instruction
   costs against an authoritative cycle-count table.
+- **8x16 sprite mode implemented** (`LCDC` bit 2) — real hardware ignores
+  bit 0 of the OAM tile number and stacks two consecutive tiles as one
+  16-pixel-tall sprite; Y-flip mirrors the whole 16-pixel sprite (which
+  also swaps which physical tile ends up on top), not each 8-pixel half
+  independently. `DrawOBJline`'s bounding-box check and row lookup both
+  previously hardcoded an 8-pixel-tall sprite unconditionally.
+- **MBC3 RTC now persists alongside cart RAM.** Previously only plain
+  cart RAM was ever saved — a cartridge with an actual real-time-clock
+  chip (Pokemon Gold/Silver/Crystal and similar) would silently lose
+  its RTC state to power-on defaults every boot. `CartHasRTC()`
+  correctly distinguishes the two real MBC3+TIMER cart types from the
+  RAM-only MBC3 variants (Pokemon Red/Blue's own cart type has no RTC
+  at all despite being numerically close). Verified with a full save →
+  persist → reload round trip using a synthetic MBC3+TIMER ROM,
+  including performing the real RTC latch sequence (the documented
+  $6000 00-then-01 write real hardware requires before a read becomes
+  visible) in the independent load-verification process.
 
 ## What's next (roughly in priority order)
 
@@ -258,23 +275,13 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    is exactly 2MB, already over this project's current cap, though
    moot until GBC support exists anyway) still won't fit resident in
    the PS1's 2MB of RAM.
-5. **8x16 sprite mode** (`LCDC` bit 2) isn't supported — `DrawOBJline`'s
-   line-range check assumes 8-tall sprites only. Most GB/GBC games use
-   8x8 sprites predominantly; a real, separate gap if a specific game
-   needs tall-sprite mode.
-6. **MBC3 RTC isn't persisted.** The RTC registers implemented earlier
-   this session (clock/calendar for games like Pokémon Gold/Silver)
-   reset every boot rather than saving alongside cart RAM — a real,
-   separate gap from plain cart RAM save/load, lower priority since it
-   only affects real-time-clock-dependent game features, not save data
-   itself.
-7. **Very large cart RAM won't fit a single memory card.** A standard
+5. **Very large cart RAM won't fit a single memory card.** A standard
    PS1 card has 15 usable 8KB blocks (120KB total); `SaveCartRAM`
    requests exactly the blocks a cart needs, but a 128KB-RAM MBC5 game
    would need every single block on the card, and anything larger
    wouldn't fit at all. Affects a small minority of RAM-heavy titles;
    not fixed proactively since most games use far less.
-8. **Real visual confirmation** (screenshot/video from actual hardware
+6. **Real visual confirmation** (screenshot/video from actual hardware
    or a working emulator session) — every emulator-boot attempt in this
    sandbox has hung or stalled (see the note below); not something to
    keep spending sandbox time on, but worth doing whenever a real
