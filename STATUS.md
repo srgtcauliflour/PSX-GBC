@@ -200,43 +200,81 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   emulation, not a gap unique to this project. The 13th (multicart_
   rom_8Mb) is an expected failure — MMM01/multicart carts are a known,
   out-of-scope cart type entirely.
+- **Tested 6 more real commercial ROMs** (Dr. Mario, Super Mario Land,
+  Gargoyle's Quest, Kirby's Pinball Land, Kirby's Dream Land 2, Pokemon
+  Crystal — not included in this repo/archive, copyright; ask the
+  person for copies again to re-run this testing), covering gaps
+  nothing had tested before: a plain ROM-only cart, more MBC1 games,
+  and the first-ever MBC2 game tested against this project. Dr. Mario,
+  Super Mario Land, Gargoyle's Quest, and Kirby's Dream Land 2 all boot
+  and render correctly (confirmed by dumping the actual framebuffer).
+  Found and fixed a real MBC2 buffer-overflow bug (RAM access wasn't
+  masked to MBC2's actual 512-byte size — same class of bug as the
+  Mooneye-driven MBC1/MBC5 fixes above) and a real, independent CPU-
+  timing bug (EI's effect was immediate instead of correctly delayed by
+  one instruction, a documented real hardware quirk). Pokemon Crystal
+  (2MB, CGB-only) renders its title logo correctly then freezes on what
+  is almost certainly a "Game Boy Color required" dialog that doesn't
+  render correctly without CGB tile-attribute support — an expected
+  consequence of this project's already-documented lack of GBC support,
+  not a new bug.
+- **One real, unresolved issue found and deeply investigated: Kirby's
+  Pinball Land hangs on a blank screen.** Traced via the same reference-
+  diffing technique to a Timer-interrupt-gated countdown flag in HRAM
+  that only this emulator fails to ever fully decrement — the Timer
+  interrupt is requested at the correct rate throughout (135 times in
+  1 million instructions) but its vector is reached only once, while
+  VBlank (higher priority, very similar ~70000-cycle period) reaches
+  its own vector 134 times in the same window. Leading hypothesis:
+  VBlank's near-identical period plus higher priority is systematically
+  starving Timer once some small, still-unidentified cycle-accounting
+  phase difference exists between this emulator and real hardware -
+  Peanut-GB shows the same general shape (also polls once per frame)
+  but does eventually get enough Timer services through, where this
+  emulator never does. Not yet root-caused; next step if resumed is
+  auditing this specific ROM's actual VBlank/Timer handler instruction
+  costs against an authoritative cycle-count table.
 
 ## What's next (roughly in priority order)
 
-1. More real-ROM testing, if more real ROMs become available. This
-   session's rounds of real-commercial-game and authoritative-suite
-   testing found the highest-impact bugs of the entire project by a
-   wide margin, despite extensive synthetic/Blargg test coverage
-   already being in place. Note for continuing this: don't commit ROM
-   files themselves to this repo or bundle them in any output archive
+1. **Kirby's Pinball Land hang (see above) — real, unresolved, deeply
+   investigated but not fixed.** A genuine MBC2-cartridge compatibility
+   issue on the one MBC2 game tested so far. Worth resuming with fresh
+   eyes given how far the investigation already got.
+2. More real-ROM testing, if more real ROMs become available. Every
+   round of real-commercial-game and authoritative-suite testing this
+   session found genuinely high-value bugs, including in code paths
+   (MBC2, EI timing) nothing else had touched. Don't commit ROM files
+   themselves to this repo or bundle them in any output archive
    (copyright) — keep them local/sandbox-only.
-2. **GBC support and sound** — explicitly deprioritized per the person's
+3. **GBC support and sound** — explicitly deprioritized per the person's
    direction earlier this session; sound especially can wait until
-   everything else is solid.
-3. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
-   flat, fully-resident pointer with no partial loading. 1.5MB (see
-   above) covers the large majority of the real library including both
-   Pokemon Red and Yellow, but the small number of even larger late-era
-   GBC games (up to 4-8MB) still won't fit resident in the PS1's 2MB of
-   RAM. Only worth doing if support for those specific large titles is
-   wanted.
-4. **8x16 sprite mode** (`LCDC` bit 2) isn't supported — `DrawOBJline`'s
+   everything else is solid. Pokemon Crystal is a concrete example of
+   what's currently missing without it.
+4. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
+   flat, fully-resident pointer with no partial loading. 1.5MB covers
+   the large majority of the real library, but the small number of
+   even larger late-era GBC games (up to 4-8MB — Pokemon Crystal itself
+   is exactly 2MB, already over this project's current cap, though
+   moot until GBC support exists anyway) still won't fit resident in
+   the PS1's 2MB of RAM.
+5. **8x16 sprite mode** (`LCDC` bit 2) isn't supported — `DrawOBJline`'s
    line-range check assumes 8-tall sprites only. Most GB/GBC games use
    8x8 sprites predominantly; a real, separate gap if a specific game
    needs tall-sprite mode.
-5. **MBC3 RTC isn't persisted.** The RTC registers implemented earlier
+6. **MBC3 RTC isn't persisted.** The RTC registers implemented earlier
    this session (clock/calendar for games like Pokémon Gold/Silver)
    reset every boot rather than saving alongside cart RAM — a real,
    separate gap from plain cart RAM save/load, lower priority since it
    only affects real-time-clock-dependent game features, not save data
    itself.
-6. **Very large cart RAM won't fit a single memory card.** A standard
+7. **Very large cart RAM won't fit a single memory card.** A standard
    PS1 card has 15 usable 8KB blocks (120KB total); `SaveCartRAM`
    requests exactly the blocks a cart needs, but a 128KB-RAM MBC5 game
    would need every single block on the card, and anything larger
    wouldn't fit at all. Affects a small minority of RAM-heavy titles;
    not fixed proactively since most games use far less.
-7. **Real visual confirmation** (screenshot/video from actual hardware
+8. **Real visual confirmation** (screenshot/video from actual hardware
    or a working emulator session) — every emulator-boot attempt in this
    sandbox has hung or stalled (see the note below); not something to
    keep spending sandbox time on, but worth doing whenever a real
