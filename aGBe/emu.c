@@ -119,6 +119,18 @@ int GBC_MODE = 0;
 BYTE VBK;   // $FF4F - VRAM bank select (bit 0 only; bits 1-7 read as 1)
 BYTE SVBK;  // $FF70 - WRAM bank select for $D000-$DFFF (bits 0-2; 0 behaves as 1)
 BYTE KEY1;  // $FF4D - speed switch (prepare/current speed flags)
+// HDMA1-4 ($FF51-$FF54): source/destination address high/low bytes for
+// VRAM DMA. HDMA5 ($FF55) both starts a transfer on write (bit 7 picks
+// General-Purpose, immediate, vs H-Blank-paced mode; bits 0-6 encode
+// transfer length as (n+1)*16 bytes) and reports status on read.
+BYTE HDMA1, HDMA2, HDMA3, HDMA4;
+// Tracks an in-progress H-Blank DMA: -1 means none active. Real H-Blank
+// DMA transfers 16 bytes per H-Blank rather than all at once - see the
+// HDMA5 write handler and the hblank()-driven continuation for why this
+// needs to persist across calls instead of finishing in one shot like
+// General-Purpose DMA does.
+int HDMA_REMAINING = -1;
+int HDMA_SRC, HDMA_DST;
 // BCPS/OCPS ($FF68/$FF6A): bit0-5 = palette RAM byte index (0-63),
 // bit7 = auto-increment the index after each BCPD/OCPD write.
 BYTE BCPS, OCPS;
@@ -238,6 +250,12 @@ void reset_Z80() {
 				}
 			}
 		}
+		// Also reset any in-progress H-Blank DMA and speed-switch state
+		// - important given this project's ROM-select menu can load a
+		// fresh cart without a full process restart, so a previous
+		// cart's leftover state must not carry over into the next one.
+		HDMA_REMAINING = -1;
+		KEY1 = 0;
 		// Confirmed against the reference core (Peanut-GB)'s exact reset
 		// mechanics: the documented power-up STAT byte ($85, mode=VBlank)
 		// is the functionally real starting mode, not just cosmetic - its
@@ -533,13 +551,20 @@ void doDMA(BYTE addr) {
 }
 
 void cycleLength(int cycle) {
-	DIVCOUNTER += cycle;
+	// GBC double-speed mode: the CPU core runs twice as fast, but the
+	// PPU/DIV/Timer are driven by the fixed system clock, which does
+	// NOT double - so for the same number of CPU cycles just executed,
+	// only half as much real system-clock time has actually passed.
+	// Every GB instruction's cycle cost is a multiple of 4, so halving
+	// here is always exact (no fractional cycles lost to rounding).
+	int sysCycle = (GBC_MODE && (KEY1 & 0x80)) ? cycle / 2 : cycle;
+	DIVCOUNTER += sysCycle;
 	while (DIVCOUNTER >= 256) {
 		DIVCOUNTER -= 256;
 		DIVREG++; // wraps naturally as a BYTE
 	}
 	if ((TIMCONT >> 2) & 0x01){
-		TIMECOUNTER += cycle;
+		TIMECOUNTER += sysCycle;
 		if (TIMECOUNTER >= MAXTIME){
 			TIMECOUNTER = 0;
 			TIMECNT += 1;
@@ -553,7 +578,7 @@ void cycleLength(int cycle) {
 			}
 		}
 	}
-	VideoCyclesLeft -= cycle;
+	VideoCyclesLeft -= sysCycle;
 	if(VideoCyclesLeft <= 0) { // Video
 		if((videoMode == HBLANKMODE) || (videoMode == VBLANKMODE)){
 			LCDY++;
@@ -679,6 +704,22 @@ void hblank(){
  	int WINaddr;
  	int BGaddr;
  	int TILEaddr;
+
+	// H-Blank DMA continuation: transfer one 16-byte block per H-Blank
+	// (this function is called once per scanline, at the same point a
+	// real H-Blank period begins) until the whole transfer completes -
+	// see the HDMA5 write handler for how a transfer starts and why
+	// General-Purpose DMA doesn't need this (it already finished
+	// immediately when it was started).
+	if (GBC_MODE && HDMA_REMAINING > 0) {
+		int k;
+		for (k = 0; k < 16; k++) {
+			WriteMEM((WORD)(HDMA_DST + k), ReadMEM((WORD)(HDMA_SRC + k)));
+		}
+		HDMA_SRC += 16;
+		HDMA_DST += 16;
+		HDMA_REMAINING -= 16;
+	}
 
  	if ((LCDCONTROL >> 6) & 0x01) { WINaddr = 0x9C00;  } else { WINaddr = 0x9800; }
  	if ((LCDCONTROL >> 3) & 0x01) { BGaddr = 0x9C00;   } else { BGaddr = 0x9800;}
@@ -1507,6 +1548,13 @@ BYTE ReadMEM(WORD loc) {
 				// hardware-detection code checks for.
 				case 0xFF4D: return (BYTE)(KEY1 | 0x7E); break; // KEY1 - speed switch (R/W)
 				case 0xFF4F: return (BYTE)(VBK | 0xFE); break; // VBK - VRAM bank (R/W)
+				case 0xFF55: // HDMA5 - VRAM DMA status (R/W)
+					// Bit 7 clear = no H-Blank DMA in progress (General-
+					// Purpose transfers always finish immediately, so
+					// this only ever reflects H-Blank DMA state); bits
+					// 0-6 = remaining length in 16-byte blocks minus 1.
+					return (BYTE)(HDMA_REMAINING < 0 ? 0xFF : (((HDMA_REMAINING / 16) - 1) & 0x7F));
+					break;
 				case 0xFF68: return (BYTE)(BCPS | 0x40); break; // BCPS/BGPI - BG palette index (R/W)
 				case 0xFF69: return BGPALRAM[BCPS & 0x3F]; break; // BCPD/BGPD - BG palette data (R/W)
 				case 0xFF6A: return (BYTE)(OCPS | 0x40); break; // OCPS/OBPI - OBJ palette index (R/W)
@@ -1792,6 +1840,41 @@ void WriteMEM(WORD loc, BYTE b){
 			// no effect at all, same as real hardware.
 			case 0xFF4D: if (GBC_MODE) { KEY1 = (KEY1 & 0x80) | (b & 0x01); } break; // KEY1 - speed switch prepare bit (R/W)
 			case 0xFF4F: if (GBC_MODE) { VBK = b & 0x01; } break; // VBK - VRAM bank (R/W)
+			case 0xFF51: if (GBC_MODE) { HDMA1 = b; } break; // HDMA1 - transfer source high (W)
+			case 0xFF52: if (GBC_MODE) { HDMA2 = b & 0xF0; } break; // HDMA2 - transfer source low (W)
+			case 0xFF53: if (GBC_MODE) { HDMA3 = b & 0x1F; } break; // HDMA3 - transfer dest high (W)
+			case 0xFF54: if (GBC_MODE) { HDMA4 = b & 0xF0; } break; // HDMA4 - transfer dest low (W)
+			case 0xFF55: // HDMA5 - VRAM DMA start (R/W)
+				if (GBC_MODE) {
+					int length = ((b & 0x7F) + 1) * 16;
+					int src = (HDMA1 << 8) | HDMA2;
+					int dst = 0x8000 | (((HDMA3 << 8) | HDMA4) & 0x1FFF);
+					if (b & 0x80) {
+						// H-Blank DMA: 16 bytes transfer per H-Blank: see
+						// the continuation in hblank() below. Real
+						// hardware also lets writing HDMA5 with bit 7
+						// clear, while an H-Blank DMA is already active,
+						// cancel it early instead of starting a new
+						// General-Purpose transfer - not implemented
+						// here since no ROM exercising that specific
+						// case has come up yet.
+						HDMA_REMAINING = length;
+						HDMA_SRC = src;
+						HDMA_DST = dst;
+					} else {
+						// General-Purpose DMA: real hardware transfers
+						// the whole block immediately (blocking the CPU
+						// for a proportional time), unlike H-Blank DMA -
+						// so, unlike that mode, this genuinely can just
+						// happen all at once here too.
+						int k;
+						for (k = 0; k < length; k++) {
+							WriteMEM((WORD)(dst + k), ReadMEM((WORD)(src + k)));
+						}
+						HDMA_REMAINING = -1;
+					}
+				}
+				break;
 			case 0xFF68: if (GBC_MODE) { BCPS = b & 0xBF; } break; // BCPS/BGPI - BG palette index (R/W)
 			case 0xFF69: // BCPD/BGPD - BG palette data (R/W)
 				if (GBC_MODE) {
@@ -1978,6 +2061,18 @@ cycleLength(4); } // 0F    RRCA
 
 void OP10(void){ //  0x10:
 	ReadMEM(reg_PC++);
+	// GBC double-speed switch: real hardware only actually switches
+	// speed when STOP executes with KEY1 bit 0 ("prepare speed switch")
+	// set - the game arms it by writing 1 to KEY1 before executing
+	// STOP. Toggles KEY1 bit 7 (current speed: 0=normal, 1=double,
+	// which cycleLength() checks directly) and clears the prepare bit.
+	// If bit 0 isn't set, STOP is meant to behave as a deep low-power
+	// halt until a button press instead - not implemented as an actual
+	// CPU freeze here, matching this project's existing behavior of
+	// just consuming the instruction either way.
+	if (GBC_MODE && (KEY1 & 0x01)) {
+		KEY1 = (KEY1 & 0x80) ^ 0x80; // toggle bit 7, clear bit 0
+	}
 cycleLength(4); } // 10 00 STOP      ???
 
 void OP11(void){ //  0x11:
