@@ -710,13 +710,21 @@ void DrawOBJline(int line, int TILEaddr) {
 	// applied to the pixel indexing here) remains a known, separate gap -
 	// out of scope for this fix, tracked in STATUS.md.
 	int i, j;
+	// BUG FIX: 8x16 sprite mode (LCDC bit 2) was never supported - the
+	// bounding-box check and row lookup both hardcoded an 8-pixel-tall
+	// sprite. In 8x16 mode, real hardware ignores bit 0 of the OAM tile
+	// number and uses two consecutive tiles (N with bit0 forced to 0,
+	// then N+1) stacked as one 16-pixel-tall sprite; Y-flip mirrors the
+	// whole 16-pixel sprite (which also swaps which physical tile ends
+	// up "on top"), not each 8-pixel half independently.
+	int spriteHeight = ((LCDCONTROL >> 2) & 0x01) ? 16 : 8;
 	for ( i = 0; i < 40; i++) {
 		pos = i * 4;
 		by = OAMRAM[pos] & 0xFF;
 		bx = OAMRAM[pos + 1] & 0xFF;
 		tileNo = OAMRAM[pos + 2] & 0xFF;
 		bflag = OAMRAM[pos + 3] & 0xFF;
-		if (( bx != 0x00 && by != 0x00) && (by <=line + 16) && (by > line + (16 - 8))) {  // 8/16
+		if (( bx != 0x00 && by != 0x00) && (by <=line + 16) && (by > line + (16 - spriteHeight))) {  // 8/16
 			// BUG FIX (severe): this always fetched row 0 of the tile
 			// (offset +0/+1) no matter which of the sprite's 8 scanlines
 			// was actually being drawn - every row of every sprite showed
@@ -726,12 +734,17 @@ void DrawOBJline(int line, int TILEaddr) {
 			// (`line`) is; Y-flip (iflipy, computed below) just mirrors
 			// which row that ends up being.
 			iflipy = (bflag & 0x40) == 0x40;
-			int spriteRow = line - (by - 16);
+			int spriteRow = line - (by - 16); // 0..(spriteHeight-1)
 			if (iflipy) {
-				spriteRow = 7 - spriteRow;
+				spriteRow = (spriteHeight - 1) - spriteRow;
 			}
-			B1 = (unsigned char)ReadMEM(TILEaddr + ((tileNo) * 16) + spriteRow * 2 );
-			B2 = (unsigned char)ReadMEM(TILEaddr + ((tileNo) * 16) + spriteRow * 2 + 1 );
+			int effectiveTileNo = tileNo;
+			if (spriteHeight == 16) {
+				effectiveTileNo = (tileNo & 0xFE) + (spriteRow >= 8 ? 1 : 0);
+				spriteRow = spriteRow % 8;
+			}
+			B1 = (unsigned char)ReadMEM(TILEaddr + ((effectiveTileNo) * 16) + spriteRow * 2 );
+			B2 = (unsigned char)ReadMEM(TILEaddr + ((effectiveTileNo) * 16) + spriteRow * 2 + 1 );
 
 			iflipx = (bflag & 0x20) == 0x20;
 			ipal   = (bflag & 0x10) == 0x10;
