@@ -251,6 +251,20 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   including performing the real RTC latch sequence (the documented
   $6000 00-then-01 write real hardware requires before a read becomes
   visible) in the independent load-verification process.
+- **GBC (Game Boy Color) support implemented.** Banked VRAM (16KB/2
+  banks) and WRAM (32KB/8 banks), the CGB register set (`VBK`/`SVBK`/
+  `KEY1`/`BCPS`-`BCPD`/`OCPS`-`OCPD`), and CGB-aware BG/window/sprite
+  rendering (per-tile palette/VRAM-bank/flip attributes, 3-bit sprite
+  palettes) — all gated on the cartridge header's CGB flag, so DMG
+  carts are completely unaffected. Verified with a synthetic ROM that
+  set an explicit palette color and got back an exactly-matching pixel
+  in the rendered output (solid `RGB(255,0,0)` across the whole
+  screen), and with two real ROMs: Pokemon Crystal (CGB-only) now
+  renders a correct, legible hardware-compatibility dialog instead of a
+  black or frozen screen, and Pokemon Yellow (CGB-enhanced) renders
+  correctly under the new code path. Double-speed mode timing, HDMA/
+  GDMA, and BG-to-OBJ priority override remain unimplemented — real,
+  separate follow-ups (see below).
 
 ## What's next (roughly in priority order)
 
@@ -264,17 +278,23 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    (MBC2, EI timing) nothing else had touched. Don't commit ROM files
    themselves to this repo or bundle them in any output archive
    (copyright) — keep them local/sandbox-only.
-3. **GBC support and sound** — explicitly deprioritized per the person's
-   direction earlier this session; sound especially can wait until
-   everything else is solid. Pokemon Crystal is a concrete example of
-   what's currently missing without it.
+3. **GBC follow-ups** — double-speed mode timing (register I/O exists,
+   doesn't change CPU speed yet), HDMA/GDMA VRAM DMA, and BG-to-OBJ
+   priority override (CGB attribute bit 7) are the three known
+   remaining gaps in the GBC support implemented this session (see
+   above). Pokemon Crystal's hardware-compatibility warning is almost
+   certainly checking for double-speed mode or HDMA specifically -
+   implementing either could be what gets it (and other CGB-only games)
+   past that screen into real gameplay. Sound remains separately
+   deprioritized per the person's direction earlier this session.
 4. **Bank-streaming for very large ROMs.** The core's `ROM[loc]` is a
    flat, fully-resident pointer with no partial loading. 1.5MB covers
    the large majority of the real library, but the small number of
    even larger late-era GBC games (up to 4-8MB — Pokemon Crystal itself
-   is exactly 2MB, already over this project's current cap, though
-   moot until GBC support exists anyway) still won't fit resident in
-   the PS1's 2MB of RAM.
+   is exactly 2MB, already over this project's current cap) still won't
+   fit resident in the PS1's 2MB of RAM, now further reduced by GBC's
+   larger VRAM/WRAM buffers (+32KB total) — worth re-checking total
+   memory footprint if this cap is ever raised.
 5. **Very large cart RAM won't fit a single memory card.** A standard
    PS1 card has 15 usable 8KB blocks (120KB total); `SaveCartRAM`
    requests exactly the blocks a cart needs, but a 128KB-RAM MBC5 game
