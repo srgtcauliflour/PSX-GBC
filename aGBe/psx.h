@@ -33,6 +33,12 @@ void PrepScreen(void);
 // SPU's hardware voices to approximate it. See psx.c for the full
 // design rationale and known limitations.
 void UpdateAudio(void);
+// Called once per instruction from cycleLength() with that instruction's
+// system-clock cycle cost (same value APUClock() receives) - a no-op on
+// real PS1 hardware (the SPU generates its own samples), but lets the
+// host test harness accumulate an actual PCM waveform for real,
+// listenable verification of the APU core - see harness.c.
+void AudioSampleHook(int cycles);
 void RenderWorld(BYTE re, BYTE gr, BYTE bl);
 unsigned long PadRead(int pad_num);
 

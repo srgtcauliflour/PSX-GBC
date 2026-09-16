@@ -133,6 +133,11 @@ void Draw_Buffer(int *screenBuffer, unsigned short *screenBufferColor, int gbcMo
 // direct-LoadImage approach here doesn't need either, so both are no-ops.
 void PrepScreen(void) {}
 void RenderWorld(BYTE re, BYTE gr, BYTE bl) { (void) re; (void) gr; (void) bl; }
+// No-op on real PS1 hardware - the SPU generates samples in hardware
+// (see UpdateAudio() below), so there's nothing for the CPU to do here.
+// Exists purely so the host test harness can hook the same call site
+// to accumulate a real PCM waveform for listening verification.
+void AudioSampleHook(int cycles) { (void) cycles; }
 
 // ---- Audio (GB APU -> PS1 SPU) -----------------------------------------
 //

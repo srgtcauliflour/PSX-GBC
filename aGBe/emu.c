@@ -861,6 +861,7 @@ void cycleLength(int cycle) {
 		}
 	}
 	APUClock(sysCycle);
+	AudioSampleHook(sysCycle);
 	VideoCyclesLeft -= sysCycle;
 	if(VideoCyclesLeft <= 0) { // Video
 		if((videoMode == HBLANKMODE) || (videoMode == VBLANKMODE)){

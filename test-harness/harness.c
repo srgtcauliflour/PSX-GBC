@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <libgte.h>
 #include <libgpu.h>
@@ -89,6 +90,98 @@ void Draw_Buffer_Pixel_Blitting(int *screenBuffer) { (void)screenBuffer; }
 // to sanity-check the APU core's behavior over time without real
 // playback - e.g. confirming a music-playing ROM's channels actually
 // change frequency/volume over time instead of sitting static.
+// ---- DUMP_WAV: real, listenable PCM export of the APU core's output ----
+// Independent of (and doesn't test) the PS1 SPU integration in psx.c -
+// this mixes the already-verified APU core's own channel outputs
+// directly in software, entirely on the host, so a real audio file can
+// be listened to and inspected (pitch, rhythm, envelope shape) as an
+// extra layer of confidence beyond the register-level synthetic tests.
+#define WAV_SAMPLE_RATE 44100
+#define WAV_CPU_CLOCK 4194304
+#define WAV_MAX_SECONDS 60
+static int16_t *wavBuffer = NULL;
+static long wavSampleCount = 0;
+static long wavMaxSamples = 0;
+static int32_t wavAccum = 0;
+
+static void WriteWavFile(void) {
+    if (!wavBuffer || wavSampleCount == 0) {
+        return;
+    }
+    const char *path = getenv("DUMP_WAV");
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        return;
+    }
+    uint32_t dataBytes = (uint32_t) (wavSampleCount * 2 * sizeof(int16_t));
+    uint32_t riffSize = 36 + dataBytes;
+    uint32_t sr = WAV_SAMPLE_RATE, byteRate = WAV_SAMPLE_RATE * 2 * 2;
+    uint16_t blockAlign = 4, bitsPerSample = 16, channels = 2, fmt = 1;
+    fwrite("RIFF", 1, 4, f); fwrite(&riffSize, 4, 1, f); fwrite("WAVE", 1, 4, f);
+    fwrite("fmt ", 1, 4, f);
+    uint32_t fmtSize = 16;
+    fwrite(&fmtSize, 4, 1, f);
+    fwrite(&fmt, 2, 1, f); fwrite(&channels, 2, 1, f); fwrite(&sr, 4, 1, f);
+    fwrite(&byteRate, 4, 1, f); fwrite(&blockAlign, 2, 1, f); fwrite(&bitsPerSample, 2, 1, f);
+    fwrite("data", 1, 4, f); fwrite(&dataBytes, 4, 1, f);
+    fwrite(wavBuffer, sizeof(int16_t), wavSampleCount * 2, f);
+    fclose(f);
+    fprintf(stderr, "[wav] wrote %ld samples (%.1fs) to %s\n", wavSampleCount, (double) wavSampleCount / WAV_SAMPLE_RATE, path);
+}
+
+void AudioSampleHook(int cycles) {
+    if (!getenv("DUMP_WAV")) {
+        return;
+    }
+    if (!wavBuffer) {
+        wavMaxSamples = WAV_SAMPLE_RATE * WAV_MAX_SECONDS;
+        wavBuffer = malloc(wavMaxSamples * 2 * sizeof(int16_t));
+        atexit(WriteWavFile);
+    }
+    wavAccum += cycles * WAV_SAMPLE_RATE;
+    while (wavAccum >= WAV_CPU_CLOCK && wavSampleCount < wavMaxSamples) {
+        wavAccum -= WAV_CPU_CLOCK;
+
+        int c1 = APUChannelOutput(1);
+        int c2 = APUChannelOutput(2);
+        int c3 = APUChannelOutput(3);
+        int c4 = APUChannelOutput(4);
+        // Convert each channel's 0-15 output to a centered -15..+15
+        // value before summing, same convention real hardware's DAC
+        // uses before analog mixing - a DAC-off channel (-1) contributes
+        // nothing at all, not a centered "0".
+        int b1 = (c1 >= 0) ? (c1 * 2 - 15) : 0;
+        int b2 = (c2 >= 0) ? (c2 * 2 - 15) : 0;
+        int b3 = (c3 >= 0) ? (c3 * 2 - 15) : 0;
+        int b4 = (c4 >= 0) ? (c4 * 2 - 15) : 0;
+
+        int left = 0, right = 0;
+        if (NR51 & 0x10) left += b1;
+        if (NR51 & 0x01) right += b1;
+        if (NR51 & 0x20) left += b2;
+        if (NR51 & 0x02) right += b2;
+        if (NR51 & 0x40) left += b3;
+        if (NR51 & 0x04) right += b3;
+        if (NR51 & 0x80) left += b4;
+        if (NR51 & 0x08) right += b4;
+
+        int masterLeft = (NR50 >> 4) & 0x07;
+        int masterRight = NR50 & 0x07;
+        // left/right are now within roughly -60..+60 (4 channels, each
+        // -15..+15) before the master volume's 1-8x scale - x68 brings
+        // the loudest possible combination close to using the full
+        // 16-bit range without clipping it.
+        left = left * (masterLeft + 1) * 68;
+        right = right * (masterRight + 1) * 68;
+        if (left > 32767) left = 32767; if (left < -32768) left = -32768;
+        if (right > 32767) right = 32767; if (right < -32768) right = -32768;
+
+        wavBuffer[wavSampleCount * 2] = (int16_t) left;
+        wavBuffer[wavSampleCount * 2 + 1] = (int16_t) right;
+        wavSampleCount++;
+    }
+}
+
 void UpdateAudio(void) {
 	static int callCount = 0;
 	callCount++;
