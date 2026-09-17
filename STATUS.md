@@ -494,7 +494,21 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   fail for the identical underlying reason as `call_timing`/
   `rst_timing` (not a regression, already failing beforehand). PUSH,
   POP, CALL, RST, RET, and RETI are now all consistently fixed to
-  their correct real-hardware total cycle counts.
+  their correct real-hardware total cycle counts, and a full audit of
+  every remaining `push()`/`pop()`/`call()`/`ret()`/`rst()` call site
+  confirmed none of the others were missed.
+
+  Checked `JP nnnn` too while auditing: its total cycle count (16T) is
+  already correct (it doesn't call `push()`/`pop()` at all, so no
+  double-charge risk there) - but it still reads both address bytes
+  atomically via `ReadWord()` rather than as two separately-charged
+  M-cycles the way CALL's own reads now are. A narrower, lower-priority
+  correctness gap than anything fixed above: it would only matter if
+  DMA's active/inactive state actually changes mid-read (a real but
+  rare scenario), not something affecting every JP the way the
+  double-charge bugs affected every CALL/RET/RST/PUSH/POP. Not fixed in
+  this pass - noted here for whoever picks this up next, rather than
+  expanding scope further without checking in first.
 
 ## What's next (roughly in priority order)
 
