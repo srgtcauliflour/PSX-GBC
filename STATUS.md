@@ -514,28 +514,42 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   OAM-DMA nuance the CALL/RET/RST family does - genuinely different
   ground. Fixed a real, documented hardware quirk: TIMA reads as $00
   for 4 T-cycles after overflow before taking TMA's value, not
-  immediately (verified real on DMG/MGB/SGB/SGB2/CGB/AGB/AGS per
-  Mooneye's own test comment). Doesn't get `tima_reload.gb` passing by
-  itself, though - tracing its source revealed a **separate, deeper
-  architectural gap**: TIMA and DIV are actually driven by the same
-  underlying 16-bit hardware counter on real hardware, and writing DIV
-  can trigger an unexpected extra TIMA increment if the write causes a
-  falling edge on the specific bit that clocks it. This project's timer
-  uses an independent, simplified counter unrelated to DIV's actual bit
-  pattern - correct for the vast majority of real game behavior, but
-  not this specific coupling. Properly fixing this would mean rebuilding
-  the timer around DIV's real 16-bit value rather than a separate
-  counter - a real, separate gap for whoever continues this, comparable
-  in kind (if smaller in scope) to the sub-instruction memory-timing gap
-  itself. No regression: `tim00_div_trigger`/`tim01`/`tim11_div_trigger`
-  (which also exercise timer/DIV interactions) all continue to pass;
-  still 13/67 overall.
+  immediately (verified real on DMG/MGB/SGB2/CGB/AGB/AGS per
+  Mooneye's own test comment).
+
+  That alone didn't get `tima_reload.gb` passing - tracing its source
+  revealed a separate, deeper architectural gap: TIMA and DIV are
+  actually driven by the same underlying 16-bit hardware counter, not
+  two independent ones. **Fixed properly**, since - unlike the OAM-DMA
+  nuance - this one is precisely documented and didn't carry the same
+  risk of encoding a guessed, possibly-wrong hardware behavior.
+  Replaced the old independent DIVCOUNTER/TIMECOUNTER pair with a real
+  unified 16-bit counter (`internalDivCounter16`); DIV is now purely
+  derived from its upper byte; a new `CheckTimerEdge()` detects the
+  real falling-edge-on-a-specific-bit mechanism that drives TIMA,
+  called every T-cycle and immediately after any DIV or TAC write
+  (both of which can themselves cause the edge that increments TIMA -
+  the whole reason `div_write.gb`/`rapid_toggle.gb` exist).
+
+  **Result: 8 more tests pass at once - 13/67 → 21/67, the single
+  biggest jump from any change in this entire timing effort**: `tim00`,
+  `tim01_div_trigger`, `tim10`, `tim10_div_trigger`, `tim11`,
+  `tima_reload`, `div_write`, `rapid_toggle`. `tima_write_reloading`/
+  `tma_write_reloading` remain failing - a related but distinct nuance
+  (canceling the reload by writing TIMA/TMA during the 4-cycle window)
+  not yet implemented. Real ROMs re-verified correct throughout
+  (Pokemon Red pixel-matched to its known-good baseline); one apparent
+  regression (Kirby's Dream Land 2 showing blank white) turned out,
+  on direct comparison against the pre-rewrite committed state at the
+  identical instruction counts, to already be blank there too - a
+  pre-existing "different point in dynamic gameplay" artifact, not
+  something this fix introduced.
 
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
    large, real gap, though real progress has been made.** Currently
-   13 of 67 Mooneye acceptance/ppu+timer+interrupts tests pass (up
+   21 of 67 Mooneye acceptance/ppu+timer+interrupts tests pass (up
    from an initial 11), most of the remaining failures for reasons
    unrelated to the already-known boot-ROM limitation. Comparable in
    scope to the GBC-support or sound-implementation efforts this
