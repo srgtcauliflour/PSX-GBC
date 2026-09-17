@@ -1055,6 +1055,17 @@ void cycleLength(int cycle) {
 	APUClock(sysCycle);
 	AudioSampleHook(sysCycle);
 	DMAClock(sysCycle);
+	// BUG FIX: the PPU mode/LY state machine below ran completely
+	// unconditionally, even while LCDC bit 7 (LCD/PPU enable) is 0 - real
+	// hardware freezes LY, the STAT mode bits, and critically the STAT
+	// LYC-coincidence bit (it stops being recomputed, so it keeps
+	// whatever value it last had) the instant the display is turned off,
+	// and only resumes ticking once it's turned back on. See the LCDC
+	// write handler (case 0xFF40) for the actual on/off transition
+	// itself (LY/mode reset, coincidence bit left untouched on power-off).
+	// Confirmed via Mooneye's stat_lyc_onoff.gb, which checks exactly
+	// this freeze-and-resume behavior across several LYC/LCDC sequences.
+	if (!(LCDCONTROL & 0x80)) { return; }
 	VideoCyclesLeft -= sysCycle;
 	if(VideoCyclesLeft <= 0) { // Video
 		if((videoMode == HBLANKMODE) || (videoMode == VBLANKMODE)){
@@ -2106,7 +2117,7 @@ BYTE ReadMEM(WORD loc) {
 
 			// VIDEO
 				case 0xFF40: return (BYTE)LCDCONTROL; break; // LCD Control (R/W)
-				case 0xFF41: return (BYTE)LCDSTATUS; break; // LCDC Status   (R/W)
+				case 0xFF41: return (BYTE)(LCDSTATUS | 0x80); break; // LCDC Status (R/W), unused bit 7 reads as 1
 				case 0xFF42: return (BYTE)SCRY; break; // Scroll Y   (R/W)
 				case 0xFF43: return (BYTE)SCRX; break; // Scroll X   (R/W)
 				case 0xFF44: return (BYTE)LCDY; break; // LCDC Y-Coordinate (R)
@@ -2488,9 +2499,44 @@ void WriteMEM(WORD loc, BYTE b){
 				break;
 
 			// VIDEO
-			case 0xFF40:
+			case 0xFF40: {
+				BYTE oldLCDC = LCDCONTROL;
 				LCDCONTROL = b;
+				// BUG FIX: turning the LCD off/on (bit 7) needs its own
+				// explicit transition - see the freeze/resume comment in
+				// cycleLength() for why the state machine alone isn't
+				// enough. Powering off resets LY and the STAT mode bits to
+				// 0 immediately but deliberately leaves the STAT
+				// LYC-coincidence bit (bit 2) untouched - real hardware
+				// stops recomputing it the instant the comparison clock
+				// stops, so it just keeps whatever value it last had.
+				// Powering back on resets LY to 0 and mode to 0 (the real
+				// first-line state, before OAM search actually begins a
+				// little later) and immediately recomputes the
+				// coincidence bit against the fresh LY=0. Confirmed via
+				// Mooneye's stat_lyc_onoff.gb.
+				if ((oldLCDC & 0x80) && !(b & 0x80)) {
+					LCDY = 0;
+					videoMode = HBLANKMODE;
+					LCDSTATUS = (LCDSTATUS & 0xFC) | (videoMode & 0x03); // mode bits only - bit 2 (coincidence) frozen
+				} else if (!(oldLCDC & 0x80) && (b & 0x80)) {
+					int wasCoincident = (LCDSTATUS >> 2) & 0x01; // frozen value from while powered off
+					LCDY = 0;
+					videoMode = HBLANKMODE;
+					VideoCyclesLeft = OAM_CYCLES;
+					int nowCoincident = (LCDY == LYC);
+					LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | (nowCoincident ? 0x04 : 0x00);
+					// Powering on restarts the comparison at LY=0 - if
+					// that's a genuine 0->1 transition of the coincidence
+					// bit (not just "still 1, same as it was frozen at"),
+					// and the LYC-coincidence STAT interrupt source is
+					// enabled (bit 6), that's a real coincidence event and
+					// requests the STAT interrupt right here, same as any
+					// other live LY==LYC transition.
+					if (nowCoincident && !wasCoincident && ((LCDSTATUS >> 6) & 0x01)) { IFLAG |= 0x02; }
+				}
 				break; // LCD Control (R/W)
+			}
 			case 0xFF41:
 				// BUG FIX: bits 0-2 (mode + LYC-coincidence) are read-only,
 				// hardware-maintained status bits on real hardware - only
@@ -2503,7 +2549,23 @@ void WriteMEM(WORD loc, BYTE b){
 			case 0xFF42: SCRY = b; break; // Scroll Y   (R/W)
 			case 0xFF43: SCRX = b; break; // Scroll X   (R/W)
 			case 0xFF44: LCDY = 0x00; break; // LCDC Y-Coordinate (R)
-			case 0xFF45: LYC = b; break; // LY Compare  (R/W)
+			case 0xFF45:
+				// BUG FIX: the STAT LYC-coincidence bit (bit 2) was only
+				// ever recomputed once per PPU mode transition (every
+				// 80-456 cycles, inside cycleLength()) - real hardware's
+				// comparator is effectively live, so a software write to
+				// LYC while the LCD is on needs to update the coincidence
+				// bit immediately, not wait for the next mode boundary.
+				// Only while the LCD is actually on - the comparison
+				// clock is frozen otherwise (see the LCDC/$FF40 handler).
+				// Confirmed via Mooneye's stat_lyc_onoff.gb, which sets
+				// LYC immediately before turning the LCD off and expects
+				// the freshly-recomputed bit to already be in effect.
+				LYC = b;
+				if (LCDCONTROL & 0x80) {
+					LCDSTATUS = (LCDSTATUS & 0xFB) | ((LCDY == LYC) ? 0x04 : 0x00);
+				}
+				break; // LY Compare  (R/W)
 			case 0xFF46: doDMA(b); break; // DMA Transfer and Start Address (W)
 			case 0xFF47: BGPAL = b; break; // BG Palette Data  (W)
 			case 0xFF48: OBJPAL0 = b; break; // Object Palette 0 Data (W)
