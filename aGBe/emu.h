@@ -48,6 +48,7 @@ extern int FRAMECOUNT;
 extern int RAM_DIRTY;
 extern int EI_PENDING;
 extern int dmaActive;
+extern long long g_totalSysCycles;
 extern int dmaBytesDone;
 extern int dmaCyclesElapsed;
 

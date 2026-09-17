@@ -412,7 +412,13 @@ WORD pop(void){
 	return (WORD)(lo | (hi << 8));
 }
 void call(void) {
-	push(reg_PC+2);
+	// BUG FIX (sub-instruction timing): previously pushed reg_PC+2,
+	// assuming the caller hadn't yet advanced past the 2 address bytes -
+	// now that CALL's own opcodes read those bytes themselves (with
+	// individually-charged M-cycles, so DMA/interrupt state observed
+	// mid-instruction is correct), reg_PC is already pointing past them
+	// by the time this runs, so the return address is just reg_PC as-is.
+	push(reg_PC);
 }
 WORD ret(void){
 	return (WORD)pop();
@@ -3316,9 +3322,15 @@ void OPC3(void){ // case  0xC3:
 
 void OPC4(void){ // case  0xC4:
 	if (!getZ()) {
+		// BUG FIX (sub-instruction timing): see OPCD (CALL nnnn) for the
+		// full explanation - same double-charge fix applied here.
+		cycleLength(4); // M1: fetch
+		BYTE lo = ReadMEM(reg_PC++);
+		cycleLength(4); // M2
+		BYTE hi = ReadMEM(reg_PC++);
+		cycleLength(4); // M3
 		call();
-		reg_PC = ReadWord(reg_PC);
-		cycleLength(24);
+		reg_PC = (WORD)(lo | (hi << 8));
 	} else {
 		reg_PC += 2;
 		cycleLength(12);
@@ -3330,7 +3342,7 @@ cycleLength(4); push(get_rBC()); } // C5    PUSH BC
 void OPC6(void){ // case  0xC6:
 reg_A = ADDreg(reg_A, ReadMEM(reg_PC++)); cycleLength(8); } // C6    ADD  A,nn
 void OPC7(void){ // case  0xC7:
-reg_PC = rst(0x0000); cycleLength(16); } // C7    RST  00H
+cycleLength(4); reg_PC = rst(0x0000); } // C7    RST  00H
 
 void OPC8(void){ // case  0xC8:
 	if (getZ()) {
@@ -3367,9 +3379,14 @@ void OPCB(void){ // case 0xCB:
 void OPCC(void){ // case  0xCC:
 
 	if (getZ() != 0) {
+		// BUG FIX (sub-instruction timing): see OPCD (CALL nnnn).
+		cycleLength(4); // M1: fetch
+		BYTE lo = ReadMEM(reg_PC++);
+		cycleLength(4); // M2
+		BYTE hi = ReadMEM(reg_PC++);
+		cycleLength(4); // M3
 		call();
-		reg_PC = ReadWord(reg_PC);
-		 cycleLength(24);
+		reg_PC = (WORD)(lo | (hi << 8));
 	} else {
 		//ReadWord(reg_PC);
 		reg_PC += 2;
@@ -3378,15 +3395,26 @@ void OPCC(void){ // case  0xCC:
 } // CC    CALL Z,nnnn
 
 void OPCD(void){ // case  0xCD:
+	// BUG FIX (sub-instruction timing): was call(); reg_PC=ReadWord(...);
+	// cycleLength(24) - call() pushes via push(), which now charges its
+	// own 3 M-cycles (12T) progressively, so a further lump cycleLength(24)
+	// here double-counted them (36T total instead of the correct 24T) -
+	// same class of bug as the earlier interrupt()/RST double-charges.
+	// Real CALL is 6 M-cycles: fetch, read addr-lo, read addr-hi, then
+	// the same idle+write+write push() already supplies.
+	cycleLength(4); // M1: fetch
+	BYTE lo = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read address low byte
+	BYTE hi = ReadMEM(reg_PC++);
+	cycleLength(4); // M3: read address high byte
 	call();
-	reg_PC = ReadWord(reg_PC);
-	cycleLength(24);
+	reg_PC = (WORD)(lo | (hi << 8));
 } // CD    CALL nnnn
 
 void OPCE(void){ // case  0xCE:
 reg_A = ADCreg(reg_A, ReadMEM(reg_PC++)); cycleLength(8); } // CE    ADC  A,nn
 void OPCF(void){ // case  0xCF:
-reg_PC = rst(0x0008); cycleLength(16); } // CF    RST  8
+cycleLength(4); reg_PC = rst(0x0008); } // CF    RST  8
 
 void OPD0(void){ // case  0xD0:
 	if (getC() != 1) {
@@ -3419,10 +3447,14 @@ void OPD3(void){
 
 void OPD4(void){ // case  0xD4:
 	if (getC() != 1) {
+		// BUG FIX (sub-instruction timing): see OPCD (CALL nnnn).
+		cycleLength(4); // M1: fetch
+		BYTE lo = ReadMEM(reg_PC++);
+		cycleLength(4); // M2
+		BYTE hi = ReadMEM(reg_PC++);
+		cycleLength(4); // M3
 		call();
-		reg_PC = ReadWord(reg_PC);
-		//reg_PC += 2; // TODO: TEST
-		cycleLength(24);
+		reg_PC = (WORD)(lo | (hi << 8));
 	} else {
 		reg_PC += 2;
 		cycleLength(12);
@@ -3434,7 +3466,7 @@ cycleLength(4); push(get_rDE()); } // D5    PUSH DE
 void OPD6(void){ // case  0xD6:
 reg_A = SUBreg(reg_A, ReadMEM(reg_PC++)); cycleLength(8); } // D6    SUB  nn
 void OPD7(void){ // case  0xD7:
-reg_PC = rst(0x0010); cycleLength(16); } // D7    RST  10H
+cycleLength(4); reg_PC = rst(0x0010); } // D7    RST  10H
 void OPD8(void){ // case  0xD8:
 	if (getC() != 0) {
 		reg_PC = ret();
@@ -3461,10 +3493,14 @@ void OPDB(void){
 
 void OPDC(void){ // case  0xDC:
 	if (getC() != 0) {
+		// BUG FIX (sub-instruction timing): see OPCD (CALL nnnn).
+		cycleLength(4); // M1: fetch
+		BYTE lo = ReadMEM(reg_PC++);
+		cycleLength(4); // M2
+		BYTE hi = ReadMEM(reg_PC++);
+		cycleLength(4); // M3
 		call();
-		reg_PC = ReadWord(reg_PC);
-		//reg_PC += 2; // TODO: TEST
-		cycleLength(24);
+		reg_PC = (WORD)(lo | (hi << 8));
 		} else {
 			reg_PC += 2;
 			cycleLength(12);
@@ -3478,7 +3514,7 @@ void OPDD(void){
 void OPDE(void){ // case  0xDE:
 reg_A = SBCreg(reg_A, ReadMEM(reg_PC++)); cycleLength(8); } // DE    SBC  A,nn
 void OPDF(void){ // case  0xDF:
-reg_PC = rst(0x0018); cycleLength(16); } // DF    RST  18H
+cycleLength(4); reg_PC = rst(0x0018); } // DF    RST  18H
 
 void OPE0(void){ // case  0xE0:
 	WriteMEM((0xFF00 + ReadMEM(reg_PC++)), reg_A);
@@ -3509,7 +3545,7 @@ void OPE6(void){ // case  0xE6:
 
 reg_A = ANDreg(reg_A, ReadMEM(reg_PC++)); cycleLength(8); } // E6    AND  nn
 void OPE7(void){ // case  0xE7:
-reg_PC = rst(0x0020); cycleLength(16); } // E7    RST  20H
+cycleLength(4); reg_PC = rst(0x0020); } // E7    RST  20H
 
 void OPE8(void){ // case  0xE8:
 	// BUG FIX: only ever adjusted SP - never set any flag except a stray
@@ -3548,8 +3584,8 @@ void OPEE(void){ // case  0xEE:
 // (immediate) has been undefined ever since.
 reg_A = XORreg(reg_A, ReadMEM(reg_PC++)); cycleLength(8); } // EE    XOR  nn
 void OPEF(void){ // case  0xEF:
+cycleLength(4);
 reg_PC = rst(0x0028);
-cycleLength(16);
 } // EF    RST  28H
 
 void OPF0(void){ // case  0xF0:
@@ -3587,8 +3623,8 @@ void OPF6(void){ // case  0xF6:
 } // F6    OR   nn
 
 void OPF7(void){ // case  0xF7:
+	cycleLength(4);
 	reg_PC = rst(0x0030);
-	cycleLength(16);
 } // F7    RST  30H
 
 void OPF8(void){ // case  0xF8:
@@ -3638,8 +3674,8 @@ void OPFE(void){ // case  0xFE:
 } // FE    CP   nn
 
 void OPFF(void){ // case  0xFF:
+	cycleLength(4);
 	reg_PC = rst(0x0038);
-	cycleLength(16);
 } // FF    RST  38H
 
 
