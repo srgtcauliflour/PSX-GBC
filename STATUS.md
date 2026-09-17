@@ -8,6 +8,55 @@ the name **PSX-GBC**; `aGBe` remains the name of the original codebase this
 project is built on and modernizes, referenced throughout this document and
 the commit history.
 
+## For the next agent — start here
+
+Read this section first; it's a short, current pointer into the much
+longer, historical rest of this document (which stays as a detailed,
+append-only log of what was tried, found, and fixed - useful for context,
+not required reading to get started).
+
+**Set up once, in order** (a fresh sandbox has none of this):
+1. PSn00bSDK v0.24 toolchain - see "Setting up the toolchain yourself"
+   under "How to rebuild and test right now" below.
+2. Mooneye's authoritative GB test suite + the WLA-DX assembler needed to
+   build it from source - see "Setting up Mooneye's test suite" in that
+   same section. This is real, load-bearing infrastructure for the #1
+   priority item below, and doesn't exist anywhere in this repo itself
+   (it's cloned from its own upstream repos into the sandbox) - do this
+   before touching sub-instruction timing work.
+3. Real commercial ROMs, if you want to extend real-ROM testing (see
+   "What's next" item 3 below) - **never commit ROM files to this repo or
+   bundle them in any output archive** (copyright); keep them local only.
+
+**Current state in brief** (see "What's proven so far" for the full,
+evidenced version of all of this):
+- CPU core: solid, `cpu_instrs` 11/11.
+- MBC1/2/3/5 + save RAM + RTC: solid, Mooneye `mbc1`+`mbc5` 18/21 (the 3
+  failures are a confirmed real-hardware multicart quirk / an
+  out-of-scope cart type, not bugs here).
+- DMG and GBC/CGB rendering: solid, verified against synthetic tests and
+  several real commercial ROMs.
+- Sound: the APU core itself is solid and independently verified (see
+  `DUMP_WAV` below); the PS1 SPU output half has never been confirmed to
+  actually produce audio, since this sandbox can't play or capture sound.
+- Sub-instruction cycle-accurate timing: a large, real, **partially
+  fixed** gap - currently 21/67 on Mooneye's `acceptance/ppu`+`timer`+
+  `interrupts`+top-level suite (started at 11/67). See "What's next"
+  item 1 for exactly what's fixed, what's failing, and why.
+
+**Priority order to actually work from is "What's next" below, kept
+current** - don't re-derive priorities from the historical log above it.
+
+**Before committing anything**, run the exact regression sweep this
+project has learned (twice, the hard way - see "What's next" item 1's
+own history) is necessary: `cpu_instrs` full suite, Mooneye
+`emulator-only/mbc1`+`mbc5`, the **full** `acceptance/ppu`+`timer`+
+`interrupts`+top-level suite (diff the exact pass list, not just the
+total - a change can silently swap one pass for another), and re-render
+at least 2-3 real ROMs to confirm they still look correct. `cpu_instrs`
+and the MBC suites alone have **not** been sufficient to catch every
+real regression found this session.
+
 ## Layout
 
 - `psx-gbc/` — the canonical, fixed source (renamed from the original
@@ -39,19 +88,70 @@ the commit history.
 # Host-native correctness testing (no PS1 toolchain needed)
 cd test-harness
 gcc -w -fcommon -I psx-stubs -I ../psx-gbc ../psx-gbc/emu.c ../psx-gbc/opcodes.c harness.c -o harness
-./harness /path/to/test.gb 30000000         # run a ROM, see Blargg pass/fail
-./harness /path/to/test.gb 30000000 trace   # per-instruction register trace
-DUMP_PPM=out.ppm ./harness /path/to/test.gb 30000000   # dump rendered screen
-ROWSUMMARY=1 ./harness /path/to/test.gb 30000000       # per-row pixel counts
-DUMP_VRAM=1 ./harness /path/to/test.gb 30000000        # tile map/data/palette dump
-
-# Blargg's test ROMs: https://github.com/retrio/gb-test-roms
-# Mooneye's test ROMs (not yet run this session): https://github.com/Gekkio/mooneye-test-suite
+./harness /path/to/test.gb 30000000         # run a ROM, see Blargg/Mooneye pass/fail
 ```
 
-For the real PS1 build (toolchain already set up in this session's sandbox
-at `/opt/psn00bsdk`, not included in this archive due to size — see
-"Setting up the toolchain yourself" below):
+Full harness environment-variable/argument reference (all opt-in, all
+combinable):
+
+```sh
+./harness rom.gb 3000000 trace     # per-instruction register trace (3rd positional arg, not an env var)
+TRACE=1 ./harness rom.gb 3000000               # coarser trace + Draw_Buffer call count, every 500k instructions
+DUMP_PPM=out.ppm ./harness rom.gb 30000000     # dump the rendered screen as a PGM/PPM image
+DUMP_PPM=out.ppm DUMP_AT=5 ./harness rom.gb 30000000  # dump only the 5th Draw_Buffer call, not the last
+DUMP_WAV=out.wav ./harness rom.gb 30000000     # render the APU core's own output to a real, listenable WAV file
+TRACE_AUDIO=1 ./harness rom.gb 3000000         # per-frame channel freq/volume/enabled dump
+ROWSUMMARY=1 ./harness rom.gb 30000000         # per-row non-white pixel counts
+DUMP_VRAM=1 ./harness rom.gb 30000000          # tile map/tile data/palette dump at exit
+DUMP_HRAM=1 ./harness rom.gb 60000000          # Mooneye pass/fail HRAM diagnostic fields
+NOSTUCK=1 ./harness rom.gb 30000000            # disable the stuck-loop early-exit (needed for infinite-loop test ROMs with no HALT)
+```
+
+Blargg's test ROMs (already used throughout this project, not included in
+this repo - copyright): `https://github.com/retrio/gb-test-roms`
+
+### Setting up Mooneye's test suite (not in this repo - clone + build yourself)
+
+Load-bearing for the #1 priority item below. Needs WLA-DX (an assembler)
+built from source; Mooneye ships its own test ROM sources, assembled via
+its own Makefile.
+
+```sh
+# WLA-DX (assembler) - build once
+git clone https://github.com/vhelin/wla-dx.git
+cd wla-dx && cmake -B build && cmake --build build
+export PATH="$(pwd)/build/binaries:$PATH"   # wla-gb, wlalink now on PATH
+cd ..
+
+# Mooneye's test suite - clone once, build whichever categories you need
+git clone https://github.com/Gekkio/mooneye-test-suite.git
+cd mooneye-test-suite
+
+# Already-covered categories this session (mbc1/mbc5 cartridge behavior):
+make WLA=wla-gb WLALINK=wlalink build/emulator-only/mbc1/bits_bank1.gb
+# ...or loop over every .s file in a directory to build a whole category:
+for f in emulator-only/mbc1/*.s emulator-only/mbc5/*.s; do
+  make WLA=wla-gb WLALINK=wlalink "build/${f%.s}.gb"
+done
+
+# The #1 priority item's own test categories (sub-instruction timing):
+for f in acceptance/ppu/*.s acceptance/timer/*.s acceptance/interrupts/*.s acceptance/*.s; do
+  make WLA=wla-gb WLALINK=wlalink "build/${f%.s}.gb"
+done
+# Resulting .gb files land in build/<same path as the .s source>, e.g.
+# build/acceptance/timer/tima_reload.gb - run them through the harness
+# exactly like any other test ROM.
+```
+
+Expect several `acceptance/*` failures that are boot-ROM-dependent
+(`boot_div*`/`boot_regs*`/`boot_hwio*`) - this project deliberately skips
+boot ROM emulation (see "Boot path" below), so those are not real gaps.
+
+### Real PS1 build
+
+Toolchain already set up in this session's sandbox at `/opt/psn00bsdk`,
+not included in this archive due to size — see "Setting up the toolchain
+yourself" below if starting fresh.
 
 ```sh
 export PATH="/opt/psn00bsdk/toolchain/bin:$PATH"
@@ -68,7 +168,14 @@ cmake --build build
 # -> psx-gbc.bin + psx-gbc.cue, a genuine multi-game PS1 disc image
 ```
 
-### Setting up the toolchain yourself
+A stock, unmodified PS1 will not boot a plain burnt copy of this disc
+image at all (the BIOS checks for a physical authenticity signature no
+CD-R can reproduce) - real hardware testing needs a modchip, an optical
+drive emulator, or a memory-card-based loader like UniROM (installable
+without opening the console via the FreePSXBoot exploit). See the
+project's own chat history for a fuller rundown if this comes up.
+
+#### Setting up the toolchain yourself
 
 ```sh
 curl -sL -o gcc.zip "https://github.com/Lameguy64/PSn00bSDK/releases/download/v0.24/gcc-mipsel-none-elf-12.3.0-linux.zip"
