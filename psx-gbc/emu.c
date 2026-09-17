@@ -3137,10 +3137,21 @@ void OP76(void){// 76 HALT
 	// fail to increment PC afterwards (the following opcode byte gets
 	// executed twice). A handful of commercial games and test ROMs rely on
 	// this exact quirk; left as a known follow-up.
+	// BUG FIX: HALT's own decode M-cycle was being charged *after* the
+	// wait loop, unconditionally, on top of whatever the loop itself
+	// already charged waiting for IF&IE to become true - every HALT that
+	// actually waited (i.e. almost every one) cost 4 T-cycles more than
+	// real hardware. Charge that one M-cycle up front instead (matching
+	// every other opcode's own decode cost), then wait in 4-cycle steps
+	// only for as long as the condition is still false, resuming exactly
+	// on the boundary where it becomes true with no extra delay tacked
+	// on. Confirmed via Mooneye's halt_ime1_timing2-GS.gb, which checks
+	// HALT's total elapsed time against a NOP-based wait down to the
+	// exact DIV value afterward.
+	cycleLength(4);
 	while (!(IFLAG & IER)) {
 		cycleLength(4);
 	}
-	cycleLength(4);
 }// 76 HALT
 
 void OP77(void){ // case  0x77:
