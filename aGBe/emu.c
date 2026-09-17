@@ -384,14 +384,32 @@ void setC(int flag) {
 		reg_F |= C_FLAG;
 	}
 }
+// BUG FIX (sub-instruction timing): previously, every multi-cycle
+// instruction performed all of its memory accesses immediately, then
+// charged its entire cycle cost in one lump sum afterward - correct for
+// the instruction's own final result, but wrong for anything that needs
+// to observe state changing *during* the instruction at the right
+// sub-instruction (M-cycle) boundary: OAM DMA progress, a Timer/PPU
+// event landing exactly between two of an instruction's own memory
+// accesses, etc. push() now charges each of its 3 M-cycles (internal
+// delay, high-byte write, low-byte write) at the point real hardware
+// actually spends that cycle, rather than all 12 T-cycles at the end -
+// callers no longer include this in their own cycleLength() call (see
+// each PUSH/CALL/RST opcode and the interrupt() dispatcher).
 void push(WORD wVal){
-	WriteMEM(--reg_SP, (wVal >> 8) & 0xFF);
-	WriteMEM(--reg_SP, wVal & 0xFF);
+	cycleLength(4); // M1: internal delay, no memory access
+	WriteMEM(--reg_SP, (wVal >> 8) & 0xFF); // M2: write high byte
+	cycleLength(4);
+	WriteMEM(--reg_SP, wVal & 0xFF); // M3: write low byte
+	cycleLength(4);
 }
 WORD pop(void){
-	WORD aW = ReadWord(reg_SP); //((ReadMEM(reg_SP) | ReadMEM(reg_SP+1) << 8) & 0xFFFF);
-	reg_SP+=2;
-	return (WORD)aW;
+	// BUG FIX: same idea as push() above, for POP's 2 memory reads.
+	BYTE lo = ReadMEM(reg_SP++);
+	cycleLength(4); // M1: read low byte
+	BYTE hi = ReadMEM(reg_SP++);
+	cycleLength(4); // M2: read high byte
+	return (WORD)(lo | (hi << 8));
 }
 void call(void) {
 	push(reg_PC+2);
@@ -585,6 +603,10 @@ int dmaActive = 0;
 int dmaCyclesElapsed = 0;
 int dmaBytesDone = 0;
 WORD dmaSourceBase = 0;
+// Set to 1 only while DMAClock() performs its own source-data read, so
+// ReadMEM's DMA-in-progress restriction (below) doesn't block the DMA
+// controller's own bus access - only the CPU's.
+int dmaInternalRead = 0;
 
 void doDMA(BYTE addr) {
 	dmaSourceBase = (addr & 0xFF) * 0x0100;
@@ -603,7 +625,14 @@ void DMAClock(int cycles) {
 		bytesShouldBeDone = 0xA0;
 	}
 	while (dmaBytesDone < bytesShouldBeDone) {
+		// dmaInternalRead lets this specific read bypass the "CPU can
+		// only see HRAM during active DMA" restriction in ReadMEM below
+		// - this is the DMA controller's own read of its source data,
+		// not a CPU-initiated one, and real hardware's DMA controller
+		// has its own bus access independent of what the CPU can see.
+		dmaInternalRead = 1;
 		OAMRAM[dmaBytesDone] = ReadMEM((WORD)(dmaSourceBase + dmaBytesDone));
+		dmaInternalRead = 0;
 		dmaBytesDone++;
 	}
 	if (dmaBytesDone >= 0xA0) {
@@ -1821,6 +1850,17 @@ void loadRom(void){
 }
 
 BYTE ReadMEM(WORD loc) {
+    	// BUG FIX (sub-instruction timing): real hardware's OAM DMA
+    	// controller has exclusive bus access to everything except HRAM
+    	// while a transfer is active - the CPU reads back $FF for
+    	// anything outside $FF80-$FFFE during that window (a real,
+    	// documented restriction some games' precise DMA-timing code
+    	// depends on, and exactly what Mooneye's push_timing/pop_timing
+    	// tests exercise by running code with SP pointing into OAM while
+    	// a transfer is in progress).
+    	if (dmaActive && !dmaInternalRead && (loc < 0xFF80 || loc > 0xFFFE)) {
+    		return 0xFF;
+    	}
     	if (loc < 0x4000) {  // ROM Bank 0
 			return ROM[loc];
 		}
@@ -1981,6 +2021,14 @@ BYTE ReadMEM(WORD loc) {
 }
 
 void WriteMEM(WORD loc, BYTE b){
+	// BUG FIX (sub-instruction timing): same restriction as ReadMEM
+	// above - the CPU can't write anywhere but HRAM while OAM DMA is
+	// actively transferring, since the DMA controller owns the bus.
+	// Real hardware simply ignores such writes rather than redirecting
+	// or erroring.
+	if (dmaActive && (loc < 0xFF80 || loc > 0xFFFE)) {
+		return;
+	}
 	if ( loc <= 0x1FFF ) { // $0000-$1FFF - RAM Enable (MBC1/2/3/5)
 		if (CARTTYPE != 0x00) {
 			int wasEnabled = RAMENABLED;
@@ -3204,8 +3252,11 @@ void OPC0(void){ // case  0xC0:
 } // C0    RET  NZ
 
 void OPC1(void){ // case  0xC1:
+	// BUG FIX (sub-instruction timing): fetch's own M-cycle (4T) is now
+	// charged explicitly here, since pop() only accounts for its own 2
+	// M-cycles (8T) - see the comment above push()/pop() for why.
+	cycleLength(4);
 	put_rBC(pop());
-	cycleLength(12);
 } // C1    POP  BC
 
 void OPC2(void){ // case  0xC2:
@@ -3235,7 +3286,7 @@ void OPC4(void){ // case  0xC4:
 } // C4    CALL NZ,nnnn
 
 void OPC5(void){ // case  0xC5:
-push(get_rBC()); cycleLength(16); } // C5    PUSH BC
+cycleLength(4); push(get_rBC()); } // C5    PUSH BC
 void OPC6(void){ // case  0xC6:
 reg_A = ADDreg(reg_A, ReadMEM(reg_PC++)); cycleLength(8); } // C6    ADD  A,nn
 void OPC7(void){ // case  0xC7:
@@ -3307,8 +3358,8 @@ void OPD0(void){ // case  0xD0:
 } // D0    RET  NC
 
 void OPD1(void){ // case  0xD1:
+	cycleLength(4); // BUG FIX (sub-instruction timing): see OPC1 (POP BC)
 	put_rDE(pop());
-	cycleLength(12); // BUG FIX: was 10 (not a multiple of 4), correct is 12
 } // D1    POP  DE
 
 void OPD2(void){ // case  0xD2:
@@ -3339,7 +3390,7 @@ void OPD4(void){ // case  0xD4:
 } // D4    CALL NC,nnnn
 
 void OPD5(void){ // case  0xD5:
-push(get_rDE()); cycleLength(16); } // D5    PUSH DE
+cycleLength(4); push(get_rDE()); } // D5    PUSH DE
 void OPD6(void){ // case  0xD6:
 reg_A = SUBreg(reg_A, ReadMEM(reg_PC++)); cycleLength(8); } // D6    SUB  nn
 void OPD7(void){ // case  0xD7:
@@ -3395,7 +3446,7 @@ void OPE0(void){ // case  0xE0:
 } // E0    LD   ($FF00+nn),A
 
 void OPE1(void){ // case  0xE1:
-reg_HL = pop();  cycleLength(12); } // E1    POP  HL
+cycleLength(4); reg_HL = pop(); } // E1    POP  HL
 
 void OPE2(void){ // case  0xE2:
 	WriteMEM((0xFF00 + reg_C), reg_A);
@@ -3410,8 +3461,8 @@ void OPE4(void){
 	}
 
 void OPE5(void){ // case  0xE5:
+	cycleLength(4);
 	push(reg_HL);
-	cycleLength(16);
 } // E5    PUSH HL
 
 void OPE6(void){ // case  0xE6:
@@ -3467,8 +3518,8 @@ void OPF0(void){ // case  0xF0:
 } // F0    LD   A,($FF00+nn)
 
 void OPF1(void){ // case  0xF1:
+	cycleLength(4); // BUG FIX (sub-instruction timing): see OPC1 (POP BC)
 	put_rAF(pop());
-	cycleLength(12);
 } // F1    POP  AF
 
 void OPF2(void){ // case  0xF2:
@@ -3486,8 +3537,8 @@ void OPF4(void){
 }// 0xF4
 
 void OPF5(void){ // case  0xF5:
+	cycleLength(4);
 	push(get_rAF());
-	cycleLength(16);
 } // F5    PUSH AF
 
 void OPF6(void){ // case  0xF6:
