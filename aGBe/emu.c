@@ -432,12 +432,24 @@ void interrupt(void){
 		// notion of elapsed time to drift further from real hardware the
 		// longer a program ran, throwing off anything that reads LY/timers
 		// expecting them to line up with a specific instruction.
+		//
+		// BUG FIX (sub-instruction timing): rst() calls push(), which as
+		// of a later commit charges its own 3 M-cycles (1 idle + 2
+		// writes = 12T) progressively rather than all at once - this
+		// function used to *also* charge the full 20T total afterward,
+		// double-counting those 12T and making every interrupt dispatch
+		// take 32T instead of 20T. Real hardware's 5 M-cycles break down
+		// as idle, idle, write-hi, write-lo, set-PC - push() now
+		// supplies the middle 3 (idle + both writes), so this only needs
+		// to charge the first idle cycle (before) and the final PC-set
+		// cycle (after) explicitly: 4 + 12 + 4 = 20.
+		cycleLength(4);
 		if 		  (IFLAG & IER & 0x01) 	      { IFLAG &= ~0x01; IME = 0; reg_PC = rst(0x0040); }  // Bit 0: V-Blank
 		else if (((IFLAG & IER) >> 1) & 0x01) { IFLAG &= ~0x02; IME = 0; reg_PC = rst(0x0048); } //  Bit 1: LCD
 		else if (((IFLAG & IER) >> 2) & 0x01) { IFLAG &= ~0x04; IME = 0; reg_PC = rst(0x0050); } //  Bit 2: Timer Overflow
 		else if (((IFLAG & IER) >> 3) & 0x01) { IFLAG &= ~0x08; IME = 0; reg_PC = rst(0x0058); } //  Bit 3: Serial I/O transfer end
 		else if (((IFLAG & IER) >> 4) & 0x01) { IFLAG &= ~0x10; IME = 0; reg_PC = rst(0x0060); } //  Bit 4: New Value on Selected Joypad Keyline(s)
-		cycleLength(20);
+		cycleLength(4);
 	}
 }
 
