@@ -401,6 +401,11 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   already set up at `/home/claude/mooneye-test-suite` (WLA-DX at
   `/home/claude/wla-dx/build/binaries`) for whoever picks this up.
 
+  (This list reflects the original discovery, at 11/67 passing. See
+  below for the fixes made since - `push_timing`, `oam_dma_restart`,
+  `oam_dma_timing`, and `rst_timing` have since been removed from the
+  failing list, at 14/67 passing as of the latest commit.)
+
   One isolated piece already fixed along the way: OAM DMA previously
   completed all 160 bytes instantly, for free, with zero cycle cost -
   real hardware takes 640 T-cycles (one byte per M-cycle). Now properly
@@ -415,13 +420,9 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   progressively (matching real hardware's actual per-cycle timing)
   instead of one lump sum at the end, and every PUSH/POP opcode updated
   to match; CPU memory access is now correctly restricted to HRAM-only
-  while OAM DMA is active. Neither gets `push_timing`/`pop_timing`
-  passing - traced both tests' source and found they check a *specific,
-  documented transition point* ("OAM is accessible at M=2") rather than
-  "OAM stays blocked for DMA's entire duration," meaning real hardware's
-  OAM-DMA bus arbitration is more nuanced than this project's current
-  blanket restriction - not something to guess at and encode as a real
-  hardware behavior claim without being sure of it.
+  while OAM DMA is active (except `$FF46` itself, the DMA trigger
+  register, which real hardware never blocks even mid-transfer, since
+  that's how a game re-triggers the next one).
 
   **Important lesson learned the hard way**: the progressive push()/
   pop() change broke two previously-passing tests (`intr_timing`,
@@ -431,20 +432,45 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   internal charges. `cpu_instrs` and Mooneye's `mbc1`/`mbc5` suites
   alone did **not** catch this - only re-running the full `acceptance/
   ppu`+`timer`+`interrupts`+top-level suite and diffing the exact
-  before/after pass lists (not just the totals) surfaced it. Now fixed
-  and re-verified back to the original 11/67 baseline. Anyone
-  continuing this effort should treat that full-suite diff as a
-  mandatory regression check after every change, not cpu_instrs/mbc1/
-  mbc5 alone.
+  before/after pass lists (not just the totals) surfaced it. Fixed and
+  re-verified.
+
+  Continuing from there: found and fixed DMA's own *start* timing too
+  (it began counting its 640T budget immediately when triggered, mid-
+  instruction, rather than only after the triggering instruction
+  actually finished - costing every transfer 12T it shouldn't have
+  had). This alone was a real, safe win: **11/67 → 14/67** on the full
+  suite (`push_timing` passing, plus `oam_dma_restart`, `oam_dma_timing`,
+  and `rst_timing` as knock-on wins from the same fix).
+
+  Chasing `push_timing`'s second scenario further led to a matching fix
+  for DMA's *end* timing (keeping OAM blocked through the exact M-cycle
+  DMA's last byte completes, not just up to it) - traced directly
+  against the test's own source and confirmed by register tracing that
+  it made `push_timing` pass completely. **This one turned out to be a
+  real regression**: the full regression sweep (now run after every
+  change, per the lesson above) caught Pokemon Red hanging indefinitely
+  and rendering solid black instead of its title screen. Bisected to
+  this exact change and confirmed via the project's own pre-existing
+  baseline build that it was new. Real game compatibility outweighs
+  passing one additional synthetic test - fully reverted; `push_timing`
+  is back to failing, but the safe start-timing fix and its 3 knock-on
+  passes are kept. Second lesson reinforced: matching a test's own
+  documented intent exactly is not the same claim as "safe for real
+  games," and the full sweep - real ROMs included, not just the Mooneye
+  suites - is what actually proves the difference.
 
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
-   large, newly-discovered, real gap.** 56 of 67 Mooneye acceptance/
-   ppu+timer+interrupts tests fail, most for reasons unrelated to the
-   already-known boot-ROM limitation. Comparable in scope to the GBC-
-   support or sound-implementation efforts this session - a dedicated
-   pass, not a quick fix.
+   large, real gap, though real progress has been made.** Currently
+   14 of 67 Mooneye acceptance/ppu+timer+interrupts tests pass (up
+   from an initial 11), most of the remaining failures for reasons
+   unrelated to the already-known boot-ROM limitation. Comparable in
+   scope to the GBC-support or sound-implementation efforts this
+   session - a dedicated pass, not a quick fix, and one where every
+   change needs the full regression sweep (see above) before being
+   trusted.
 2. **Kirby's Pinball Land hang (see above) — real, unresolved, deeply
    investigated but not fixed.** A genuine MBC2-cartridge compatibility
    issue on the one MBC2 game tested so far. A real PPU frame-timing
