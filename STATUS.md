@@ -401,6 +401,16 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   already set up at `/home/claude/mooneye-test-suite` (WLA-DX at
   `/home/claude/wla-dx/build/binaries`) for whoever picks this up.
 
+  One isolated piece already fixed along the way: OAM DMA previously
+  completed all 160 bytes instantly, for free, with zero cycle cost -
+  real hardware takes 640 T-cycles (one byte per M-cycle). Now properly
+  cycle-stepped via a new `DMAClock()`. Confirmed via direct trace of
+  `oam_dma_start.s` that this alone isn't enough to pass `oam_dma_*`
+  (they check OAM contents at precise M-cycle checkpoints against
+  concurrently-executing HRAM code, which needs the same sub-
+  instruction timing model as everything else in this section) - but
+  it's a real, independent correctness improvement on its own terms.
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
