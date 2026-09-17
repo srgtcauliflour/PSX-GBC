@@ -3290,8 +3290,9 @@ void OPBF(void){ // case  0xBF:
 CPreg(reg_A,reg_A); cycleLength(4); } // BF    CP   A
 void OPC0(void){ // case  0xC0:
 	if (!getZ()) {
+		cycleLength(8); // BUG FIX (sub-instruction timing): fetch + condition check M-cycles
 		reg_PC = ret();
-		cycleLength(20);
+		cycleLength(4); // final M-cycle (set PC)
 	} else {
 		cycleLength(8);
 	}
@@ -3346,16 +3347,23 @@ cycleLength(4); reg_PC = rst(0x0000); } // C7    RST  00H
 
 void OPC8(void){ // case  0xC8:
 	if (getZ()) {
+		cycleLength(8); // BUG FIX (sub-instruction timing): fetch + condition check M-cycles
 		reg_PC = ret();
-		cycleLength(20);
+		cycleLength(4); // final M-cycle (set PC)
 	} else {
 		cycleLength(8);
 	}
 } // C8    RET  Z
 
 void OPC9(void){ // case  0xC9:
+	// BUG FIX (sub-instruction timing): pop() (via ret()) now charges its
+	// own 8T progressively; this used to *also* charge the full 16T
+	// afterward, double-counting (24T instead of the correct 16T). Real
+	// RET is 4 M-cycles: fetch, read PC-lo, read PC-hi, then an internal
+	// delay to actually set PC - pop() supplies the middle 2 (the reads).
+	cycleLength(4); // M1: fetch
 	reg_PC = ret();
-	cycleLength(16);
+	cycleLength(4); // M4: internal delay (set PC)
 } // C9    RET
 
 void OPCA(void){ // case  0xCA:
@@ -3418,8 +3426,9 @@ cycleLength(4); reg_PC = rst(0x0008); } // CF    RST  8
 
 void OPD0(void){ // case  0xD0:
 	if (getC() != 1) {
+		cycleLength(8); // BUG FIX (sub-instruction timing): fetch + condition check M-cycles
 		reg_PC = ret();
-		cycleLength(20);
+		cycleLength(4); // final M-cycle (set PC)
 	} else {
 		cycleLength(8);
 	}
@@ -3469,14 +3478,19 @@ void OPD7(void){ // case  0xD7:
 cycleLength(4); reg_PC = rst(0x0010); } // D7    RST  10H
 void OPD8(void){ // case  0xD8:
 	if (getC() != 0) {
+		cycleLength(8); // BUG FIX (sub-instruction timing): fetch + condition check M-cycles
 		reg_PC = ret();
-		cycleLength(20);
+		cycleLength(4); // final M-cycle (set PC)
 	} else {
 		cycleLength(8);
 	}
 }// D8    RET  C
 void OPD9(void){ // case  0xD9:
-reg_PC = ret(); IME = 1; cycleLength(16); } // D9    RETI
+// BUG FIX (sub-instruction timing): same fix and reasoning as OPC9 (RET) -
+// IME=1 still happens in the same relative position (right after ret()'s
+// own reads, before the final delay cycle) as before, preserving the
+// timing reti_intr_timing.gb already depends on.
+cycleLength(4); reg_PC = ret(); IME = 1; cycleLength(4); } // D9    RETI
 void OPDA(void){ // case  0xDA:
 	if (getC() != 0) {
 		reg_PC = jp(ReadWord(reg_PC));
