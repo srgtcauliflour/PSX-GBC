@@ -484,6 +484,18 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   especially, given how heavily real games use CALL) re-verified
   correct throughout.
 
+  Finished the same fix for `RET`/`RETI` (unconditional RET was 24T
+  instead of 16T, conditional RET cc taken was 28T instead of 20T,
+  RETI matched unconditional RET) - took particular care verifying
+  `reti_intr_timing.gb`, `intr_timing.gb`, and `halt_ime0_nointr_
+  timing.gb` immediately after, since RETI's own IME-enable timing is
+  exactly what those tests check, and confirmed all three still pass.
+  Still 13/67 overall - `ret_timing`/`ret_cc_timing`/`reti_timing`
+  fail for the identical underlying reason as `call_timing`/
+  `rst_timing` (not a regression, already failing beforehand). PUSH,
+  POP, CALL, RST, RET, and RETI are now all consistently fixed to
+  their correct real-hardware total cycle counts.
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
