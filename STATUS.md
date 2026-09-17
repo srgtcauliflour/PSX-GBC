@@ -411,6 +411,32 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   instruction timing model as everything else in this section) - but
   it's a real, independent correctness improvement on its own terms.
 
+  Two more pieces attempted: `push()`/`pop()` now charge their M-cycles
+  progressively (matching real hardware's actual per-cycle timing)
+  instead of one lump sum at the end, and every PUSH/POP opcode updated
+  to match; CPU memory access is now correctly restricted to HRAM-only
+  while OAM DMA is active. Neither gets `push_timing`/`pop_timing`
+  passing - traced both tests' source and found they check a *specific,
+  documented transition point* ("OAM is accessible at M=2") rather than
+  "OAM stays blocked for DMA's entire duration," meaning real hardware's
+  OAM-DMA bus arbitration is more nuanced than this project's current
+  blanket restriction - not something to guess at and encode as a real
+  hardware behavior claim without being sure of it.
+
+  **Important lesson learned the hard way**: the progressive push()/
+  pop() change broke two previously-passing tests (`intr_timing`,
+  `halt_ime0_nointr_timing`) by double-charging interrupt dispatch's
+  cycle cost - `interrupt()` also calls `push()` (via `rst()`) and still
+  had its own full lump-sum charge afterward, on top of push()'s new
+  internal charges. `cpu_instrs` and Mooneye's `mbc1`/`mbc5` suites
+  alone did **not** catch this - only re-running the full `acceptance/
+  ppu`+`timer`+`interrupts`+top-level suite and diffing the exact
+  before/after pass lists (not just the totals) surfaced it. Now fixed
+  and re-verified back to the original 11/67 baseline. Anyone
+  continuing this effort should treat that full-suite diff as a
+  mandatory regression check after every change, not cpu_instrs/mbc1/
+  mbc5 alone.
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
