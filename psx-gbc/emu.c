@@ -121,6 +121,37 @@ int TIMECNT;
 // to 0 immediately on overflow, then to TMA once this reaches 0), so
 // the $FF05 read handler needs no changes of its own.
 int timaReloadPending = 0;
+
+// Real hardware bit positions of the 16-bit internal counter each TAC
+// clock-select value watches for a falling edge (Pan Docs "Timer
+// Obscure Behaviour") - indexed by TAC bits 1-0. These exactly match
+// this project's existing MAXTIME periods (1024/16/64/256 T-cycles),
+// since a bit at position N has a full toggle period of 2^(N+1).
+static const int TIMER_BIT_POS[4] = {9, 3, 5, 7};
+
+// Checks the current watched-bit-AND-enabled value against the last
+// one seen (TIMER_BIT_ANDED) and increments TIMA on a falling edge -
+// call this any time either input could have changed: every T-cycle as
+// internalDivCounter16 advances, and immediately after any DIV or TAC
+// write (both of which can themselves cause a falling edge, which is
+// the whole point of this real hardware quirk - see the comment above
+// internalDivCounter16's declaration).
+extern int internalDivCounter16;
+extern int TIMER_BIT_ANDED;
+void CheckTimerEdge(void) {
+	int bitPos = TIMER_BIT_POS[TIMCONT & 0x03];
+	int enabled = (TIMCONT >> 2) & 0x01;
+	int currentBit = ((internalDivCounter16 >> bitPos) & 0x01) & enabled;
+	if (TIMER_BIT_ANDED == 1 && currentBit == 0) {
+		TIMECNT += 1;
+		if (TIMECNT > 255) {
+			IFLAG |= 0x04;
+			TIMECNT = 0;
+			timaReloadPending = 4;
+		}
+	}
+	TIMER_BIT_ANDED = currentBit;
+}
 int MAXTIME, TIMECOUNTER;
 
 // ---- GBC (Game Boy Color) support ----------------------------------
@@ -194,6 +225,23 @@ int RAM_DIRTY = 0; // Set on any cart RAM write; cleared once a save completes.
 // (or whatever garbage the stub happened to return) DIV can cause
 // spurious failures far removed from anything DIV-related on its face.
 int DIVCOUNTER = 0;
+// Real hardware quirk (Mooneye's div_write.gb/rapid_toggle.gb document
+// this precisely): DIV and TIMA are actually driven by the same single,
+// free-running 16-bit hardware counter - DIV is just that counter's
+// upper 8 bits, and the timer increments on a falling edge of one
+// specific bit of it (which bit depends on TAC's clock-select field),
+// ANDed with the timer's own enable bit. Writing DIV resets the whole
+// 16-bit counter to 0, and disabling the timer (or, on real hardware,
+// changing which bit is watched) can each cause a *spurious* extra
+// timer increment if the watched-bit-AND-enabled value happens to be 1
+// right before the change, since that's a 1->0 transition too. This
+// project's DIVCOUNTER/MAXTIME pair above is a simpler, independent
+// model that doesn't reproduce any of this - internalDivCounter16 is
+// the real, unified counter needed to do so; TIMER_BIT_ANDED tracks the
+// last computed watched-bit-AND-enabled value so a falling edge can
+// actually be detected when either input changes.
+int internalDivCounter16 = 0;
+int TIMER_BIT_ANDED = 0;
 int FRAMECOUNT = 0; // Incremented once per vblank(); used by debug tracing below.
 BYTE DIVREG = 0;
 BYTE SERIALDATA = 0xFF;   // $FF01 SB - Serial transfer data
@@ -952,43 +1000,30 @@ void cycleLength(int cycle) {
 	// actual elapsed cycles between two events empirically, rather than
 	// assuming they match a textbook constant.
 	g_totalSysCycles += sysCycle;
-	DIVCOUNTER += sysCycle;
-	while (DIVCOUNTER >= 256) {
-		DIVCOUNTER -= 256;
-		DIVREG++; // wraps naturally as a BYTE
-	}
-	if ((TIMCONT >> 2) & 0x01){
-		TIMECOUNTER += sysCycle;
-		// Process any already-pending reload delay using this call's
-		// cycles *before* checking for a new overflow below - otherwise
-		// an overflow detected in this same call would have its fresh
-		// 4-cycle countdown immediately consumed by this same sysCycle,
-		// collapsing the "reads as 0" window to zero real cycles.
+	// BUG FIX (real hardware DIV/TIMA coupling): replaced the previous
+	// independent DIVCOUNTER/TIMECOUNTER pair with the real, unified
+	// 16-bit hardware counter model - see internalDivCounter16's
+	// declaration comment for the full explanation of why (div_write.gb/
+	// rapid_toggle.gb both specifically test the falling-edge behavior
+	// this enables). Iterated one T-cycle at a time rather than in a
+	// single bulk step: sysCycle is always small (at most ~24), and
+	// per-T-cycle precision avoids any risk of a multi-cycle jump
+	// mis-detecting (or double-detecting) an edge, or of the reload-
+	// delay countdown being collapsed the way an earlier, coarser
+	// attempt at that fix was (see timaReloadPending's own history).
+	int divTick;
+	for (divTick = 0; divTick < sysCycle; divTick++) {
+		internalDivCounter16 = (internalDivCounter16 + 1) & 0xFFFF;
+		CheckTimerEdge();
 		if (timaReloadPending > 0) {
-			timaReloadPending -= sysCycle;
+			timaReloadPending -= 1;
 			if (timaReloadPending <= 0) {
 				timaReloadPending = 0;
 				TIMECNT = TIMEMOD;
 			}
 		}
-		if (TIMECOUNTER >= MAXTIME){
-			TIMECOUNTER = 0;
-			TIMECNT += 1;
-
-			if (TIMECNT > 255) {
-				IFLAG |= 0x04;
-				// BUG FIX: TIMA doesn't reload to TMA immediately on
-				// overflow - real hardware shows $00 for exactly 4
-				// T-cycles first (see timaReloadPending's declaration
-				// comment above for the full explanation).
-				TIMECNT = 0;
-				timaReloadPending = 4;
-				#if defined(DEBUG)
-				printf("Timer Interrupt!\n");
-				#endif
-			}
-		}
 	}
+	DIVREG = (BYTE)(internalDivCounter16 >> 8);
 	APUClock(sysCycle);
 	AudioSampleHook(sysCycle);
 	DMAClock(sysCycle);
@@ -2299,20 +2334,37 @@ void WriteMEM(WORD loc, BYTE b){
 					break;
 			case 0xFF01: SERIALDATA = b; break; // Serial transfer data (R/W)
 			case 0xFF02: SERIALCONTROL = b; onSerialControlWrite(); break; // SIO control (R/W)
-			case 0xFF04: DIVREG = 0; DIVCOUNTER = 0; break; // Any write resets the divider to 0
+			case 0xFF04:
+				// BUG FIX: any write resets the real, unified 16-bit
+				// counter to 0 (not just the visible DIVREG byte) - and
+				// since resetting it can itself cause the watched timer
+				// bit to fall from 1 to 0, that's a real falling edge
+				// too, checked immediately rather than only on the next
+				// natural tick (this is exactly what div_write.gb tests:
+				// repeatedly resetting DIV while the timer runs can
+				// trigger real, if easy to miss, spurious TIMA
+				// increments this way).
+				internalDivCounter16 = 0;
+				DIVREG = 0;
+				DIVCOUNTER = 0;
+				CheckTimerEdge();
+				break;
 			case 0xFF05: TIMECNT = b; break; // Timer counter (R/W)
 			case 0xFF06: TIMEMOD = b; break; // Timer Modulo (R/W)
 			case 0xFF07: TIMCONT = b;
-							//set Timer rate
-							if ((TIMCONT & 0x3) == 0) {
-								MAXTIME = 1024;
-							} else if ((TIMCONT & 0x3) == 1) {
-								MAXTIME = 16;
-							} else if ((TIMCONT & 0x3) == 2) {
-								MAXTIME = 64;
-							} else if ((TIMCONT & 0x3) == 3) {
-								MAXTIME = 256;
-							}
+							// BUG FIX: MAXTIME (the old, independent timer-period
+							// model) is no longer used - the real, unified-counter
+							// model (see CheckTimerEdge()) derives the watched bit
+							// directly from TIMCONT itself. Checking for an edge
+							// immediately with the new TIMCONT value (against the
+							// counter's current, unchanged state) catches the real
+							// hardware quirk where changing the enable bit (or,
+							// less commonly tested, the clock-select bits) can
+							// itself be a falling edge if the watched-bit-AND-
+							// enabled value was 1 right before the write - exactly
+							// what rapid_toggle.gb exercises by rapidly enabling/
+							// disabling the timer.
+							CheckTimerEdge();
 							break; // Timer Control
 			case 0xFF0F: IFLAG = b; break; // Interrupt Flag (R/W)
 
