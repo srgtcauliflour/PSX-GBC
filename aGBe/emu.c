@@ -620,15 +620,35 @@ WORD dmaSourceBase = 0;
 // controller's own bus access - only the CPU's.
 int dmaInternalRead = 0;
 
+// BUG FIX (sub-instruction timing): doDMA() is called from inside
+// WriteMEM, itself called from inside the triggering LDH (n),A
+// instruction's own implementation - *before* that instruction's own
+// cycleLength(12) call at its end. Immediately starting DMA's cycle
+// count right there effectively let the triggering instruction's own
+// remaining 12T count as DMA-elapsed time too, finishing the transfer
+// 12T earlier than real hardware (where DMA only starts advancing once
+// the triggering instruction has actually finished). dmaPendingStart
+// makes DMAClock() consume exactly one cycleLength() call's worth of
+// cycles (the remainder of the triggering instruction) before DMA
+// actually starts counting toward its own 640T budget.
+int dmaPendingStart = 0;
 void doDMA(BYTE addr) {
 	dmaSourceBase = (addr & 0xFF) * 0x0100;
 	dmaCyclesElapsed = 0;
 	dmaBytesDone = 0;
 	dmaActive = 1;
+	dmaPendingStart = 1;
 }
 
 void DMAClock(int cycles) {
 	if (!dmaActive) {
+		return;
+	}
+	if (dmaPendingStart) {
+		// Consume this call's cycles as the remainder of the triggering
+		// instruction, not as DMA-elapsed time - see the comment above
+		// doDMA().
+		dmaPendingStart = 0;
 		return;
 	}
 	dmaCyclesElapsed += cycles;
@@ -2037,8 +2057,16 @@ void WriteMEM(WORD loc, BYTE b){
 	// above - the CPU can't write anywhere but HRAM while OAM DMA is
 	// actively transferring, since the DMA controller owns the bus.
 	// Real hardware simply ignores such writes rather than redirecting
-	// or erroring.
-	if (dmaActive && (loc < 0xFF80 || loc > 0xFFFE)) {
+	// or erroring. $FF46 itself (the DMA trigger register) is always
+	// writable regardless - it has to be, since that's how a game
+	// re-triggers the very next transfer, typically once per frame,
+	// and real hardware never blocks this register's own trigger.
+	// (Investigated as a candidate cause for a real Pokemon Red
+	// regression during this same work - it turned out not to be the
+	// actual cause that time, but keeping the exception regardless
+	// since it's independently correct real-hardware behavior either
+	// way.)
+	if (dmaActive && loc != 0xFF46 && (loc < 0xFF80 || loc > 0xFFFE)) {
 		return;
 	}
 	if ( loc <= 0x1FFF ) { // $0000-$1FFF - RAM Enable (MBC1/2/3/5)

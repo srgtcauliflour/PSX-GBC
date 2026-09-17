@@ -325,8 +325,8 @@ int main(int argc, char **argv) {
         lastPC = reg_PC;
 
         if (getenv("TRACE") && (i % 500000 == 0)) {
-            fprintf(stderr, "[trace] i=%ld PC=%04X SP=%04X A=%02X op=%02X IME=%d IE=%02X IF=%02X LY=%02X\n",
-                    i, reg_PC, reg_SP, reg_A, ReadMEM(reg_PC), IME, IER, IFLAG, LCDY);
+            fprintf(stderr, "[trace] i=%ld PC=%04X SP=%04X A=%02X op=%02X IME=%d IE=%02X IF=%02X LY=%02X dmaActive=%d dmaBytesDone=%d\n",
+                    i, reg_PC, reg_SP, reg_A, ReadMEM(reg_PC), IME, IER, IFLAG, LCDY, dmaActive, dmaBytesDone);
         }
 
         instructions[ReadMEM(reg_PC++)]();

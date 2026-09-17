@@ -47,6 +47,9 @@ extern BYTE BGPAL, OBJPAL0, OBJPAL1;
 extern int FRAMECOUNT;
 extern int RAM_DIRTY;
 extern int EI_PENDING;
+extern int dmaActive;
+extern int dmaBytesDone;
+extern int dmaCyclesElapsed;
 
 // APU (sound) state - see the APUChannel struct and channel globals in
 // emu.c for the full field list; declared here so psx.c's UpdateAudio()
