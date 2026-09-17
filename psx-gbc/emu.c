@@ -501,17 +501,45 @@ void interrupt(void){
 		// function used to *also* charge the full 20T total afterward,
 		// double-counting those 12T and making every interrupt dispatch
 		// take 32T instead of 20T. Real hardware's 5 M-cycles break down
-		// as idle, idle, write-hi, write-lo, set-PC - push() now
-		// supplies the middle 3 (idle + both writes), so this only needs
-		// to charge the first idle cycle (before) and the final PC-set
-		// cycle (after) explicitly: 4 + 12 + 4 = 20.
+		// as idle, idle, write-hi, write-lo, set-PC.
+		//
+		// BUG FIX (sub-instruction timing, Mooneye's ie_push.gb): this used
+		// to push PC via the generic push()/rst() helpers and pick the
+		// vector from IF/IE as evaluated *before* the push started. Real
+		// hardware re-reads IF & IE for real, live memory locations at
+		// each of the two push writes - so if SP happens to alias $FFFF
+		// (IE) or $FF0F (IF), a game deliberately doing that (a real,
+		// documented hardware quirk, not just a Mooneye curiosity) can
+		// have the write to IE/IF itself change or even cancel which
+		// interrupt actually gets serviced. The precise rule, confirmed
+		// against all 4 of ie_push.gb's rounds by hand: the write of PC's
+		// *high* byte (SP-1) happens before the vector is chosen, so it
+		// can still affect the outcome; the *low* byte write (SP-2)
+		// happens after, so it's always too late to change this
+		// dispatch (though the write itself still lands normally). If no
+		// enabled+pending interrupt remains once the vector is chosen,
+		// the dispatch is cancelled: PC is set to $0000 instead of any
+		// vector, and no IF bit is cleared - but IME is still cleared
+		// either way, since real hardware commits to that the moment
+		// dispatch begins, independent of the outcome.
+		WORD returnAddr = reg_PC;
+		IME = 0;
+		cycleLength(4); // M1: idle
+		cycleLength(4); // M2: idle
+		WriteMEM(--reg_SP, (returnAddr >> 8) & 0xFF); // M3: write PC high byte
 		cycleLength(4);
-		if 		  (IFLAG & IER & 0x01) 	      { IFLAG &= ~0x01; IME = 0; reg_PC = rst(0x0040); }  // Bit 0: V-Blank
-		else if (((IFLAG & IER) >> 1) & 0x01) { IFLAG &= ~0x02; IME = 0; reg_PC = rst(0x0048); } //  Bit 1: LCD
-		else if (((IFLAG & IER) >> 2) & 0x01) { IFLAG &= ~0x04; IME = 0; reg_PC = rst(0x0050); } //  Bit 2: Timer Overflow
-		else if (((IFLAG & IER) >> 3) & 0x01) { IFLAG &= ~0x08; IME = 0; reg_PC = rst(0x0058); } //  Bit 3: Serial I/O transfer end
-		else if (((IFLAG & IER) >> 4) & 0x01) { IFLAG &= ~0x10; IME = 0; reg_PC = rst(0x0060); } //  Bit 4: New Value on Selected Joypad Keyline(s)
+		int pending = IFLAG & IER;
+		WORD vector;
+		if 		  (pending & 0x01) { IFLAG &= ~0x01; vector = 0x0040; } // Bit 0: V-Blank
+		else if (pending & 0x02) { IFLAG &= ~0x02; vector = 0x0048; } //  Bit 1: LCD
+		else if (pending & 0x04) { IFLAG &= ~0x04; vector = 0x0050; } //  Bit 2: Timer Overflow
+		else if (pending & 0x08) { IFLAG &= ~0x08; vector = 0x0058; } //  Bit 3: Serial I/O transfer end
+		else if (pending & 0x10) { IFLAG &= ~0x10; vector = 0x0060; } //  Bit 4: New Value on Selected Joypad Keyline(s)
+		else 					  { vector = 0x0000; } // cancelled: nothing left enabled+pending
+		WriteMEM(--reg_SP, returnAddr & 0xFF); // M4: write PC low byte
 		cycleLength(4);
+		reg_PC = vector;
+		cycleLength(4); // M5: idle, set PC
 	}
 }
 
