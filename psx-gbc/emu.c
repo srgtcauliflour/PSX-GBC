@@ -3704,7 +3704,15 @@ void OPF2(void){ // case  0xF2:
 }// F2    LD   A,(C)
 
 void OPF3(void){ // case  0xF3:
+	// BUG FIX: DI must also cancel a still-pending EI delay, not just
+	// clear IME - otherwise a DI executed one instruction after EI (before
+	// EI_PENDING's countdown reaches 0) doesn't actually prevent EI's
+	// effect from landing a moment later. Real hardware's DI is
+	// immediate and unconditional (Mooneye's rapid_di_ei.gb tests
+	// exactly this: "ei; di; ei; di" and "ei; di; nop; nop" must both
+	// produce zero interrupts).
 	IME = 0;
+	EI_PENDING = 0;
 	cycleLength(4);
 } // F3    DI
 
@@ -3753,7 +3761,14 @@ void OPFA(void){ // case  0xFA:
 } // FA    LD   A,(nnnn)
 
 void OPFB(void){ // case  0xFB:
-	EI_PENDING = 2;
+	// BUG FIX: don't restart the delay if one's already armed (EI_PENDING
+	// == 1, meaning IME becomes 1 at the end of *this* instruction) - a
+	// second EI executing as the very instruction after a first EI must
+	// not push IME's activation out by another instruction (Mooneye's
+	// ei_sequence.gb tests exactly this: 18 consecutive EIs with IE/IF
+	// already set should still fire the interrupt right after the
+	// second EI, not after the last one).
+	if (EI_PENDING == 0) EI_PENDING = 2;
 	cycleLength(4);
 } // FB    EI
 
