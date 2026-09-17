@@ -37,9 +37,11 @@ missing, and suggested next steps.
 
 ## Repo layout
 
-- `aGBe/` — the canonical, fixed source, including the real PSn00bSDK
-  platform layer (`psx.c`/`psx.h`/`main.c`/`gui.c`). This is what actually
-  builds and runs on real PS1 hardware.
+- `psx-gbc/` — the canonical, fixed source (this is the modernized,
+  renamed continuation of the original **aGBe** codebase - see
+  Acknowledgments below), including the real PSn00bSDK platform layer
+  (`psx.c`/`psx.h`/`main.c`/`gui.c`). This is what actually builds and
+  runs on real PS1 hardware.
 - `test-harness/` — a host-native (Linux gcc) build of the *unmodified*
   CPU/MBC/PPU core (`emu.c` + `opcodes.c`) against stub PSX SDK headers, so
   it can be run against real Game Boy test ROMs without needing the PS1
@@ -48,9 +50,9 @@ missing, and suggested next steps.
   wired up to print identical per-instruction traces, used throughout this
   project's history to pinpoint exact divergences by diffing traces
   instruction-by-instruction.
-- `psn00bsdk-build/` — the real CMake project that builds `aGBe/`'s
-  canonical source directly into a bootable PS-EXE and CD image via the
-  real PSn00bSDK toolchain.
+- `psn00bsdk-build/` — the real CMake project that builds `psx-gbc/`'s
+  canonical source directly into a bootable PS-EXE (`PSXGBC.EXE`) and CD
+  image via the real PSn00bSDK toolchain.
 - `psn00bsdk-smoketest/` — an early proof-of-concept, superseded by
   `psn00bsdk-build/`. Kept for reference only.
 - `STATUS.md` — the detailed, living project status document.
@@ -61,7 +63,7 @@ missing, and suggested next steps.
 
 ```sh
 cd test-harness
-gcc -w -fcommon -I psx-stubs -I ../aGBe ../aGBe/emu.c ../aGBe/opcodes.c harness.c -o harness
+gcc -w -fcommon -I psx-stubs -I ../psx-gbc ../psx-gbc/emu.c ../psx-gbc/opcodes.c harness.c -o harness
 ./harness /path/to/test.gb 30000000         # run a ROM, see Blargg-style pass/fail
 DUMP_PPM=out.ppm ./harness /path/to/test.gb 30000000   # dump the rendered screen as an image
 ```
@@ -83,7 +85,7 @@ cd psn00bsdk-build
 cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE="$PSN00BSDK_LIBS/cmake/sdk.cmake" \
   -DPSN00BSDK_TC="" -DPSN00BSDK_TARGET="mipsel-none-elf"
 cmake --build build
-# -> build/agbe.exe is a real, bootable PS-EXE
+# -> build/psxgbc.exe is a real, bootable PS-EXE
 
 # Build a bootable CD image (see psn00bsdk-build/iso.xml for disc layout):
 /path/to/PSn00bSDK-0.24-Linux/bin/mkpsxiso -y psn00bsdk-build/iso.xml

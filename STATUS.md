@@ -10,23 +10,25 @@ the commit history.
 
 ## Layout
 
-- `aGBe/` — the canonical, fixed source, including the real PSn00bSDK
-  platform layer (`psx.c`/`psx.h`/`main.c`). This is what actually builds
-  and runs on real PS1 hardware/toolchain now.
+- `psx-gbc/` — the canonical, fixed source (renamed from the original
+  `aGBe/` codebase folder - "aGBe" is still the name of the codebase this
+  project modernizes, see the header note above), including the real
+  PSn00bSDK platform layer (`psx.c`/`psx.h`/`main.c`). This is what
+  actually builds and runs on real PS1 hardware/toolchain now.
 - `test-harness/` — a host-native (Linux gcc) build of the *unmodified*
   CPU/MBC/PPU core (`emu.c`+`opcodes.c`) against stub PSX SDK headers, so
   it can be run against real Game Boy test ROMs without needing the PS1
   toolchain. Also contains `refharness.c`, a second core (Peanut-GB,
   MIT-licensed) wired up to print identical per-instruction traces, for
-  diffing against aGBe's own core to pinpoint exact divergences. Has
-  opt-in visual debugging via env vars: `DUMP_PPM=<path>` dumps the
+  diffing against this project's own core to pinpoint exact divergences.
+  Has opt-in visual debugging via env vars: `DUMP_PPM=<path>` dumps the
   rendered screen to a PGM/PPM image, `ROWSUMMARY=1` prints a per-row
   non-white-pixel count, `DUMP_VRAM=1` dumps the tile map/tile data/
   palette at exit, `TRACE`/`trace` arg give per-instruction register
   traces.
-- `psn00bsdk-build/` — the real CMake project that builds `aGBe/`'s
+- `psn00bsdk-build/` — the real CMake project that builds `psx-gbc/`'s
   canonical source directly (no copy-and-sync step) into a bootable
-  PS-EXE via the real PSn00bSDK toolchain.
+  PS-EXE (`PSXGBC.EXE`) via the real PSn00bSDK toolchain.
 - `psn00bsdk-smoketest/` — an earlier proof-of-concept (superseded by
   `psn00bsdk-build/` now that the real platform layer exists). Kept for
   reference; not the thing to build from going forward.
@@ -36,7 +38,7 @@ the commit history.
 ```sh
 # Host-native correctness testing (no PS1 toolchain needed)
 cd test-harness
-gcc -w -fcommon -I psx-stubs -I ../aGBe ../aGBe/emu.c ../aGBe/opcodes.c harness.c -o harness
+gcc -w -fcommon -I psx-stubs -I ../psx-gbc ../psx-gbc/emu.c ../psx-gbc/opcodes.c harness.c -o harness
 ./harness /path/to/test.gb 30000000         # run a ROM, see Blargg pass/fail
 ./harness /path/to/test.gb 30000000 trace   # per-instruction register trace
 DUMP_PPM=out.ppm ./harness /path/to/test.gb 30000000   # dump rendered screen
@@ -58,12 +60,12 @@ cd psn00bsdk-build
 cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE="$PSN00BSDK_LIBS/cmake/sdk.cmake" \
   -DPSN00BSDK_TC="" -DPSN00BSDK_TARGET="mipsel-none-elf"
 cmake --build build
-# -> build/agbe.exe is a real, bootable PS-EXE running the actual emulator
+# -> build/psxgbc.exe is a real, bootable PS-EXE running the actual emulator
 
 # Build a real bootable CD image with two demo ROMs on it (iso_files/
 # holds the actual .GB files to include - swap in real ROMs as needed):
 /opt/psn00bsdk/sdk/PSn00bSDK-0.24-Linux/bin/mkpsxiso -y iso.xml
-# -> agbe.bin + agbe.cue, a genuine multi-game PS1 disc image
+# -> psx-gbc.bin + psx-gbc.cue, a genuine multi-game PS1 disc image
 ```
 
 ### Setting up the toolchain yourself
@@ -103,7 +105,7 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
 - **Real PSn00bSDK platform layer.** `psx.c`/`psx.h`/`main.c` are now a
   genuine (if minimal) implementation, not GsLib stubs: real GPU output,
   real controller input (`InitPAD`/`StartPAD`). Builds and links into a
-  real, bootable PS-EXE (`psn00bsdk-build/build/agbe.exe`) that runs an
+  real, bootable PS-EXE (`psn00bsdk-build/build/psxgbc.exe`) that runs an
   embedded demo ROM through the actual `runEmu()` loop.
 - **Real CD-ROM ROM loading — multiple games on one disc, confirmed.**
   `LoadROMFromCD()` in `psx.c` uses PSn00bSDK's real `psxcd.h` (the same
