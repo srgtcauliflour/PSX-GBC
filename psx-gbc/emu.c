@@ -2041,7 +2041,7 @@ BYTE ReadMEM(WORD loc) {
 				case 0xFF05: return (BYTE)TIMECNT; break;// Timer counter (R/W)
 				case 0xFF06: return (BYTE)TIMEMOD; break;// Timer Modulo (R/W)
 				case 0xFF07: return (BYTE)TIMCONT; break; // Timer Control
-				case 0xFF0F: return (BYTE)IFLAG; break; // Interrupt Flag (R/W)
+				case 0xFF0F: return (BYTE)(IFLAG | 0xE0); break; // Interrupt Flag (R/W), unused bits read as 1
 
 				// SOUND - many bits across these registers are
 				// write-only on real hardware and read back as 1
