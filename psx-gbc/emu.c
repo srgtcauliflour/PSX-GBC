@@ -2349,7 +2349,16 @@ void WriteMEM(WORD loc, BYTE b){
 				DIVCOUNTER = 0;
 				CheckTimerEdge();
 				break;
-			case 0xFF05: TIMECNT = b; break; // Timer counter (R/W)
+			case 0xFF05:
+				// BUG FIX: a write to TIMA while a reload from the
+				// previous overflow is still pending cancels that
+				// reload - the written value sticks instead of TMA's
+				// (Mooneye's tima_write_reloading.gb documents this
+				// precisely). Ordinary writes (no reload pending) are
+				// unaffected.
+				TIMECNT = b;
+				timaReloadPending = 0;
+				break; // Timer counter (R/W)
 			case 0xFF06: TIMEMOD = b; break; // Timer Modulo (R/W)
 			case 0xFF07: TIMCONT = b;
 							// BUG FIX: MAXTIME (the old, independent timer-period
