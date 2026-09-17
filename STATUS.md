@@ -545,6 +545,21 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   pre-existing "different point in dynamic gameplay" artifact, not
   something this fix introduced.
 
+  Follow-up attempt on the remaining 2 Timer failures
+  (`tima_write_reloading`/`tma_write_reloading`): added "a write to
+  TIMA while a reload is pending cancels it," a real, documented
+  behavior confirmed via both tests' own source comments - but not
+  precise enough to pass either, since they test a more specific
+  cycle-by-cycle sub-nuance (exactly *which* T-cycle(s) within the
+  4-cycle window a write does or doesn't cancel the reload) this
+  simpler, uniform model doesn't capture. Kept anyway since it's a
+  real improvement over the previous "reload state ignored entirely on
+  write" behavior and introduces no regression (confirmed: still
+  21/67) - getting the exact remaining nuance right would need the
+  same careful, direct empirical tracing that resolved `push_timing.gb`
+  earlier, not attempted here to avoid guessing at something subtly
+  wrong the way an earlier DMA-nuance attempt turned out to be.
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
