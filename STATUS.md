@@ -460,11 +460,33 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   games," and the full sweep - real ROMs included, not just the Mooneye
   suites - is what actually proves the difference.
 
+  Next, found and fixed the same double-charge bug (already known from
+  `interrupt()`) in **all 8 `RST` opcodes and all 5 `CALL` opcodes**:
+  each called `push()` (which now charges its own M-cycles
+  progressively) but *also* charged the instruction's old, full lump
+  sum afterward - RST was taking 28T instead of the correct 16T,
+  confirmed by direct measurement with a tiny synthetic ROM. `CALL`
+  also needed its 2 address-byte reads split into individually-charged
+  M-cycles, matching the same pattern as PUSH/POP. Fixing RST's timing
+  correctly caused `rst_timing.gb` to regress - traced immediately and
+  confirmed it's the *same* OAM-DMA-completion-boundary nuance behind
+  the reverted `dmaPendingEnd` regression above: `rst_timing.gb` was
+  only passing before by coincidence, with RST's old *incorrect* timing
+  happening to land on the right cycle alignment. Kept the genuine
+  fix rather than revert it to keep a coincidental pass. `call_timing.gb`
+  and its conditional variants remain failing for the identical
+  underlying reason (confirmed via source inspection) - not a new
+  regression, since they were already failing beforehand. Currently
+  13/67 on the full suite (`rst_timing` swapped out, everything else
+  from the DMA start-timing fix retained). Real ROMs (Pokemon Red
+  especially, given how heavily real games use CALL) re-verified
+  correct throughout.
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
    large, real gap, though real progress has been made.** Currently
-   14 of 67 Mooneye acceptance/ppu+timer+interrupts tests pass (up
+   13 of 67 Mooneye acceptance/ppu+timer+interrupts tests pass (up
    from an initial 11), most of the remaining failures for reasons
    unrelated to the already-known boot-ROM limitation. Comparable in
    scope to the GBC-support or sound-implementation efforts this
