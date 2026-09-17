@@ -113,6 +113,14 @@ BYTE BGPAL;
 BYTE P1;
 BYTE TIMEMOD, TIMCONT;
 int TIMECNT;
+// Real hardware quirk (Mooneye's tima_reload.gb test documents this
+// precisely): when TIMA overflows, it doesn't reload to TMA
+// immediately - it reads as $00 for exactly 4 T-cycles first, and only
+// then takes on TMA's value. timaReloadPending counts that delay down;
+// TIMECNT itself is already the visible/readable value throughout (set
+// to 0 immediately on overflow, then to TMA once this reaches 0), so
+// the $FF05 read handler needs no changes of its own.
+int timaReloadPending = 0;
 int MAXTIME, TIMECOUNTER;
 
 // ---- GBC (Game Boy Color) support ----------------------------------
@@ -951,13 +959,30 @@ void cycleLength(int cycle) {
 	}
 	if ((TIMCONT >> 2) & 0x01){
 		TIMECOUNTER += sysCycle;
+		// Process any already-pending reload delay using this call's
+		// cycles *before* checking for a new overflow below - otherwise
+		// an overflow detected in this same call would have its fresh
+		// 4-cycle countdown immediately consumed by this same sysCycle,
+		// collapsing the "reads as 0" window to zero real cycles.
+		if (timaReloadPending > 0) {
+			timaReloadPending -= sysCycle;
+			if (timaReloadPending <= 0) {
+				timaReloadPending = 0;
+				TIMECNT = TIMEMOD;
+			}
+		}
 		if (TIMECOUNTER >= MAXTIME){
 			TIMECOUNTER = 0;
 			TIMECNT += 1;
 
 			if (TIMECNT > 255) {
 				IFLAG |= 0x04;
-				TIMECNT = TIMEMOD;
+				// BUG FIX: TIMA doesn't reload to TMA immediately on
+				// overflow - real hardware shows $00 for exactly 4
+				// T-cycles first (see timaReloadPending's declaration
+				// comment above for the full explanation).
+				TIMECNT = 0;
+				timaReloadPending = 4;
 				#if defined(DEBUG)
 				printf("Timer Interrupt!\n");
 				#endif
