@@ -574,10 +574,40 @@ void onSerialControlWrite(void) {
 	}
 }
 
+// OAM DMA: real hardware transfers all 160 bytes over 160 M-cycles (640
+// T-cycles), one byte per M-cycle - not instantly, the way this was
+// previously implemented. dmaActive/dmaCyclesElapsed/dmaBytesDone track
+// an in-progress transfer; DMAClock() (called from cycleLength()
+// alongside APUClock() etc.) advances it by however many bytes should
+// now be done given the elapsed time, however that time was split
+// across instructions.
+int dmaActive = 0;
+int dmaCyclesElapsed = 0;
+int dmaBytesDone = 0;
+WORD dmaSourceBase = 0;
+
 void doDMA(BYTE addr) {
-	j = (addr & 0xFF) * 0x0100;
-	for (i = 0; i < 0xA0; i++) {
-		WriteMEM(0xFE00 + i, ReadMEM(j + i));
+	dmaSourceBase = (addr & 0xFF) * 0x0100;
+	dmaCyclesElapsed = 0;
+	dmaBytesDone = 0;
+	dmaActive = 1;
+}
+
+void DMAClock(int cycles) {
+	if (!dmaActive) {
+		return;
+	}
+	dmaCyclesElapsed += cycles;
+	int bytesShouldBeDone = dmaCyclesElapsed / 4;
+	if (bytesShouldBeDone > 0xA0) {
+		bytesShouldBeDone = 0xA0;
+	}
+	while (dmaBytesDone < bytesShouldBeDone) {
+		OAMRAM[dmaBytesDone] = ReadMEM((WORD)(dmaSourceBase + dmaBytesDone));
+		dmaBytesDone++;
+	}
+	if (dmaBytesDone >= 0xA0) {
+		dmaActive = 0;
 	}
 }
 
@@ -869,6 +899,7 @@ void cycleLength(int cycle) {
 	}
 	APUClock(sysCycle);
 	AudioSampleHook(sysCycle);
+	DMAClock(sysCycle);
 	VideoCyclesLeft -= sysCycle;
 	if(VideoCyclesLeft <= 0) { // Video
 		if((videoMode == HBLANKMODE) || (videoMode == VBLANKMODE)){
