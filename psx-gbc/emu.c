@@ -2673,6 +2673,21 @@ void WriteMEM(WORD loc, BYTE b){
 				// mode/coincidence bits directly, which then never got
 				// corrected by the PPU state machine (see cycleLength).
 				LCDSTATUS = (LCDSTATUS & 0x07) | (b & 0xF8);
+				// BUG FIX: newly *enabling* a STAT interrupt source while
+				// its underlying condition is already true (e.g. writing
+				// bit 4 while already in VBlank) is itself a rising edge
+				// of the composite STAT signal on real hardware, and needs
+				// to fire right here - UpdateStatLine() is otherwise only
+				// called from mode transitions, which don't happen just
+				// because an enable bit changed. Confirmed via Mooneye's
+				// stat_irq_blocking.gb, whose very first round enables the
+				// mode=1 source while *already* in VBlank and expects an
+				// immediate interrupt. Gated on LCD-on for the same reason
+				// as the LYC write handler below - the comparator (and the
+				// modes themselves) are frozen while off.
+				if (LCDCONTROL & 0x80) {
+					UpdateStatLine(0);
+				}
 				break; // LCDC Status   (R/W)
 			case 0xFF42: SCRY = b; break; // Scroll Y   (R/W)
 			case 0xFF43: SCRX = b; break; // Scroll X   (R/W)
@@ -2692,6 +2707,12 @@ void WriteMEM(WORD loc, BYTE b){
 				LYC = b;
 				if (LCDCONTROL & 0x80) {
 					LCDSTATUS = (LCDSTATUS & 0xFB) | ((LCDY == LYC) ? 0x04 : 0x00);
+					// BUG FIX: same reasoning as the $FF41 handler above -
+					// a LYC write can itself create a fresh LY==LYC match
+					// (or clear an existing one), which needs to go
+					// through the same rising-edge check as any other
+					// live coincidence change.
+					UpdateStatLine(0);
 				}
 				break; // LY Compare  (R/W)
 			case 0xFF46: doDMA(b); break; // DMA Transfer and Start Address (W)
