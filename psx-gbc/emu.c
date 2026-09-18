@@ -1065,6 +1065,43 @@ int APUChannelOutput(int channelNum) {
 	return -1;
 }
 
+// BUG FIX: the STAT interrupt (IF bit 1) was requested independently
+// at each individual condition (LYC=LY coincidence, mode 0/1/2) with
+// no shared state between them - but real hardware's STAT interrupt
+// is level-triggered from a single internal signal that's the OR of
+// every currently-enabled AND currently-true condition, and IF bit 1
+// is only actually set on a LOW-to-HIGH transition of that composite
+// signal. If the signal is already high (e.g. LYC=LY coincidence is
+// already true and enabled) when a second condition also becomes true
+// (e.g. mode reaches 0), no second interrupt fires until the signal
+// first drops back to low - confirmed by Mooneye's stat_irq_blocking.gb,
+// which deliberately arranges LYC=LY to stay true across a mode change
+// specifically to verify the second condition does NOT produce an
+// extra interrupt. statLineActive tracks the signal's last-known state;
+// UpdateStatLine() recomputes it and fires on the rising edge only.
+// This also fixes two real, independent bugs the old per-site checks
+// had: mode=2's interrupt was being requested a second time when OAM
+// search *ended* (entering mode 3, which has no STAT interrupt source
+// of its own) as well as when it began, and mode=0's interrupt was
+// wired to the wrong bit entirely (checking bit 3 when *entering* OAM
+// mode - backwards - instead of when actually entering HBlank, which
+// had no check at all).
+int statLineActive = 0;
+void UpdateStatLine(int extraMode2) {
+	int lyc = (LCDY == LYC) && ((LCDSTATUS >> 6) & 0x01);
+	int m0 = (videoMode == HBLANKMODE) && ((LCDSTATUS >> 3) & 0x01);
+	int m1 = (videoMode == VBLANKMODE) && ((LCDSTATUS >> 4) & 0x01);
+	// extraMode2: real hardware also treats the mode=2 condition as
+	// momentarily true right as VBlank begins, even though the visible
+	// mode is 1 by then - see the VBlank-entry call site.
+	int m2 = ((videoMode == OAMMODE) || extraMode2) && ((LCDSTATUS >> 5) & 0x01);
+	int now = lyc || m0 || m1 || m2;
+	if (now && !statLineActive) {
+		IFLAG |= 0x02;
+	}
+	statLineActive = now;
+}
+
 long long g_totalSysCycles = 0;
 void cycleLength(int cycle) {
 	// GBC double-speed mode: the CPU core runs twice as fast, but the
@@ -1166,7 +1203,7 @@ void cycleLength(int cycle) {
 				// carries the overshoot forward into the new mode's
 				// countdown, losing nothing.
 				VideoCyclesLeft += OAM_CYCLES;
-				if ((LCDSTATUS >> 5) & 0x01) { IFLAG |= 0x02; }
+				UpdateStatLine(0);
 			} else if (LCDY < 0x90) {
 				hblank();
 				videoMode = OAMMODE;
@@ -1174,7 +1211,7 @@ void cycleLength(int cycle) {
 				// case) for the full explanation - same overshoot-losing
 				// bug, same fix.
 				VideoCyclesLeft += OAM_CYCLES;
-				if ((LCDSTATUS >> 3) & 0x01) { IFLAG |= 0x02; } // LCD 3
+				UpdateStatLine(0);
 			} else {
 				videoMode = VBLANKMODE;
 				VideoCyclesLeft += VBLANK_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
@@ -1205,20 +1242,19 @@ void cycleLength(int cycle) {
 					// relied on before now happened not to exercise this
 					// exact, extremely common pattern.
 					IFLAG |= 0x01;
-					// BUG FIX: real hardware also fires the STAT interrupt
-					// at this exact same moment (LY reaching 144) if the
-					// mode=2 (OAM) STAT interrupt source is enabled (bit
-					// 5) - even though entering VBlank isn't literally
-					// "mode 2". Previously only bit 4 (the dedicated
-					// "fire STAT at VBlank too" source) was checked here.
-					// Confirmed via Mooneye's vblank_stat_intr-GS.gb,
-					// which measures that a mode=2-enabled STAT interrupt
-					// and the dedicated VBlank interrupt land on the
-					// exact same T-cycle at line 144.
-					if (((LCDSTATUS >> 4) & 0x01) || ((LCDSTATUS >> 5) & 0x01)) { IFLAG |= 0x02; }
 				}
+				// BUG FIX: real hardware also treats the mode=2 (OAM)
+				// condition as momentarily true at the exact moment VBlank
+				// begins (LY reaching 144), even though the visible mode is
+				// 1 by then - see UpdateStatLine()'s declaration comment.
+				// Confirmed via Mooneye's vblank_stat_intr-GS.gb, which
+				// measures that a mode=2-enabled STAT interrupt and the
+				// dedicated VBlank interrupt land on the exact same T-cycle
+				// at line 144. Called every line within VBlank (not just at
+				// entry) so a LYC write that starts matching partway through
+				// VBlank still correctly produces its own rising edge.
+				UpdateStatLine(LCDY == 0x90);
 			}
-			if (LCDY == LYC) { IFLAG |= 0x02; } // 3
 			// BUG FIX: STAT's mode bits (0-1) and LYC-coincidence bit (2)
 			// were never synced with the actual PPU state anywhere - only
 			// ever set by a direct software write to $FF41, which then sat
@@ -1233,13 +1269,27 @@ void cycleLength(int cycle) {
 			if (videoMode == OAMMODE) {
 				videoMode = TRANSFERMODE;
 				VideoCyclesLeft += TRANSFER_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
-				if ((LCDSTATUS >> 5) & 0x01) { IFLAG |= 0x02; } //3
+				// BUG FIX: mode 3 (transfer) has no STAT interrupt source of
+				// its own - this used to re-check bit 5 (mode=2) here too,
+				// double-firing the OAM interrupt a second time as OAM
+				// search *ends*, on top of the correct firing when it
+				// *begins*. Still need to recompute the line here though
+				// (mode=2's condition just became false), so a later mode
+				// transition can correctly detect a fresh rising edge
+				// instead of staying wrongly suppressed by stale state -
+				// see UpdateStatLine()'s declaration comment.
+				UpdateStatLine(0);
 				LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
 				return;
 			}
 			if (videoMode == TRANSFERMODE) {
 				videoMode = HBLANKMODE;
 				VideoCyclesLeft += HBLANK_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
+				// BUG FIX: mode 0 (HBlank)'s own STAT interrupt (bit 3) had
+				// no check anywhere - the only bit-3 check in this whole
+				// function was on the *next* line's OAM-mode-entry site
+				// (backwards; fixed there to check bit 5 like it should).
+				UpdateStatLine(0);
 				LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
 				return;
 			}
@@ -2592,21 +2642,26 @@ void WriteMEM(WORD loc, BYTE b){
 					LCDY = 0;
 					videoMode = HBLANKMODE;
 					LCDSTATUS = (LCDSTATUS & 0xFC) | (videoMode & 0x03); // mode bits only - bit 2 (coincidence) frozen
+					// While powered off, UpdateStatLine() never runs (see
+					// its gate in cycleLength()), so statLineActive would
+					// otherwise stay stuck reflecting whatever combination
+					// of conditions (possibly mode-based) was live the
+					// instant before power-off. Only the frozen coincidence
+					// bit can still meaningfully contribute while off -
+					// resync statLineActive to just that, so the power-on
+					// branch's UpdateStatLine() call correctly detects a
+					// rising edge only when it's a genuine one.
+					statLineActive = ((LCDSTATUS >> 2) & 0x01) && ((LCDSTATUS >> 6) & 0x01);
 				} else if (!(oldLCDC & 0x80) && (b & 0x80)) {
-					int wasCoincident = (LCDSTATUS >> 2) & 0x01; // frozen value from while powered off
 					LCDY = 0;
 					videoMode = HBLANKMODE;
 					VideoCyclesLeft = OAM_CYCLES;
-					int nowCoincident = (LCDY == LYC);
-					LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | (nowCoincident ? 0x04 : 0x00);
-					// Powering on restarts the comparison at LY=0 - if
-					// that's a genuine 0->1 transition of the coincidence
-					// bit (not just "still 1, same as it was frozen at"),
-					// and the LYC-coincidence STAT interrupt source is
-					// enabled (bit 6), that's a real coincidence event and
-					// requests the STAT interrupt right here, same as any
-					// other live LY==LYC transition.
-					if (nowCoincident && !wasCoincident && ((LCDSTATUS >> 6) & 0x01)) { IFLAG |= 0x02; }
+					LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
+					// Powering on restarts the comparison at LY=0 and
+					// immediately recomputes the composite STAT line
+					// (coincidence against the fresh LY=0, mode=0) -
+					// see UpdateStatLine()'s declaration comment.
+					UpdateStatLine(0);
 				}
 				break; // LCD Control (R/W)
 			}
