@@ -40,7 +40,7 @@ evidenced version of all of this):
   `DUMP_WAV` below); the PS1 SPU output half has never been confirmed to
   actually produce audio, since this sandbox can't play or capture sound.
 - Sub-instruction cycle-accurate timing: a large, real, **partially
-  fixed** gap - currently 30/67 on Mooneye's `acceptance/ppu`+`timer`+
+  fixed** gap - currently 35/67 on Mooneye's `acceptance/ppu`+`timer`+
   `interrupts`+top-level suite (started at 11/67). See "What's next"
   item 1 for exactly what's fixed, what's failing, and why.
 - Kirby's Pinball Land's long-standing blank-screen hang: resolved as
@@ -797,6 +797,80 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   `jp_timing`/`jp_cc_timing`, `add_sp_e_timing`, `ld_hl_sp_e_timing`,
   and `rst_timing` all remain failing for this reason.
 
+  **Second follow-up, same session, once the user finished uploading
+  all 6 real ROMs: did the "opcode-table-wide restructuring" pass this
+  entry originally deferred.** Split `OP77`/`OP7E`/`OPE0`/`OPF0` (the
+  `LD (HL),A`/`LD A,(HL)`/`LDH (n),A`/`LDH A,(n)` family) into their
+  real per-M-cycle fetch/operand-read/access charges, matching PUSH/
+  POP/CALL/RST/RET's existing pattern - the concrete fix the previous
+  entry's root-cause analysis called for. Also found and fixed OAM
+  DMA's end-of-transfer timing: the bus-blocking restriction doesn't
+  lift the instant the 160th byte's own transfer completes - it stays
+  active for one more M-cycle beyond that (644T, not 640T), the
+  teardown-side counterpart to the already-fixed 2-M-cycle startup
+  latency.
+
+  This round of hand-derivation was rougher than the first: initial
+  attempts at each of these produced **real, confirmed regressions**
+  (splitting `OP77`+`OPE0` alone broke `tim00`/`tim01`/`tim10`/`tim11`/
+  `div_write`/etc. by shifting exactly when a DIV/TAC write becomes
+  visible to the timer edge-detector relative to a *different*
+  precisely-timed instruction sequence; fixing that by also splitting
+  `OPF0` then broke `div_timing` until `OP7E` got the same treatment;
+  and the DMA end-timing fix went through several self-contradictory
+  hand-derived values before being found **empirically instead** -
+  scanning candidate delays against `push_timing.gb`, `oam_dma_timing.gb`,
+  and `oam_dma_restart.gb` together and taking the one value all three
+  independently-authored tests agree on, after hand arithmetic on the
+  same three tests kept producing answers that satisfied one while
+  contradicting another). Every fix was re-verified against the full
+  acceptance sweep, `cpu_instrs`, Mooneye `mbc1`+`mbc5`, and - for the
+  first time this session - re-rendered against all 6 real ROMs
+  (Dr. Mario, Kirby's Dream Land 2, Kirby's Pinball Land, Pokemon
+  Red/Yellow/Crystal): all still render correctly, including confirming
+  Pokemon Red's title-screen walk animation is still cycling normally
+  frame-to-frame (a snapshot mid-animation looked like a regression at
+  first glance - it wasn't, just a different frame of the same loop).
+
+  **Result: 30/67 → 35/67** (`push_timing`, `pop_timing`, `div_timing`,
+  `call_timing2`, `call_cc_timing2`, `rst_timing`) - the single biggest
+  jump since the DIV/Timer rewrite two sessions ago, and done with real
+  ROMs available to validate against for the first time this session.
+
+  The remaining 9 failures in this specific cluster -
+  `call_timing`/`call_cc_timing`, `ret_timing`/`ret_cc_timing`/
+  `reti_timing`, `jp_timing`/`jp_cc_timing`, `add_sp_e_timing`,
+  `ld_hl_sp_e_timing` - are a **different, deeper problem**, not just
+  more of the same fix, and are reported as `UNKNOWN`/hang rather than
+  a clean `$42` failure: the CPU parks forever re-executing `RST $38`
+  at address `$0038` (SP draining downward every iteration, since
+  nothing in these ROMs defines a real handler there - the design
+  relies on the DMA-blocked-read byte landing *within* HRAM, e.g.
+  `call_timing.gb`'s "the read is blocked, so the call target becomes
+  $FFCA/$FFDA" - both valid HRAM addresses with real handlers copied
+  there). Traced `call_timing.gb` directly: the very first byte of its
+  copied test procedure (`$FDFE`, meant to *always* read as the real
+  `CALL` opcode regardless of DMA timing, per the test's own comments -
+  only the *later* high-address-byte read at `$FE00` is meant to be
+  boundary-sensitive) is itself reading as DMA-blocked (`$FF`) when it
+  shouldn't be - `dmaCyclesElapsed` measured 632 T-cycles into the
+  transfer at that point, against a hand-derived expectation of 640,
+  an 8T gap that resisted several careful recomputation attempts
+  (this test's setup differs from `push_timing.gb`'s in loop-counter
+  value, instruction sequence, *and* an extra `LD HL,nnnn` before the
+  final jump, giving more surface for a hand-arithmetic slip than the
+  three-test empirical scan above could realistically cover). Given
+  this session's hand-derivation track record on DMA-boundary timing
+  specifically (multiple confirmed errors, only resolved by empirical
+  scanning, and this project's own prior `dmaPendingEnd` regression
+  history in this exact area), **not worth another hand-derived guess**
+  - left alone rather than risk a repeat. Next step if resumed: the
+  same empirical-scan technique that found the +4T completion delay,
+  but will need a wider scan (likely 2+ free parameters, since this
+  gap doesn't fit the single-delay model that already explained the
+  other four tests) and probably its own temporary instrumentation
+  rather than reusing what's described above.
+
   Separately, a finer-grained PPU mode-timing cluster
   (`hblank_ly_scx_timing-GS`, `intr_2_0_timing`,
   `intr_2_mode0_timing`(`_sprites`), `intr_2_mode3_timing`,
@@ -814,26 +888,32 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
    large, real gap, though real progress has been made.** Currently
-   30 of 67 Mooneye acceptance/ppu+timer+interrupts tests pass (up
+   35 of 67 Mooneye acceptance/ppu+timer+interrupts tests pass (up
    from an initial 11), most of the remaining failures for reasons
-   unrelated to the already-known boot-ROM limitation. Comparable in
-   scope to the GBC-support or sound-implementation efforts this
-   session - a dedicated pass, not a quick fix, and one where every
-   change needs the full regression sweep (see above) before being
-   trusted. **Concrete next step, now identified** (see the detailed
-   entry above): give simple, single-`cycleLength()`-call write opcodes
-   (starting with `LDH (n),A`/`LD (HL),A`, but really any opcode whose
-   `WriteMEM()` call can have a timing-sensitive side effect - DMA
-   trigger, DIV reset, and likely others) the same fetch-then-execute
-   M-cycle split PUSH/POP/CALL/RST/RET already got, so a side effect
-   triggered mid-instruction stops over-crediting the instruction's
-   pre-write cycles (fetch, operand read) as "after the trigger" time.
-   This is what's actually blocking `push_timing`, `pop_timing`,
-   `call_timing`+variants, `ret_timing`+variants, `jp_timing`+variants,
-   and `rst_timing` - confirmed via direct empirical tracing (not
-   guessed), but not attempted this session since it's a broad,
-   opcode-table-wide change in its own right, deserving its own
-   dedicated pass and full regression sweep.
+   unrelated to the already-known boot-ROM limitation. The opcode-
+   table-wide fetch-then-execute restructuring flagged here in the
+   previous entry is **done for the opcodes that needed it**
+   (`OP77`/`OP7E`/`OPE0`/`OPF0`) - see the detailed entry above for
+   what that fixed (`push_timing`, `pop_timing`, `div_timing`,
+   `call_timing2`, `call_cc_timing2`, `rst_timing`) and for the DMA
+   end-of-transfer timing fix that went with it. **What's left in this
+   specific cluster is a different, deeper problem**, not more
+   opcode-splitting: `call_timing`/`call_cc_timing`,
+   `ret_timing`/`ret_cc_timing`/`reti_timing`, `jp_timing`/
+   `jp_cc_timing`, `add_sp_e_timing`, `ld_hl_sp_e_timing` all hang
+   (`UNKNOWN`, stuck re-executing `RST $38` forever) rather than
+   cleanly fail - traced `call_timing.gb` far enough to find an 8T gap
+   between a hand-derived expectation and the actual traced
+   `dmaCyclesElapsed` value that resisted several careful
+   recomputation attempts (this ROM's setup differs from the ones the
+   completion-delay fix was empirically validated against in loop
+   counter, instruction sequence, and an extra `LD HL,nnnn`). Given
+   this exact area's track record this session (multiple confirmed
+   hand-derivation errors, only resolved by empirical scanning) and
+   this project's prior `dmaPendingEnd` regression history in it, this
+   needs the same empirical-scan technique again rather than another
+   hand-derived guess - likely with 2+ free parameters this time, and
+   probably fresh temporary instrumentation.
 2. ~~**Kirby's Pinball Land hang**~~ **RESOLVED this session** (re-
    confirmed a second time later in the same session, against the
    `oam_dma_start` fix too - still rendering real, active gameplay,
