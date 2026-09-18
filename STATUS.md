@@ -40,18 +40,20 @@ evidenced version of all of this):
   `DUMP_WAV` below); the PS1 SPU output half has never been confirmed to
   actually produce audio, since this sandbox can't play or capture sound.
 - Sub-instruction cycle-accurate timing: a large, real, **mostly
-  fixed** gap - currently 50/67 on Mooneye's `acceptance/ppu`+`timer`+
+  fixed** gap - currently 52/67 on Mooneye's `acceptance/ppu`+`timer`+
   `interrupts`+top-level suite (started at 11/67). The entire CALL/
   PUSH/POP/RST/RET/JP/ADD SP,e/OAM-DMA sub-family and most of the STAT-
   interrupt/PPU-mode-timing cluster are now fixed; VRAM-access
-  blocking during mode 3 and line 0's own special post-power-on
-  timing are also now implemented and verified regression-free (all
-  24 of `lcdon_timing-GS`'s LY checks pass). What's left there is a
-  narrow, LCD-on-adjacent-only quirk (mode 3 on line 1, specifically
-  the one right after a power-on line 0, needs a few extra T-cycles
-  this project doesn't model yet - confirmed NOT a general mode-3
-  bug, see below), sprite-count-dependent mode-3 length, and two
-  narrow TIMA-reload edge cases. See "What's next" item 1 for detail.
+  blocking during mode 3, line 0's own special post-power-on timing,
+  and the TIMA/TMA write-during-reload edge cases are also all now
+  fixed and verified regression-free (all 24 of `lcdon_timing-GS`'s LY
+  checks pass; `tima_write_reloading`/`tma_write_reloading` both PASS
+  outright). What's left is a narrow, LCD-on-adjacent-only quirk
+  (mode 3 on line 1, specifically the one right after a power-on line
+  0, needs a few extra T-cycles this project doesn't model yet -
+  confirmed NOT a general mode-3 bug, see below), sprite-count-
+  dependent mode-3 length, and `hblank_ly_scx_timing-GS`'s own,
+  still-unidentified gap. See "What's next" item 1 for detail.
 - Kirby's Pinball Land's long-standing blank-screen hang: resolved as
   a side effect of this suite's HALT-timing fix - see "What's next"
   item 2.
@@ -1110,10 +1112,49 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   unmodeled one), but line 0's own timing is now real, verified-
   correct, hardware-accurate behavior.**
 
+  **Sixth follow-up, same session: `tima_write_reloading`/
+  `tma_write_reloading`.** Both fixed. A prior session had already
+  correctly modeled TIMA's basic overflow-reload delay (reads as $00
+  for one M-cycle, then TMA - `tima_reload.gb` already passed) and a
+  TIMA write during that same M-cycle correctly cancelled the pending
+  reload (the written value sticking instead), but a first attempt at
+  this session's own re-investigation (hand-derived, guessing the
+  boundary was exactly at `timaReloadPending==1`) had zero effect once
+  actually tested - a reminder, yet again, that this project's own
+  M-cycle-offset arithmetic keeps being too easy to get wrong by hand.
+  Rather than keep guessing, cross-checked against SameBoy's own
+  timer implementation (a known-accurate reference core, fetched and
+  read directly rather than trusted from memory): its
+  `tima_reload_state` machine has *two* consecutive M-cycles after
+  overflow, not one - the first (`RELOADING`, matching this project's
+  existing "$00 for one M-cycle" behavior) still lets a TIMA write
+  cancel the reload as before, but the *second* (`RELOADED`, once
+  TIMECNT has already silently become TMA and reads look completely
+  ordinary again) silently ignores any TIMA write instead. Added a
+  second countdown (`timaWriteBlocked`, 4T/one M-cycle, starting the
+  instant `timaReloadPending` reaches 0) that gates exactly this
+  extra, otherwise-invisible window. Also ported SameBoy's TMA-write
+  behavior, which this project hadn't modeled at all: a TMA write
+  during *either* of these two windows immediately updates TIMA to
+  match the newly-written value too (real hardware's reload circuitry
+  reads TMA live while a reload is in flight, rather than only
+  latching it at the moment of overflow).
+
+  Verified: both tests now PASS outright (previously both FAIL) -
+  Mooneye's own success signature, not just a partial-check
+  improvement. Full acceptance sweep **50/67 -> 52/67**, with every
+  other test's PASS/FAIL unchanged (only these two flipped). mbc1/mbc5
+  at the known 18/21 baseline, `cpu_instrs.gb` still 11/11, and all 6
+  real ROMs byte-identical to the prior round's dumps - this only
+  touches the narrow TIMA-write-during-reload edge case, which none
+  of these ROMs exercise in a way that shows up in a single
+  fixed-instruction-count snapshot, so a fully clean diff here is
+  expected rather than surprising.
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
-   large, real gap, most of it now closed.** Currently 50 of 67
+   large, real gap, most of it now closed.** Currently 52 of 67
    Mooneye acceptance/ppu+timer+interrupts tests pass (up from an
    initial 11). **The entire CALL/PUSH/POP/RST/RET/JP/ADD SP,e/OAM-DMA
    sub-instruction-timing family - the cluster this project's own
@@ -1155,12 +1196,6 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
      quirk found via `lcdon_timing-GS`, but that quirk turned out to
      be specific to the line right after LCD power-on, not general -
      see that entry above. Ruled out, not the same bug.)
-   - `tima_write_reloading`/`tma_write_reloading` - a narrow, already-
-     investigated edge case (exactly which T-cycle(s) within TIMA's
-     4-cycle reload window a write does or doesn't cancel the reload) -
-     unchanged from the prior session's attempt; needs the same kind
-     of direct empirical tracing (not hand-derivation) that resolved
-     everything else this session, but hasn't been attempted again yet.
 2. ~~**Kirby's Pinball Land hang**~~ **RESOLVED this session** (re-
    confirmed a second time later in the same session, against the
    `oam_dma_start` fix too - still rendering real, active gameplay,

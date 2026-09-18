@@ -121,6 +121,18 @@ int TIMECNT;
 // to 0 immediately on overflow, then to TMA once this reaches 0), so
 // the $FF05 read handler needs no changes of its own.
 int timaReloadPending = 0;
+// BUG FIX (Mooneye's tima_write_reloading.gb/tma_write_reloading.gb):
+// the write-blocking window is one M-cycle *longer* than the visible
+// "reads as $00" window above - a TIMA write during that first window
+// (timaReloadPending>0) cancels the reload and the written value sticks
+// (already handled below), but a TIMA write during the *following*
+// M-cycle (once TIMECNT has already become TMA and reads normally) is
+// silently ignored instead - the reload has already "committed" from
+// the write-arbitration hardware's perspective even though nothing
+// about its visible state distinguishes that cycle from any other
+// ordinary one. timaWriteBlocked counts down that second, write-only
+// window the same way timaReloadPending counts down the first.
+int timaWriteBlocked = 0;
 
 // Real hardware bit positions of the 16-bit internal counter each TAC
 // clock-select value watches for a falling edge (Pan Docs "Timer
@@ -1155,7 +1167,10 @@ void cycleLength(int cycle) {
 			if (timaReloadPending <= 0) {
 				timaReloadPending = 0;
 				TIMECNT = TIMEMOD;
+				timaWriteBlocked = 4;
 			}
+		} else if (timaWriteBlocked > 0) {
+			timaWriteBlocked -= 1;
 		}
 	}
 	DIVREG = (BYTE)(internalDivCounter16 >> 8);
@@ -2600,14 +2615,35 @@ void WriteMEM(WORD loc, BYTE b){
 			case 0xFF05:
 				// BUG FIX: a write to TIMA while a reload from the
 				// previous overflow is still pending cancels that
-				// reload - the written value sticks instead of TMA's
-				// (Mooneye's tima_write_reloading.gb documents this
-				// precisely). Ordinary writes (no reload pending) are
-				// unaffected.
+				// reload - the written value sticks instead of TMA's.
+				// But a write during the *following* M-cycle - once
+				// TIMECNT has already become TMA and reads look
+				// perfectly ordinary again - is silently ignored
+				// instead (timaWriteBlocked's declaration comment has
+				// the full explanation). Confirmed empirically via
+				// Mooneye's tima_write_reloading.gb, which probes 4
+				// consecutive T-cycles around the reload boundary.
+				if (timaWriteBlocked > 0) {
+					break;
+				}
 				TIMECNT = b;
 				timaReloadPending = 0;
 				break; // Timer counter (R/W)
-			case 0xFF06: TIMEMOD = b; break; // Timer Modulo (R/W)
+			case 0xFF06:
+				TIMEMOD = b;
+				// BUG FIX: unlike a TIMA write (which is either
+				// cancel-and-override or fully ignored, see $FF05
+				// above), a TMA write during *either* half of the
+				// reload window is immediately reflected into TIMA
+				// too - real hardware's reload circuitry reads TMA
+				// live while it's active, so a new TMA value written
+				// mid-reload takes effect right away rather than
+				// waiting for the next overflow. Confirmed empirically
+				// via Mooneye's tma_write_reloading.gb.
+				if (timaReloadPending > 0 || timaWriteBlocked > 0) {
+					TIMECNT = b;
+				}
+				break; // Timer Modulo (R/W)
 			case 0xFF07: TIMCONT = b;
 							// BUG FIX: MAXTIME (the old, independent timer-period
 							// model) is no longer used - the real, unified-counter
