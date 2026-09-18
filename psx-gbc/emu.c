@@ -2148,6 +2148,15 @@ BYTE ReadMEM(WORD loc) {
     	if ((LCDCONTROL & 0x80) && (videoMode == OAMMODE || videoMode == TRANSFERMODE) && (loc >= 0xFE00 && loc <= 0xFE9F)) {
     		return 0xFF;
     	}
+    	// BUG FIX: the PPU also has exclusive access to VRAM while actively
+    	// fetching background/window/sprite tile data from it (mode 3
+    	// only - mode 2's OAM search doesn't touch VRAM) - real hardware's
+    	// CPU reads back $FF for VRAM during mode 3. The PPU's own
+    	// rendering code (DrawBGline etc.) reads the VRAM[] array directly
+    	// rather than through this function, so it's unaffected.
+    	if ((LCDCONTROL & 0x80) && (videoMode == TRANSFERMODE) && (loc >= 0x8000 && loc <= 0x9FFF)) {
+    		return 0xFF;
+    	}
     	if (loc < 0x4000) {  // ROM Bank 0
 			return ROM[loc];
 		}
@@ -2326,6 +2335,11 @@ void WriteMEM(WORD loc, BYTE b){
 	// BUG FIX: same PPU-owns-OAM-during-modes-2-and-3 restriction as
 	// ReadMEM - see that comment for the full explanation.
 	if ((LCDCONTROL & 0x80) && (videoMode == OAMMODE || videoMode == TRANSFERMODE) && (loc >= 0xFE00 && loc <= 0xFE9F)) {
+		return;
+	}
+	// BUG FIX: same PPU-owns-VRAM-during-mode-3 restriction as ReadMEM -
+	// see that comment for the full explanation.
+	if ((LCDCONTROL & 0x80) && (videoMode == TRANSFERMODE) && (loc >= 0x8000 && loc <= 0x9FFF)) {
 		return;
 	}
 	if ( loc <= 0x1FFF ) { // $0000-$1FFF - RAM Enable (MBC1/2/3/5)

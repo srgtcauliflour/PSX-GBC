@@ -43,10 +43,12 @@ evidenced version of all of this):
   fixed** gap - currently 50/67 on Mooneye's `acceptance/ppu`+`timer`+
   `interrupts`+top-level suite (started at 11/67). The entire CALL/
   PUSH/POP/RST/RET/JP/ADD SP,e/OAM-DMA sub-family and most of the STAT-
-  interrupt/PPU-mode-timing cluster are now fixed; what's left is
-  LCDC-on-specific timing (needs VRAM-access blocking, a genuinely new
-  feature), sprite-count-dependent mode-3 length, and two narrow
-  TIMA-reload edge cases. See "What's next" item 1 for detail.
+  interrupt/PPU-mode-timing cluster are now fixed; VRAM-access
+  blocking during mode 3 is also now implemented and verified
+  regression-free. What's left is a documented "PPU is 2 T-cycles
+  late on line 0" quirk for LCDC-on-specific timing, sprite-count-
+  dependent mode-3 length, and two narrow TIMA-reload edge cases. See
+  "What's next" item 1 for detail.
 - Kirby's Pinball Land's long-standing blank-screen hang: resolved as
   a side effect of this suite's HALT-timing fix - see "What's next"
   item 2.
@@ -979,6 +981,40 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
       T-cycle(s) within TIMA's 4-cycle reload window a write does or
       doesn't cancel the reload).
 
+  **Fourth follow-up, same session: VRAM access blocking during PPU
+  mode 3.** The first, lower-risk half of what `lcdon_timing-GS`/
+  `lcdon_write_timing-GS` need (see above). Added the mirror of the
+  existing OAM-blocking checks in `ReadMEM`/`WriteMEM`: while the LCD
+  is on and `videoMode == TRANSFERMODE`, CPU reads of `$8000-$9FFF`
+  return `$FF` and CPU writes to that range are dropped, exactly as
+  real hardware's CPU-vs-PPU VRAM bus contention works (mode 2's OAM
+  search doesn't touch VRAM, so it's mode 3 only, unlike OAM which is
+  blocked across both modes 2 and 3). The PPU's own rendering code
+  (`DrawBGline` etc.) reads the `VRAM[]` array directly rather than
+  through `ReadMEM`, so rendering itself is unaffected - only CPU
+  program access is gated.
+
+  Verified as the highest-regression-risk change attempted this
+  session, given how central VRAM access is to virtually every real
+  game's tile-fetching code (unlike OAM, touched more narrowly):
+  full Mooneye acceptance/ppu+timer+interrupts sweep (50/67, byte-
+  identical PASS/FAIL composition to the pre-change sweep - zero
+  tests flipped either direction), mbc1/mbc5 (18/21, matching the
+  pre-existing known-failure baseline), `cpu_instrs.gb` (still
+  11/11), and all 6 real ROMs (Kirby's Dream Land 2, Kirby's Pinball
+  Land, Dr. Mario, Pokemon Crystal, Pokemon Yellow, Pokemon Red) -
+  every single one produced a byte-identical framebuffer to the prior
+  round's verified-clean dump at the same fixed 5M-instruction
+  snapshot. Zero regressions.
+
+  As expected, `lcdon_timing-GS`/`lcdon_write_timing-GS` still fail on
+  their own (confirmed directly, not just via the sweep) - VRAM
+  blocking alone was never going to be sufficient; the still-missing
+  "PPU is 2 T-cycles late on line 0" quirk documented above is the
+  other, harder half of that pair and remains unimplemented.
+  **Result: still 50/67, but VRAM blocking is now a safely-verified
+  building block for the line-0-quirk work.**
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
@@ -998,13 +1034,16 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    access to OAM during PPU modes 2-3; and making mode 3's length vary
    with SCX. **What's left, each a distinct, bounded gap - not more of
    what's already fixed**:
-   - `lcdon_timing-GS`/`lcdon_write_timing-GS` - needs a documented "the
-     PPU is 2 T-cycles late on line 0 specifically" quirk modeled
-     precisely, *and* VRAM access blocking during mode 3 (a feature
-     that doesn't exist yet - only OAM got blocked this session, and
-     VRAM is much more central to real games' rendering than the OAM
-     edge cases fixed so far, so this needs its own careful,
-     dedicated pass with full real-ROM verification, not a bolt-on).
+   - `lcdon_timing-GS`/`lcdon_write_timing-GS` - VRAM access blocking
+     during mode 3 is now implemented and verified regression-free
+     (see the fourth follow-up entry above), but that alone doesn't
+     pass either test. What's still missing is the documented "the
+     PPU is 2 T-cycles late on line 0 specifically, lines 1+ are
+     normal" quirk from `lcdon_timing-GS.s`'s 24-entry expectation
+     table - reverse-engineer the exact transition points from its
+     `expect_ly`/`expect_stat_lyc0`/`expect_stat_lyc1`/
+     `expect_oam_access`/`expect_vram_access` arrays across 3 passes
+     at cycle offsets 0/17/60/110/130/174/224/244 (+1/+2).
    - `intr_2_mode0_timing_sprites` - needs mode 3's length to also
      vary with the number/position of sprites on the current line (on
      top of the SCX penalty above) - a separate, larger penalty model.
