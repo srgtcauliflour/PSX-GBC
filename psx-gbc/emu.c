@@ -2122,6 +2122,19 @@ BYTE ReadMEM(WORD loc) {
     	if (dmaBlockingActive && !dmaInternalRead && (loc >= 0xFE00 && loc <= 0xFE9F)) {
     		return 0xFF;
     	}
+    	// BUG FIX: separately from OAM DMA, the PPU itself has exclusive
+    	// access to OAM while actively searching it (mode 2) or fetching
+    	// sprite data from it (mode 3) - real hardware's CPU reads back
+    	// $FF for OAM during both modes, independent of whether an OAM DMA
+    	// transfer is also happening. The PPU's own rendering code
+    	// (DrawOBJline etc.) reads the OAMRAM[] array directly rather than
+    	// through this function, so it's unaffected. Confirmed via
+    	// Mooneye's intr_2_oam_ok_timing.gb, which measures exactly how
+    	// many M-cycles after the mode=2 STAT interrupt fires OAM actually
+    	// becomes readable again.
+    	if ((LCDCONTROL & 0x80) && (videoMode == OAMMODE || videoMode == TRANSFERMODE) && (loc >= 0xFE00 && loc <= 0xFE9F)) {
+    		return 0xFF;
+    	}
     	if (loc < 0x4000) {  // ROM Bank 0
 			return ROM[loc];
 		}
@@ -2295,6 +2308,11 @@ void WriteMEM(WORD loc, BYTE b){
 	// the exception regardless since it's independently correct
 	// real-hardware behavior either way.)
 	if (dmaBlockingActive && loc != 0xFF46 && (loc >= 0xFE00 && loc <= 0xFE9F)) {
+		return;
+	}
+	// BUG FIX: same PPU-owns-OAM-during-modes-2-and-3 restriction as
+	// ReadMEM - see that comment for the full explanation.
+	if ((LCDCONTROL & 0x80) && (videoMode == OAMMODE || videoMode == TRANSFERMODE) && (loc >= 0xFE00 && loc <= 0xFE9F)) {
 		return;
 	}
 	if ( loc <= 0x1FFF ) { // $0000-$1FFF - RAM Enable (MBC1/2/3/5)
