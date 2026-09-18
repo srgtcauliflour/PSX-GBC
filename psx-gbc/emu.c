@@ -722,17 +722,56 @@ int dmaInternalRead = 0;
 // cycles (the remainder of the triggering instruction) before DMA
 // actually starts counting toward its own 640T budget.
 int dmaPendingStart = 0;
+
+// BUG FIX (sub-instruction timing, Mooneye's oam_dma_start.gb): CPU
+// bus-blocking ("reads outside HRAM return $FF") was tied directly to
+// dmaActive, which doDMA() sets the instant the trigger write happens -
+// but real hardware only actually starts blocking 2 M-cycles *after*
+// that write (confirmed against the test's own timing diagram: M=0 the
+// write happens, M=1 OAM is still normally accessible, only M=2 is
+// where "the new DMA starts" and blocking begins). Tracked with its own
+// delay, independent of dmaPendingStart/dmaCyclesElapsed (which govern
+// when the *byte transfer itself* starts, a related but different
+// question) since they need different answers for a "restarted" DMA
+// (a second $FF46 write while a transfer is already active): the test
+// confirms the previous transfer's blocking is never interrupted or
+// reset by a restart, even though the restart *does* immediately take
+// over the actual source address/byte-progress. So dmaBlockPendingStart/
+// dmaBlockCyclesElapsed only ever get (re)armed by a genuinely fresh
+// start (no transfer was already active) - a restart mid-transfer
+// leaves them alone entirely, letting whatever blocking delay was
+// already ticking keep ticking on its own original schedule.
+int dmaBlockingActive = 0;
+int dmaBlockPendingStart = 0;
+int dmaBlockCyclesElapsed = 0;
+
 void doDMA(BYTE addr) {
+	int wasActive = dmaActive;
 	dmaSourceBase = (addr & 0xFF) * 0x0100;
 	dmaCyclesElapsed = 0;
 	dmaBytesDone = 0;
 	dmaActive = 1;
 	dmaPendingStart = 1;
+	if (!wasActive) {
+		dmaBlockPendingStart = 1;
+		dmaBlockCyclesElapsed = 0;
+		dmaBlockingActive = 0;
+	}
 }
 
 void DMAClock(int cycles) {
 	if (!dmaActive) {
 		return;
+	}
+	if (!dmaBlockingActive) {
+		if (dmaBlockPendingStart) {
+			dmaBlockPendingStart = 0;
+		} else {
+			dmaBlockCyclesElapsed += cycles;
+			if (dmaBlockCyclesElapsed >= 4) {
+				dmaBlockingActive = 1;
+			}
+		}
 	}
 	if (dmaPendingStart) {
 		// Consume this call's cycles as the remainder of the triggering
@@ -759,6 +798,7 @@ void DMAClock(int cycles) {
 	}
 	if (dmaBytesDone >= 0xA0) {
 		dmaActive = 0;
+		dmaBlockingActive = 0;
 	}
 }
 
@@ -1994,8 +2034,10 @@ BYTE ReadMEM(WORD loc) {
     	// documented restriction some games' precise DMA-timing code
     	// depends on, and exactly what Mooneye's push_timing/pop_timing
     	// tests exercise by running code with SP pointing into OAM while
-    	// a transfer is in progress).
-    	if (dmaActive && !dmaInternalRead && (loc < 0xFF80 || loc > 0xFFFE)) {
+    	// a transfer is in progress). Gated on dmaBlockingActive, not
+    	// dmaActive - see its declaration comment for why blocking starts
+    	// 2 M-cycles after the trigger write, not immediately.
+    	if (dmaBlockingActive && !dmaInternalRead && (loc < 0xFF80 || loc > 0xFFFE)) {
     		return 0xFF;
     	}
     	if (loc < 0x4000) {  // ROM Bank 0
@@ -2171,7 +2213,7 @@ void WriteMEM(WORD loc, BYTE b){
 	// actual cause that time, but keeping the exception regardless
 	// since it's independently correct real-hardware behavior either
 	// way.)
-	if (dmaActive && loc != 0xFF46 && (loc < 0xFF80 || loc > 0xFFFE)) {
+	if (dmaBlockingActive && loc != 0xFF46 && (loc < 0xFF80 || loc > 0xFFFE)) {
 		return;
 	}
 	if ( loc <= 0x1FFF ) { // $0000-$1FFF - RAM Enable (MBC1/2/3/5)
