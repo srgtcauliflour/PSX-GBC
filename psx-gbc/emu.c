@@ -1205,7 +1205,17 @@ void cycleLength(int cycle) {
 					// relied on before now happened not to exercise this
 					// exact, extremely common pattern.
 					IFLAG |= 0x01;
-					if ((LCDSTATUS >> 4) & 0x01) { IFLAG |= 0x02; }
+					// BUG FIX: real hardware also fires the STAT interrupt
+					// at this exact same moment (LY reaching 144) if the
+					// mode=2 (OAM) STAT interrupt source is enabled (bit
+					// 5) - even though entering VBlank isn't literally
+					// "mode 2". Previously only bit 4 (the dedicated
+					// "fire STAT at VBlank too" source) was checked here.
+					// Confirmed via Mooneye's vblank_stat_intr-GS.gb,
+					// which measures that a mode=2-enabled STAT interrupt
+					// and the dedicated VBlank interrupt land on the
+					// exact same T-cycle at line 144.
+					if (((LCDSTATUS >> 4) & 0x01) || ((LCDSTATUS >> 5) & 0x01)) { IFLAG |= 0x02; }
 				}
 			}
 			if (LCDY == LYC) { IFLAG |= 0x02; } // 3
