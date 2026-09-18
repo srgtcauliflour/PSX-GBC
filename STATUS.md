@@ -40,7 +40,7 @@ evidenced version of all of this):
   `DUMP_WAV` below); the PS1 SPU output half has never been confirmed to
   actually produce audio, since this sandbox can't play or capture sound.
 - Sub-instruction cycle-accurate timing: a large, real, **partially
-  fixed** gap - currently 21/67 on Mooneye's `acceptance/ppu`+`timer`+
+  fixed** gap - currently 29/67 on Mooneye's `acceptance/ppu`+`timer`+
   `interrupts`+top-level suite (started at 11/67). See "What's next"
   item 1 for exactly what's fixed, what's failing, and why.
 
@@ -667,11 +667,96 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   earlier, not attempted here to avoid guessing at something subtly
   wrong the way an earlier DMA-nuance attempt turned out to be.
 
+  **New session: 21/67 → 29/67, six independent, individually-verified
+  fixes, zero regressions.** Toolchain setup was ephemeral (a fresh
+  sandbox, nothing preserved from prior sessions) - rebuilt WLA-DX from
+  source and Mooneye's test suite exactly per "Setting up Mooneye's
+  test suite" above, plus cloned `retrio/gb-test-roms` for `cpu_instrs`
+  regression testing (also not in this repo - see that section for the
+  clone commands). Every fix below was verified against the full
+  `acceptance/ppu`+`timer`+`interrupts`+top-level sweep (diffing the
+  exact pass list, not just the total), `cpu_instrs` (stayed 11/11),
+  Mooneye `mbc1`+`mbc5` (stayed 18/21), and the two small bundled
+  synthetic ROMs at `psn00bsdk-build/iso_files/GAME.GB`/`GAME2.GB`
+  (Blargg's `02-interrupts`/`01-special`, already in this repo, not
+  copyrighted commercial ROMs) re-rendered and diffed pixel-for-pixel
+  via `ROWSUMMARY`/`DUMP_PPM` - no real commercial ROMs were available
+  in this sandbox this session, so that piece of the usual regression
+  discipline (re-render 2-3 real ROMs) couldn't be done; worth doing
+  the next time real ROMs are available, given how central some of
+  these changes are (the interrupt dispatch and PPU-off rewrites
+  especially).
+    1. **IF ($FF0F) now reads unused bits 5-7 as 1** (same convention
+       already used for SIO control and the sound registers) - fixed
+       `if_ie_registers`.
+    2. **DI now cancels a still-pending EI delay, and EI no longer
+       re-arms an already-pending one.** DI only cleared IME, not
+       `EI_PENDING`'s countdown, so a DI executed right after EI didn't
+       actually stop IME from turning on a moment later; EI
+       unconditionally reset the delay to 2 even mid-countdown, pushing
+       IME's activation out an extra instruction whenever EI executed
+       twice in a row. Fixed `rapid_di_ei` and `ei_sequence`.
+    3. **HALT was overcharging 4 T-cycles on every single wait** - its
+       own one-M-cycle decode cost was charged *after* the wait loop,
+       on top of whatever the loop itself already charged, instead of
+       up front like every other opcode. Since a HALT-then-wait-for-
+       VBlank main loop is close to universal across the library, this
+       was a broad per-frame pacing bug, not an edge case. Fixed
+       `halt_ime1_timing2-GS` and two others.
+    4. **Interrupt dispatch now re-reads IE/IF live during the actual
+       PC push**, matching real hardware, instead of picking a vector
+       once up front and pushing PC via the ordinary push()/rst()
+       helpers. Games that deliberately point SP at $FFFF/$FF0F right
+       before an interrupt (a real, documented hardware quirk) can have
+       the push's own write to IE/IF redirect or cancel that exact
+       dispatch. The precise rule (derived and hand-verified against
+       all 4 rounds of the test before implementing): a change from the
+       PC-high-byte write (SP-1) can still redirect/cancel the vector;
+       a change from the PC-low-byte write (SP-2) is always too late,
+       since the vector is already committed by then; IME is cleared
+       either way, cancellation or not. Fixed `ie_push`.
+    5. **The PPU now actually freezes while LCDC bit 7 (LCD enable) is
+       0** - previously LY and the STAT mode/coincidence bits kept
+       advancing even with the display "off" (the entire PPU state
+       machine in `cycleLength()` had no gate on this at all). Real
+       hardware freezes LY at 0 and stops recomputing STAT's mode and
+       LYC-coincidence bits the instant the display turns off, resuming
+       only once turned back on; a coincidence bit that goes from
+       false to true (not "was already true") right as the display
+       turns back on fires the STAT interrupt if that source is
+       enabled. Also made the LYC-coincidence bit recompute immediately
+       on a software write to LYC while the LCD is on (previously only
+       recomputed once per 80-456-cycle PPU mode transition - too
+       coarse for real hardware's effectively-live comparator), and
+       fixed STAT's unused bit 7 to read as 1 (same convention as IF
+       above). Fixed `stat_lyc_onoff`.
+  Remaining failures in this suite, past the already-documented
+  boot-ROM-dependent ones: the CALL/PUSH/POP/RST/RET/OAM-DMA-boundary
+  cluster (`push_timing`, `pop_timing`, `rst_timing`, `call_timing`
+  and its `_2`/`_cc` variants, `ret_timing`/`ret_cc_timing`/
+  `reti_timing`, `jp_timing`/`jp_cc_timing`, `add_sp_e_timing`,
+  `ld_hl_sp_e_timing`, `oam_dma_start`) - **deliberately not touched
+  this session**, since this is the exact cluster whose earlier attempts
+  caused real, silent regressions in actual commercial games (see the
+  `dmaPendingEnd` and `push_timing` history above) and this session had
+  no real ROMs available to validate against; a finer-grained PPU mode-
+  timing cluster (`hblank_ly_scx_timing-GS`, `intr_2_0_timing`,
+  `intr_2_mode0_timing`(`_sprites`), `intr_2_mode3_timing`,
+  `intr_2_oam_ok_timing`, `lcdon_timing-GS`, `lcdon_write_timing-GS`,
+  `stat_irq_blocking`, `vblank_stat_intr-GS`) that's a similarly-sized,
+  separate dedicated effort from what just got fixed above (spot-
+  checked `di_timing-GS`'s source specifically - it hinges on exact
+  frame-period cycle counting across a full VBlank-to-VBlank span, a
+  genuinely deeper nuance than the LCD-on/off freeze fixed above, not
+  more of the same fix); and `tima_write_reloading`/
+  `tma_write_reloading`, unchanged from the already-documented prior
+  attempt.
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
    large, real gap, though real progress has been made.** Currently
-   21 of 67 Mooneye acceptance/ppu+timer+interrupts tests pass (up
+   29 of 67 Mooneye acceptance/ppu+timer+interrupts tests pass (up
    from an initial 11), most of the remaining failures for reasons
    unrelated to the already-known boot-ROM limitation. Comparable in
    scope to the GBC-support or sound-implementation efforts this
