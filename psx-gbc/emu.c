@@ -1117,6 +1117,36 @@ int statLineActive = 0;
 // skipping mode 2); 2 = in the shortened final HBlank phase (about to
 // increment LY normally).
 int lcdOnLine0Phase = 0;
+
+// BUG FIX: the SCX penalty added to mode 3's length was never
+// subtracted back out of the following HBlank - HBLANK_CYCLES was
+// added as a flat, unconditional 204T every single line, so any line
+// with a non-zero (SCX mod 8) grew to 460T or 464T total instead of
+// staying at a fixed 456T. Cached here when mode 3 begins (from
+// whatever Mode3ScxPenalty() returns *then* - SCX can change during
+// mode 3 itself, so this must be sampled once, not re-read later) and
+// subtracted back out of HBLANK_CYCLES when mode 3 ends, keeping
+// every line's total length constant regardless of SCX. Confirmed via
+// Mooneye's hblank_ly_scx_timing-GS.gb, which checks the exact
+// M-cycle LY increments on relative to the mode=0 STAT interrupt at
+// every SCX value 0-8 - a per-line drift like this would desync that
+// measurement by exactly the missing penalty.
+int currentLineMode3Penalty = 0;
+
+// BUG FIX: mode 3's SCX penalty isn't a linear (SCX mod 8) T-cycles as
+// previously implemented - the background pixel FIFO discards whole
+// pixels one at a time, but only ever resumes normal output in
+// 4-pixel-aligned chunks, so the discard for a non-multiple-of-4 SCX
+// still costs a full extra 4T slot. Real behavior is a step function:
+// SCX mod 8 of 0 costs nothing, 1-4 costs a flat 4T, 5-7 costs a flat
+// 8T - i.e. round (SCX mod 8) up to the next multiple of 4. Confirmed
+// via Mooneye's hblank_ly_scx_timing-GS.gb, whose own header comment
+// documents exactly these three cases (51/50/49 M-cycles of HBlank
+// respectively) rather than a smooth per-SCX-value gradient.
+int Mode3ScxPenalty(void) {
+	int scx7 = SCRX & 0x07;
+	return ((scx7 + 3) / 4) * 4;
+}
 void UpdateStatLine(int extraMode2) {
 	int lyc = (LCDY == LYC) && ((LCDSTATUS >> 6) & 0x01);
 	int m0 = (videoMode == HBLANKMODE) && ((LCDSTATUS >> 3) & 0x01);
@@ -1197,7 +1227,8 @@ void cycleLength(int cycle) {
 		if (lcdOnLine0Phase == 1) {
 			lcdOnLine0Phase = 2;
 			videoMode = TRANSFERMODE;
-			VideoCyclesLeft += TRANSFER_CYCLES + (SCRX & 0x07); // BUG FIX: see the overshoot comment above OAM_CYCLES
+			currentLineMode3Penalty = Mode3ScxPenalty();
+			VideoCyclesLeft += TRANSFER_CYCLES + currentLineMode3Penalty; // BUG FIX: see the overshoot comment above OAM_CYCLES
 			UpdateStatLine(0);
 			LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
 			return;
@@ -1326,7 +1357,8 @@ void cycleLength(int cycle) {
 				// fixed, so a longer mode 3 means a shorter mode 0) at
 				// every SCX value 0-8 and checks the exact M-cycle LY
 				// increments on relative to the mode=0 STAT interrupt.
-				VideoCyclesLeft += TRANSFER_CYCLES + (SCRX & 0x07); // BUG FIX: see the overshoot comment above OAM_CYCLES
+				currentLineMode3Penalty = Mode3ScxPenalty();
+				VideoCyclesLeft += TRANSFER_CYCLES + currentLineMode3Penalty; // BUG FIX: see the overshoot comment above OAM_CYCLES
 				// BUG FIX: mode 3 (transfer) has no STAT interrupt source of
 				// its own - this used to re-check bit 5 (mode=2) here too,
 				// double-firing the OAM interrupt a second time as OAM
@@ -1349,11 +1381,15 @@ void cycleLength(int cycle) {
 					// declaration comment. Once this fires, line 0's special
 					// handling is done; the LY++ this triggers next proceeds
 					// completely normally, as does every following line.
-					VideoCyclesLeft += HBLANK_CYCLES - 8;
+					VideoCyclesLeft += HBLANK_CYCLES - 8 - currentLineMode3Penalty;
 					lcdOnLine0Phase = 0;
 				} else {
-					VideoCyclesLeft += HBLANK_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
+					// BUG FIX: see currentLineMode3Penalty's declaration
+					// comment - without this, every line with a non-zero
+					// SCX mod 8 grew past the real, fixed 456T line length.
+					VideoCyclesLeft += HBLANK_CYCLES - currentLineMode3Penalty; // BUG FIX: see the overshoot comment above OAM_CYCLES
 				}
+				currentLineMode3Penalty = 0;
 				// BUG FIX: mode 0 (HBlank)'s own STAT interrupt (bit 3) had
 				// no check anywhere - the only bit-3 check in this whole
 				// function was on the *next* line's OAM-mode-entry site

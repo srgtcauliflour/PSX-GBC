@@ -1151,6 +1151,70 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   fixed-instruction-count snapshot, so a fully clean diff here is
   expected rather than surprising.
 
+  **Seventh follow-up, same session: mode 3's SCX penalty was a real
+  bug, plus a promising-but-inconclusive interrupt-timing lead on
+  `hblank_ly_scx_timing-GS`.** Investigating that test's own
+  documented SCX-penalty table ("(SCX mod 8) = 0 => nothing, 1-4 =>
+  50 M-cycles of HBlank, 5-7 => 49") surfaced two real, independent
+  bugs in the existing SCX-length code from earlier this session:
+  1. **The penalty itself was linear (`SCX mod 8` T-cycles), not the
+     real step function.** The background pixel FIFO only ever
+     resumes output in 4-pixel-aligned chunks, so a non-multiple-of-4
+     discard still costs a full extra 4T slot - i.e. `SCX mod 8` of
+     1-4 costs a flat 4T, 5-7 costs a flat 8T, not a smooth per-value
+     gradient. Fixed via a small `Mode3ScxPenalty()` helper (round
+     `SCX mod 8` up to the next multiple of 4).
+  2. **The penalty was never subtracted back out of HBlank.**
+     `HBLANK_CYCLES` was added as an unconditional flat 204T every
+     line, regardless of whatever penalty mode 3 had just taken - so
+     any line with a non-zero `SCX mod 8` grew to 460T or 464T total
+     instead of staying at the real, fixed 456T. This is a genuine,
+     independent bug (verified by direct T-cycle tracing of mode 3's
+     actual start/end points against a synthetic SCX=1 case) that
+     would have caused real, silent frame-timing drift in any game
+     that scrolls to a non-8-aligned SCX value - which is most of
+     them. Fixed by caching the penalty when mode 3 begins
+     (`currentLineMode3Penalty`, since SCX can change again before
+     mode 3 ends) and subtracting the same amount back out of
+     `HBLANK_CYCLES` when it ends.
+
+  Both fixes verified regression-free on their own (full sweep
+  unchanged, mbc1/mbc5 at 18/21, `cpu_instrs.gb` 11/11, 5/6 real ROMs
+  byte-identical - Pokemon Red's dump differed, confirmed benign via
+  the same sequential-dump technique used earlier this session, same
+  title-screen animation just at a different phase).
+
+  Getting `hblank_ly_scx_timing-GS` to actually pass needed one more
+  piece: empirically, its SCX=0 case only passed with an *additional*
+  4T delay between mode 0's STAT bits becoming visible and the mode=0
+  STAT interrupt actually firing (measured via a HALT-based round
+  trip whose every other component - interrupt dispatch, `ADD SP,e`,
+  `RET`, `CALL`, `NOP`, `LD A,(HL)` - is independently pinned by other
+  already-passing tests, leaving this as the one unaccounted-for gap).
+  That delay is a real, measured finding, but applying it broke
+  `intr_2_0_timing` (which measures the interval between mode 2's and
+  mode 0's STAT interrupts, and had been passing): delaying mode 0's
+  interrupt alone stretches that interval by 4T; delaying mode 2's
+  interrupt by the same amount *to compensate* was tried too, but
+  measured zero effect (a direct, reproducible finding, not a guess),
+  meaning the real mechanism isn't as simple as "delay every mode-
+  entry interrupt check uniformly by one M-cycle." Given
+  `intr_2_0_timing` was a currently-passing test, the interrupt-delay
+  change was reverted entirely (confirmed by re-running the full
+  regression sweep with it removed: byte-identical to the pre-this-
+  round baseline) rather than accepted as a net-zero trade with a
+  hidden regression. The two SCX fixes above were kept (independently
+  justified, zero regression risk on their own); `hblank_ly_scx_timing-GS`
+  itself remains failing, but with a precisely quantified, reproducible
+  4T gap and a documented dead end (delaying mode 2 too) for whoever
+  picks this up next - a considerably narrower unknown than "still-
+  unidentified gap in the interrupt-dispatch-to-polling-read latency
+  chain" was before this round. **Result: acceptance sweep unchanged
+  at 52/67 (no new pass, no regression), but the SCX-penalty
+  compensation bug fix is real, independently valuable progress kept
+  from this investigation, and the interrupt-timing dead end is now
+  on record instead of needing to be rediscovered.**
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
@@ -1189,13 +1253,30 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
      vary with the number/position of sprites on the current line (on
      top of the SCX penalty above) - a separate, larger penalty model.
    - `hblank_ly_scx_timing-GS` - the SCX-length fix above is real and
-     kept, but doesn't make this test pass: its very first check
-     (SCX=0) already fails, pointing at a still-unidentified gap in the
-     interrupt-dispatch-to-polling-read latency chain it depends on.
-     (This session briefly suspected a connection to the mode-3-timing
-     quirk found via `lcdon_timing-GS`, but that quirk turned out to
-     be specific to the line right after LCD power-on, not general -
-     see that entry above. Ruled out, not the same bug.)
+     kept, and this session went further: fixed two real, independent
+     bugs in the SCX penalty itself (it was a linear `SCX mod 8`
+     instead of the real step function, and it was never subtracted
+     back out of HBlank, so any non-zero-`SCX mod 8` line silently
+     grew past the real, fixed 456T line length - see the seventh
+     follow-up entry above for the full detail). Even so, this test's
+     own SCX=0 case (where neither fix contributes anything) still
+     fails on its own, narrowed down to a precisely quantified 4T gap:
+     empirically, the read needs the mode=0 STAT interrupt to fire 4T
+     *later* relative to when mode 0's STAT bits become visible than
+     this project currently does. A same-sized delay applied to mode
+     0's interrupt alone fixes this test but breaks the currently-
+     passing `intr_2_0_timing` (which measures the mode2-to-mode0
+     interrupt interval); the natural fix - delaying mode 2's
+     interrupt by the same 4T to compensate - was tried and measured
+     to have *zero* effect on that interval, a real, reproducible dead
+     end, not a guess. The right mechanism is evidently something more
+     specific than "delay every mode-transition interrupt check by one
+     M-cycle" - worth a dedicated investigation with fresh eyes rather
+     than more guessing here. (This session also briefly suspected a
+     connection to the mode-3-timing quirk found via `lcdon_timing-GS`,
+     but that quirk turned out to be specific to the line right after
+     LCD power-on, not general - see that entry above. Ruled out, not
+     the same bug.)
 2. ~~**Kirby's Pinball Land hang**~~ **RESOLVED this session** (re-
    confirmed a second time later in the same session, against the
    `oam_dma_start` fix too - still rendering real, active gameplay,
