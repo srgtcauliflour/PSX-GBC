@@ -1268,7 +1268,20 @@ void cycleLength(int cycle) {
 		} else {
 			if (videoMode == OAMMODE) {
 				videoMode = TRANSFERMODE;
-				VideoCyclesLeft += TRANSFER_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
+				// BUG FIX: mode 3's length was a fixed 172T constant,
+				// ignoring the real, well-documented SCX penalty - the
+				// background pixel FIFO has to discard (SCX mod 8) pixels
+				// from the very first tile it fetches each scanline (to
+				// actually start displaying at the sub-tile scroll
+				// offset), costing that many extra T-cycles, sampled once
+				// from SCX at the exact moment mode 3 begins (not
+				// continuously). Confirmed via Mooneye's
+				// hblank_ly_scx_timing-GS.gb, which measures the resulting
+				// HBlank-length change (the total scanline length is
+				// fixed, so a longer mode 3 means a shorter mode 0) at
+				// every SCX value 0-8 and checks the exact M-cycle LY
+				// increments on relative to the mode=0 STAT interrupt.
+				VideoCyclesLeft += TRANSFER_CYCLES + (SCRX & 0x07); // BUG FIX: see the overshoot comment above OAM_CYCLES
 				// BUG FIX: mode 3 (transfer) has no STAT interrupt source of
 				// its own - this used to re-check bit 5 (mode=2) here too,
 				// double-firing the OAM interrupt a second time as OAM
