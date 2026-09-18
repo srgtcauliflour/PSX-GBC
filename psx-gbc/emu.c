@@ -3868,14 +3868,23 @@ void OPE8(void){ // case  0xE8:
 	// an *unsigned* 8-bit add of SP's low byte with the immediate (even
 	// though the actual addition to SP is sign-extended) - order matters:
 	// compute the flags from the pre-update SP before overwriting it.
+	// BUG FIX (sub-instruction timing): split into its real 4 M-cycles
+	// (fetch, read e, 2 internal delays) instead of one lump
+	// cycleLength(16) at the end - see the comment on OP77/OPE0 for why;
+	// Mooneye's add_sp_e_timing.gb specifically depends on the read of
+	// `e` landing on the correct M-cycle relative to a concurrent OAM
+	// DMA transfer.
+	cycleLength(4); // M1: fetch
 	BYTE e = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read e
 	int result = reg_SP + (signed char)e;
 	setH(((reg_SP & 0x0F) + (e & 0x0F)) > 0x0F);
 	setC(((reg_SP & 0xFF) + (e & 0xFF)) > 0xFF);
 	reg_SP = (WORD)(result & 0xFFFF);
 	setZ(0);
 	setN(0);
-	cycleLength(16);
+	cycleLength(4); // M3: internal delay
+	cycleLength(4); // M4: internal delay
 } // E8    ADD  SP,dd
 
 void OPE9(void){ // case  0xE9:
@@ -3967,14 +3976,18 @@ void OPF8(void){ // case  0xF8:
 	// BUG FIX: previously set no flags at all. Same H/C computation as
 	// ADD SP,e8 above (this is really the same ALU operation, just written
 	// to HL instead of back to SP) - Z and N always clear.
+	// BUG FIX (sub-instruction timing): split into its real 3 M-cycles
+	// (fetch, read e, internal delay) - see the comment on OPE8/OP77.
+	cycleLength(4); // M1: fetch
 	BYTE e = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read e
 	int result = reg_SP + (signed char)e;
 	setH(((reg_SP & 0x0F) + (e & 0x0F)) > 0x0F);
 	setC(((reg_SP & 0xFF) + (e & 0xFF)) > 0xFF);
 	reg_HL = (WORD)(result & 0xFFFF);
 	setZ(0);
 	setN(0);
-	cycleLength(12);
+	cycleLength(4); // M3: internal delay
 } // F8    LD   HL,SP+dd
 
 void OPF9(void){ // case  0xF9:
