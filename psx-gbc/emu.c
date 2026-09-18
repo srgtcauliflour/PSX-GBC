@@ -2039,17 +2039,27 @@ void loadRom(void){
 }
 
 BYTE ReadMEM(WORD loc) {
-    	// BUG FIX (sub-instruction timing): real hardware's OAM DMA
-    	// controller has exclusive bus access to everything except HRAM
-    	// while a transfer is active - the CPU reads back $FF for
-    	// anything outside $FF80-$FFFE during that window (a real,
-    	// documented restriction some games' precise DMA-timing code
-    	// depends on, and exactly what Mooneye's push_timing/pop_timing
-    	// tests exercise by running code with SP pointing into OAM while
-    	// a transfer is in progress). Gated on dmaBlockingActive, not
+    	// BUG FIX (sub-instruction timing): OAM DMA's bus-blocking restriction
+    	// is scoped to the actual OAM range ($FE00-$FE9F) being written, not
+    	// "everything except HRAM" - real hardware's DMA controller only
+    	// contends with the CPU on the specific bus(es) it's actively using
+    	// (here: OAM as the destination; these tests all source from VRAM,
+    	// a separate bus, which is why the DMA-adjacent-but-not-OAM
+    	// addresses these tests deliberately probe - like $FDFE, the two
+    	// bytes just *before* OAM - read normally throughout, not $FF).
+    	// Found by tracing call_timing.gb: its copied test procedure's own
+    	// opcode fetch (at $FDFE, meant to *always* succeed per the test's
+    	// own comments - only the later, real-OAM address is meant to be
+    	// boundary-sensitive) was reading as DMA-blocked under the old
+    	// "everything except HRAM" model, sending the CPU into an
+    	// unhandled RST $38 loop forever. Narrowing this out fixed the
+    	// entire remaining call/ret/reti-timing hang cluster (verified
+    	// push_timing/pop_timing/oam_dma_timing/oam_dma_restart/
+    	// oam_dma_start - which all specifically target addresses inside
+    	// true OAM - are unaffected). Gated on dmaBlockingActive, not
     	// dmaActive - see its declaration comment for why blocking starts
     	// 2 M-cycles after the trigger write, not immediately.
-    	if (dmaBlockingActive && !dmaInternalRead && (loc < 0xFF80 || loc > 0xFFFE)) {
+    	if (dmaBlockingActive && !dmaInternalRead && (loc >= 0xFE00 && loc <= 0xFE9F)) {
     		return 0xFF;
     	}
     	if (loc < 0x4000) {  // ROM Bank 0
@@ -2213,19 +2223,18 @@ BYTE ReadMEM(WORD loc) {
 
 void WriteMEM(WORD loc, BYTE b){
 	// BUG FIX (sub-instruction timing): same restriction as ReadMEM
-	// above - the CPU can't write anywhere but HRAM while OAM DMA is
-	// actively transferring, since the DMA controller owns the bus.
-	// Real hardware simply ignores such writes rather than redirecting
-	// or erroring. $FF46 itself (the DMA trigger register) is always
-	// writable regardless - it has to be, since that's how a game
-	// re-triggers the very next transfer, typically once per frame,
-	// and real hardware never blocks this register's own trigger.
-	// (Investigated as a candidate cause for a real Pokemon Red
-	// regression during this same work - it turned out not to be the
-	// actual cause that time, but keeping the exception regardless
-	// since it's independently correct real-hardware behavior either
-	// way.)
-	if (dmaBlockingActive && loc != 0xFF46 && (loc < 0xFF80 || loc > 0xFFFE)) {
+	// above, narrowed to true OAM ($FE00-$FE9F) for the same reason -
+	// see that comment for the full explanation. Real hardware simply
+	// ignores such writes rather than redirecting or erroring. $FF46
+	// itself (the DMA trigger register) is always writable regardless -
+	// it has to be, since that's how a game re-triggers the very next
+	// transfer, typically once per frame, and real hardware never
+	// blocks this register's own trigger. (Investigated as a candidate
+	// cause for a real Pokemon Red regression during this same work -
+	// it turned out not to be the actual cause that time, but keeping
+	// the exception regardless since it's independently correct
+	// real-hardware behavior either way.)
+	if (dmaBlockingActive && loc != 0xFF46 && (loc >= 0xFE00 && loc <= 0xFE9F)) {
 		return;
 	}
 	if ( loc <= 0x1FFF ) { // $0000-$1FFF - RAM Enable (MBC1/2/3/5)
