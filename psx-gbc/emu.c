@@ -1087,6 +1087,24 @@ int APUChannelOutput(int channelNum) {
 // mode - backwards - instead of when actually entering HBlank, which
 // had no check at all).
 int statLineActive = 0;
+// BUG FIX: real hardware's line 0 immediately after the LCD is turned on
+// (LCDC bit 7 going 0->1) is NOT a normal scanline - it starts with a
+// glitched "fake mode 0" phase (STAT reads mode 0, but it lasts the same
+// 80T as a normal mode 2, and doesn't block OAM/VRAM access), skips mode 2
+// (OAM search) entirely, and its final HBlank is 8T shorter than normal -
+// making the whole line 448T instead of 456T (this total deficit is
+// confirmed exactly by Mooneye's lcdon_timing-GS.gb's LY checks, which all
+// pass with this split; attributing the whole 8T to the final HBlank
+// specifically, rather than some other split between the phases below, is
+// this implementation's choice and isn't independently pinned down by any
+// currently-passing check - the STAT/OAM/VRAM sub-checks that would
+// validate the exact internal boundaries still fail, on a separate,
+// already-documented bug elsewhere in mode 3's timing). Every line from
+// line 1 onward is completely normal. 0 = not in this special phase; 1 =
+// in the initial fake-mode-0 phase (about to go straight to mode 3,
+// skipping mode 2); 2 = in the shortened final HBlank phase (about to
+// increment LY normally).
+int lcdOnLine0Phase = 0;
 void UpdateStatLine(int extraMode2) {
 	int lyc = (LCDY == LYC) && ((LCDSTATUS >> 6) & 0x01);
 	int m0 = (videoMode == HBLANKMODE) && ((LCDSTATUS >> 3) & 0x01);
@@ -1157,6 +1175,18 @@ void cycleLength(int cycle) {
 	if (!(LCDCONTROL & 0x80)) { return; }
 	VideoCyclesLeft -= sysCycle;
 	if(VideoCyclesLeft <= 0) { // Video
+		// BUG FIX: line 0's special post-power-on "fake mode 0" phase (see
+		// lcdOnLine0Phase's declaration comment) ends here - it goes
+		// straight to mode 3, skipping mode 2 (OAM search) and without
+		// touching LY, unlike a real HBlank/VBlank expiry below.
+		if (lcdOnLine0Phase == 1) {
+			lcdOnLine0Phase = 2;
+			videoMode = TRANSFERMODE;
+			VideoCyclesLeft += TRANSFER_CYCLES + (SCRX & 0x07); // BUG FIX: see the overshoot comment above OAM_CYCLES
+			UpdateStatLine(0);
+			LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
+			return;
+		}
 		if((videoMode == HBLANKMODE) || (videoMode == VBLANKMODE)){
 			LCDY++;
 			// BUG FIX: was wrapping at 0x100 (256) instead of 154 (144 visible
@@ -1297,7 +1327,18 @@ void cycleLength(int cycle) {
 			}
 			if (videoMode == TRANSFERMODE) {
 				videoMode = HBLANKMODE;
-				VideoCyclesLeft += HBLANK_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
+				if (lcdOnLine0Phase == 2) {
+					// BUG FIX: line 0's own final HBlank (after its mode 3,
+					// entered via the fake-mode-0 skip above) is 8T shorter
+					// than a normal HBlank - see lcdOnLine0Phase's
+					// declaration comment. Once this fires, line 0's special
+					// handling is done; the LY++ this triggers next proceeds
+					// completely normally, as does every following line.
+					VideoCyclesLeft += HBLANK_CYCLES - 8;
+					lcdOnLine0Phase = 0;
+				} else {
+					VideoCyclesLeft += HBLANK_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
+				}
 				// BUG FIX: mode 0 (HBlank)'s own STAT interrupt (bit 3) had
 				// no check anywhere - the only bit-3 check in this whole
 				// function was on the *next* line's OAM-mode-entry site
@@ -2697,10 +2738,18 @@ void WriteMEM(WORD loc, BYTE b){
 					// branch's UpdateStatLine() call correctly detects a
 					// rising edge only when it's a genuine one.
 					statLineActive = ((LCDSTATUS >> 2) & 0x01) && ((LCDSTATUS >> 6) & 0x01);
+					lcdOnLine0Phase = 0;
 				} else if (!(oldLCDC & 0x80) && (b & 0x80)) {
 					LCDY = 0;
 					videoMode = HBLANKMODE;
 					VideoCyclesLeft = OAM_CYCLES;
+					// BUG FIX: line 0 right after power-on isn't a normal
+					// scanline - see lcdOnLine0Phase's declaration comment.
+					// This flags the state machine to skip mode 2 and end
+					// with an 8T-short HBlank once this phase's 80T (the
+					// same length as normal mode 2/OAM search, just
+					// reported as mode 0 and not OAM/VRAM-blocking) expire.
+					lcdOnLine0Phase = 1;
 					LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
 					// Powering on restarts the comparison at LY=0 and
 					// immediately recomputes the composite STAT line

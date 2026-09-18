@@ -44,11 +44,13 @@ evidenced version of all of this):
   `interrupts`+top-level suite (started at 11/67). The entire CALL/
   PUSH/POP/RST/RET/JP/ADD SP,e/OAM-DMA sub-family and most of the STAT-
   interrupt/PPU-mode-timing cluster are now fixed; VRAM-access
-  blocking during mode 3 is also now implemented and verified
-  regression-free. What's left is a documented "PPU is 2 T-cycles
-  late on line 0" quirk for LCDC-on-specific timing, sprite-count-
-  dependent mode-3 length, and two narrow TIMA-reload edge cases. See
-  "What's next" item 1 for detail.
+  blocking during mode 3 and line 0's own special post-power-on
+  timing are also now implemented and verified regression-free (all
+  24 of `lcdon_timing-GS`'s LY checks pass). What's left is a general
+  4T mode-3-exit-timing bug (affects `lcdon_timing-GS`'s STAT check
+  and likely `hblank_ly_scx_timing-GS` too), sprite-count-dependent
+  mode-3 length, and two narrow TIMA-reload edge cases. See "What's
+  next" item 1 for detail.
 - Kirby's Pinball Land's long-standing blank-screen hang: resolved as
   a side effect of this suite's HALT-timing fix - see "What's next"
   item 2.
@@ -1015,6 +1017,90 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   **Result: still 50/67, but VRAM blocking is now a safely-verified
   building block for the line-0-quirk work.**
 
+  **Fifth follow-up, same session: line 0's special post-power-on
+  timing.** Reverse-engineered the qualitative schedule directly from
+  `lcdon_timing-GS.s`'s own 24-entry expectation table (all 3 passes,
+  cross-referencing LY/STAT/OAM-access/VRAM-access at every sampled
+  M-cycle - the test's own "nops XXX" comments turned out to label
+  M-cycle counts, not T-cycles, once cross-checked against the actual
+  instruction timings between reads) rather than trusting the `.s`
+  file's own paraphrased "PPU is late by 2 T-cycles" comment, which
+  didn't match the derived numbers closely enough to be usable
+  directly. The real schedule: right after LCDC's power-on write,
+  line 0 spends a normal 80T in a "fake mode 0" phase (STAT reads
+  mode 0, but OAM/VRAM stay unblocked - it behaves like mode 2's
+  length without being mode 2), then goes straight to mode 3
+  (TRANSFERMODE), *skipping mode 2 (OAM search) entirely* - skipping
+  the search itself is why OAM has real, uninitialized-looking data
+  on the very first frame after power-on on real hardware. Mode 3
+  then runs its normal 172T (plus the usual SCX penalty), and the
+  line's closing HBlank is shorter than normal before LY increments
+  to 1 and every following line proceeds completely normally.
+
+  The *exact* size of that HBlank shortening is where hand-derivation
+  from the table's absolute M-cycle offsets (matching this project's
+  established, repeatedly-learned lesson about this exact kind of
+  arithmetic) proved unreliable: a first symbolic derivation of the
+  alignment between the LCDC write and the table's own "M-cycle 0"
+  reference point predicted a 4T-short HBlank (200T HBlank, 452T
+  total), which the harness's own Mooneye DUMP_HRAM state (fail_round/
+  fail_expect/fail_actual, which the test conveniently writes to
+  fixed, dumpable HRAM addresses on the very first mismatch) showed
+  was wrong by exactly one M-cycle once actually tested. Corrected
+  empirically against that same feedback instead of re-deriving by
+  hand: the real deficit is 8T, not 4T (448T total, not 452T) -
+  attributed here entirely to the closing HBlank (196T instead of
+  204T) since that's the only unconstrained parameter that reproduces
+  the correct total; the exact internal mode0->mode3 and mode3->hblank
+  boundary *positions* within line 0 aren't independently confirmed
+  by any check that currently passes (see below).
+
+  Implemented as a small 3-state flag (`lcdOnLine0Phase`: 0 = normal,
+  1 = in the fake-mode-0 phase headed for mode 3, 2 = in the
+  shortened closing HBlank headed for LY++), set by the LCDC power-on
+  write handler and consumed by two small intercepts in `cycleLength()`'s
+  existing mode-transition state machine - no change to line 1 onward,
+  which already goes through the same, unmodified general-case code.
+  Verified directly against the DUMP_HRAM state described above:
+  **all 24 of the test's `LY` checks now pass exactly** (previously
+  wrong from the very first read after M-cycle 20). Full regression sweep unchanged
+  at 50/67 (byte-identical composition), mbc1/mbc5 at the known 18/21
+  baseline, `cpu_instrs.gb` still 11/11, and 5 of 6 real ROMs
+  byte-identical to the prior round's dumps; Pokemon Red's dump
+  differed, confirmed benign via a sequential run of dumps a few
+  thousand instructions apart (same title screen, coherent bobbing-
+  logo animation across the sequence - just a different animation
+  phase landing at the fixed 5M-instruction snapshot, the same
+  pattern already seen and verified benign for this exact ROM earlier
+  in this project's history), not a rendering regression.
+
+  `lcdon_timing-GS` as a whole still fails overall - past the LY
+  checks, its STAT sub-check fails next, and this exposed a *separate,
+  more general* bug, unrelated to LCD-on: on line 1 (an entirely
+  ordinary line, well past any of the power-on special-casing), mode 3
+  holds for 176T before yielding to HBlank instead of the expected
+  172T - confirmed independently via both the STAT and VRAM-access
+  arrays landing on the exact same M-cycle boundary. (`intr_2_mode3_timing`
+  was checked as a candidate for the same root cause since it also
+  exercises mode 3's exit boundary, but it already passes, so this
+  isn't that.) This is a real, newly-quantified 4T discrepancy in
+  mode 3's exit/HBlank-entry timing that's a strong candidate for the
+  root cause already flagged (but not identified) for
+  `hblank_ly_scx_timing-GS` below, whose very first check (SCX=0,
+  where the SCX-length fix contributes nothing) fails for an until-now
+  unidentified reason - a mode-3-holds-4T-too-long bug would produce
+  exactly that symptom. Given the size of this session's line-0
+  investigation already, this general mode-3-exit-timing bug was
+  deliberately left for its own dedicated pass rather than chased
+  further here. **Result: still 50/67 (this fix doesn't flip
+  `lcdon_timing-GS`'s own pass/fail, since its STAT check still fails -
+  just later, and for a different, now-identified reason), but line
+  0's own timing is now real, verified-correct, hardware-accurate
+  behavior, and there's now a concrete, quantified lead (a 4T
+  mode-3-exit delay) connecting `lcdon_timing-GS`/
+  `lcdon_write_timing-GS` to `hblank_ly_scx_timing-GS`'s
+  already-documented but previously unexplained SCX=0 failure.**
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
@@ -1035,22 +1121,27 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    with SCX. **What's left, each a distinct, bounded gap - not more of
    what's already fixed**:
    - `lcdon_timing-GS`/`lcdon_write_timing-GS` - VRAM access blocking
-     during mode 3 is now implemented and verified regression-free
-     (see the fourth follow-up entry above), but that alone doesn't
-     pass either test. What's still missing is the documented "the
-     PPU is 2 T-cycles late on line 0 specifically, lines 1+ are
-     normal" quirk from `lcdon_timing-GS.s`'s 24-entry expectation
-     table - reverse-engineer the exact transition points from its
-     `expect_ly`/`expect_stat_lyc0`/`expect_stat_lyc1`/
-     `expect_oam_access`/`expect_vram_access` arrays across 3 passes
-     at cycle offsets 0/17/60/110/130/174/224/244 (+1/+2).
+     during mode 3 (fourth follow-up above) and line 0's own special
+     post-power-on timing (fifth follow-up above, `lcdOnLine0Phase`)
+     are both now implemented and verified regression-free; all 24 of
+     `lcdon_timing-GS`'s `LY` checks now pass exactly. What's left is
+     *not* a line-0-specific gap any more: the test's STAT sub-check
+     now fails on ordinary line 1, on a general mode-3-exit-timing bug
+     (mode 3 holds 4T too long before yielding to HBlank) - see the
+     `hblank_ly_scx_timing-GS` entry below, which this is very likely
+     the same root cause of.
    - `intr_2_mode0_timing_sprites` - needs mode 3's length to also
      vary with the number/position of sprites on the current line (on
      top of the SCX penalty above) - a separate, larger penalty model.
    - `hblank_ly_scx_timing-GS` - the SCX-length fix above is real and
      kept, but doesn't make this test pass: its very first check
-     (SCX=0) already fails, pointing at a still-unidentified gap in the
-     interrupt-dispatch-to-polling-read latency chain it depends on.
+     (SCX=0) already fails. No longer entirely unidentified: this
+     session's `lcdon_timing-GS` investigation (fifth follow-up above)
+     independently found and quantified a real bug matching this
+     exact symptom - mode 3 holds for 176T instead of 172T before
+     yielding to HBlank on an ordinary line, confirmed via both STAT
+     and VRAM-access data landing on the same M-cycle boundary. Worth
+     checking first before assuming a different cause.
    - `tima_write_reloading`/`tma_write_reloading` - a narrow, already-
      investigated edge case (exactly which T-cycle(s) within TIMA's
      4-cycle reload window a write does or doesn't cancel the reload) -
