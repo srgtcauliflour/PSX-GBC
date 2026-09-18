@@ -3577,18 +3577,34 @@ void OPC1(void){ // case  0xC1:
 } // C1    POP  BC
 
 void OPC2(void){ // case  0xC2:
+	// BUG FIX (sub-instruction timing): split into its real M-cycles
+	// (fetch, read address low byte, read address high byte, then an
+	// internal delay only when the branch is actually taken) instead of
+	// reading both address bytes atomically via ReadWord() and charging
+	// one lump cycleLength() after - see the comment on OP77/OPE0 for
+	// why this matters for any instruction whose memory access can
+	// observe DMA-blocked state mid-read. Matches Mooneye's own
+	// jp_timing.gb/jp_cc_timing.gb M-cycle diagram exactly.
+	cycleLength(4); // M1: fetch
+	BYTE lo = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read address low byte
+	BYTE hi = ReadMEM(reg_PC++);
+	cycleLength(4); // M3: read address high byte
 	if (!getZ()) {
-		reg_PC = jp(ReadWord(reg_PC));
-		cycleLength(16);
-	} else {
-		reg_PC += 2;
-		cycleLength(12);
+		reg_PC = jp((WORD)(lo | (hi << 8)));
+		cycleLength(4); // M4: internal delay (branch taken)
 	}
 } // C2    JP   NZ,nnnn
 
 void OPC3(void){ // case  0xC3:
-	reg_PC = jp(ReadWord(reg_PC));
-	cycleLength(16);
+	// BUG FIX (sub-instruction timing): see OPC2's comment.
+	cycleLength(4); // M1: fetch
+	BYTE lo = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read address low byte
+	BYTE hi = ReadMEM(reg_PC++);
+	cycleLength(4); // M3: read address high byte
+	reg_PC = jp((WORD)(lo | (hi << 8)));
+	cycleLength(4); // M4: internal delay
 } // C3    JP   nnnn
 
 void OPC4(void){ // case  0xC4:
@@ -3637,13 +3653,15 @@ void OPC9(void){ // case  0xC9:
 } // C9    RET
 
 void OPCA(void){ // case  0xCA:
+	// BUG FIX (sub-instruction timing): see OPC2's comment.
+	cycleLength(4); // M1: fetch
+	BYTE lo = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read address low byte
+	BYTE hi = ReadMEM(reg_PC++);
+	cycleLength(4); // M3: read address high byte
 	if (getZ()) {
-		reg_PC = jp(ReadWord(reg_PC));
-		cycleLength(16);
-	} else {
-		//ReadWord(reg_PC);
-		reg_PC += 2;
-		cycleLength(12);
+		reg_PC = jp((WORD)(lo | (hi << 8)));
+		cycleLength(4); // M4: internal delay (branch taken)
 	}
 }	// CA    JP   Z,nnnn
 
@@ -3710,13 +3728,15 @@ void OPD1(void){ // case  0xD1:
 } // D1    POP  DE
 
 void OPD2(void){ // case  0xD2:
+	// BUG FIX (sub-instruction timing): see OPC2's comment.
+	cycleLength(4); // M1: fetch
+	BYTE lo = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read address low byte
+	BYTE hi = ReadMEM(reg_PC++);
+	cycleLength(4); // M3: read address high byte
 	if (getC() != 1) {
-		reg_PC = jp(ReadWord(reg_PC));
-		//reg_PC += 2; // TODO: TEST
-		cycleLength(16); // BUG FIX: was 20, real hardware is 16 when taken
-	} else {
-		reg_PC += 2;
-		cycleLength(12); // BUG FIX: was 8, real hardware is 12 when not taken
+		reg_PC = jp((WORD)(lo | (hi << 8)));
+		cycleLength(4); // M4: internal delay (branch taken)
 	}
 }// D2    JP   NC,nnnn
 
@@ -3762,13 +3782,15 @@ void OPD9(void){ // case  0xD9:
 // timing reti_intr_timing.gb already depends on.
 cycleLength(4); reg_PC = ret(); IME = 1; cycleLength(4); } // D9    RETI
 void OPDA(void){ // case  0xDA:
+	// BUG FIX (sub-instruction timing): see OPC2's comment.
+	cycleLength(4); // M1: fetch
+	BYTE lo = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read address low byte
+	BYTE hi = ReadMEM(reg_PC++);
+	cycleLength(4); // M3: read address high byte
 	if (getC() != 0) {
-		reg_PC = jp(ReadWord(reg_PC));
-		//reg_PC += 2; // TODO: TEST
-		cycleLength(16);
-	} else {
-		reg_PC += 2;
-		cycleLength(12);
+		reg_PC = jp((WORD)(lo | (hi << 8)));
+		cycleLength(4); // M4: internal delay (branch taken)
 	}
 }// DA    JP   C,nnnn
 void OPDB(void){
