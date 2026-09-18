@@ -43,6 +43,9 @@ evidenced version of all of this):
   fixed** gap - currently 29/67 on Mooneye's `acceptance/ppu`+`timer`+
   `interrupts`+top-level suite (started at 11/67). See "What's next"
   item 1 for exactly what's fixed, what's failing, and why.
+- Kirby's Pinball Land's long-standing blank-screen hang: resolved as
+  a side effect of this suite's HALT-timing fix - see "What's next"
+  item 2.
 
 **Priority order to actually work from is "What's next" below, kept
 current** - don't re-derive priorities from the historical log above it.
@@ -330,22 +333,23 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   render correctly without CGB tile-attribute support — an expected
   consequence of this project's already-documented lack of GBC support,
   not a new bug.
-- **One real, unresolved issue found and deeply investigated: Kirby's
-  Pinball Land hangs on a blank screen.** Traced via the same reference-
-  diffing technique to a Timer-interrupt-gated countdown flag in HRAM
-  that only this emulator fails to ever fully decrement — the Timer
-  interrupt is requested at the correct rate throughout (135 times in
-  1 million instructions) but its vector is reached only once, while
-  VBlank (higher priority, very similar ~70000-cycle period) reaches
-  its own vector 134 times in the same window. Leading hypothesis:
-  VBlank's near-identical period plus higher priority is systematically
-  starving Timer once some small, still-unidentified cycle-accounting
-  phase difference exists between this emulator and real hardware -
-  Peanut-GB shows the same general shape (also polls once per frame)
-  but does eventually get enough Timer services through, where this
-  emulator never does. Not yet root-caused; next step if resumed is
-  auditing this specific ROM's actual VBlank/Timer handler instruction
-  costs against an authoritative cycle-count table.
+- **Kirby's Pinball Land's blank-screen hang — RESOLVED in a later
+  session** (see "What's next" item 2 for the fix and the real-ROM
+  evidence). Originally traced via reference-diffing to a Timer-
+  interrupt-gated countdown flag in HRAM that only this emulator
+  failed to ever fully decrement — the Timer interrupt was requested
+  at the correct rate throughout (135 times in 1 million instructions)
+  but its vector was reached only once, while VBlank (higher priority,
+  very similar ~70000-cycle period) reached its own vector 134 times in
+  the same window. The leading hypothesis at the time - "some small,
+  still-unidentified cycle-accounting phase difference" systematically
+  starving Timer relative to VBlank - turned out to match a real bug
+  found independently, much later, via Mooneye's suite rather than by
+  chasing this ROM directly: HALT was overcharging every wait by 4
+  T-cycles (see the sub-instruction timing section above). Once real
+  ROMs were available again to check against, this ROM was confirmed
+  actually playing (ball, flippers, and score all progressing across
+  multiple checkpoints), not stuck.
 - **8x16 sprite mode implemented** (`LCDC` bit 2) — real hardware ignores
   bit 0 of the OAM tile number and stacks two consecutive tiles as one
   16-pixel-tall sprite; Y-flip mirrors the whole 16-pixel sprite (which
@@ -763,18 +767,41 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    session - a dedicated pass, not a quick fix, and one where every
    change needs the full regression sweep (see above) before being
    trusted.
-2. **Kirby's Pinball Land hang (see above) — real, unresolved, deeply
-   investigated but not fixed.** A genuine MBC2-cartridge compatibility
-   issue on the one MBC2 game tested so far. A real PPU frame-timing
-   bug found during a second investigation pass (see above) turned out
-   to be real and worth fixing in its own right, but didn't resolve
-   this specific hang - whatever's actually starving this ROM's Timer
-   interrupt remains open.
-3. More real-ROM testing, if more real ROMs become available. Every
-   round of real-commercial-game and authoritative-suite testing this
-   session found genuinely high-value bugs, including in code paths
-   (MBC2, EI timing) nothing else had touched. Don't commit ROM files
-   themselves to this repo or bundle them in any output archive
+2. ~~**Kirby's Pinball Land hang**~~ **RESOLVED this session** (still
+   worth a skeptical re-check next time real ROMs are available, given
+   how long this one resisted diagnosis - but the evidence is strong).
+   The user supplied the actual real ROMs this project's own testing
+   had relied on in earlier sessions (Dr. Mario, Kirby's Dream Land 2,
+   Kirby's Pinball Land, Pokemon Red/Yellow/Crystal - kept local only,
+   per usual, never committed). Re-running Kirby's Pinball Land against
+   this session's HALT-timing fix (see above - HALT was overcharging
+   every wait by 4 T-cycles) shows real, progressing pinball gameplay
+   at three separate checkpoints (5M/15M/30M/60M instructions in) -
+   a title/ranking screen, then live gameplay with the ball, flippers,
+   and score all visibly changing across checkpoints (score reset
+   partway through is expected: the harness supplies no controller
+   input, so the ball just drains and a new game starts) - not the
+   permanent blank screen this ROM was previously stuck on. This
+   strongly matches the leading hypothesis from the original
+   investigation ("some small, still-unidentified cycle-accounting
+   phase difference" between this emulator and real hardware
+   systematically starving the Timer interrupt relative to VBlank) -
+   the HALT fix is exactly that class of bug, and was found completely
+   independently via Mooneye's suite, not by chasing this ROM directly.
+   Also re-verified via the same real ROMs: Dr. Mario, Kirby's Dream
+   Land 2, Pokemon Red, and Pokemon Yellow all still render correctly
+   (title/gameplay screens visually confirmed, pixel content sane) -
+   no regressions from this session's 6 timing commits. Pokemon Crystal
+   is unchanged from its previously-documented state (correctly renders
+   the "designed only for use on the Game Boy Color" compatibility
+   screen, still doesn't get past it - see item 4 below, unrelated to
+   anything fixed this session).
+3. More real-ROM testing now that real ROMs are available again this
+   session (see item 2) - previous rounds of real-commercial-game and
+   authoritative-suite testing found genuinely high-value bugs,
+   including in code paths (MBC2, EI timing) nothing else had touched.
+   Don't commit ROM files themselves to this repo or bundle them in
+   any output archive
    (copyright) — keep them local/sandbox-only.
 4. **GBC support is functionally complete for rendering purposes** -
    sprite-vs-background priority (the last known gap, including the
