@@ -39,11 +39,13 @@ evidenced version of all of this):
 - Sound: the APU core itself is solid and independently verified (see
   `DUMP_WAV` below); the PS1 SPU output half has never been confirmed to
   actually produce audio, since this sandbox can't play or capture sound.
-- Sub-instruction cycle-accurate timing: a large, real, **partially
-  fixed** gap - currently 44/67 on Mooneye's `acceptance/ppu`+`timer`+
+- Sub-instruction cycle-accurate timing: a large, real, **mostly
+  fixed** gap - currently 50/67 on Mooneye's `acceptance/ppu`+`timer`+
   `interrupts`+top-level suite (started at 11/67). The entire CALL/
-  PUSH/POP/RST/RET/JP/ADD SP,e/OAM-DMA sub-family is now fully fixed;
-  what's left is a separate PPU mode-timing cluster and two narrow
+  PUSH/POP/RST/RET/JP/ADD SP,e/OAM-DMA sub-family and most of the STAT-
+  interrupt/PPU-mode-timing cluster are now fixed; what's left is
+  LCDC-on-specific timing (needs VRAM-access blocking, a genuinely new
+  feature), sprite-count-dependent mode-3 length, and two narrow
   TIMA-reload edge cases. See "What's next" item 1 for detail.
 - Kirby's Pinball Land's long-standing blank-screen hang: resolved as
   a side effect of this suite's HALT-timing fix - see "What's next"
@@ -895,42 +897,121 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   mode-timing cluster below, and `tima_write_reloading`/
   `tma_write_reloading` do).
 
-  Separately, a finer-grained PPU mode-timing cluster
-  (`hblank_ly_scx_timing-GS`, `intr_2_0_timing`,
-  `intr_2_mode0_timing`(`_sprites`), `intr_2_mode3_timing`,
-  `intr_2_oam_ok_timing`, `lcdon_timing-GS`, `lcdon_write_timing-GS`,
-  `stat_irq_blocking`, `vblank_stat_intr-GS`) remains a similarly-sized,
-  separate dedicated effort from anything fixed this session (spot-
-  checked `di_timing-GS`'s source specifically - it hinges on exact
-  frame-period cycle counting across a full VBlank-to-VBlank span, a
-  genuinely deeper nuance than the LCD-on/off freeze fixed above, not
-  more of the same fix); and `tima_write_reloading`/
-  `tma_write_reloading` remain unchanged from the already-documented
-  prior attempt.
+  **Third follow-up, same session: the PPU mode-timing cluster this
+  entry originally deferred as "a similarly-sized, separate dedicated
+  effort" got most of the way done too**, once the user asked to keep
+  going after the CALL/PUSH/etc. cluster closed out. Six more real,
+  independently-verified fixes, each checked against the full
+  acceptance sweep, `cpu_instrs`, `mbc1`+`mbc5`, and all 6 real ROMs
+  (Pokemon Red's and Pokemon Yellow's title-screen animations each
+  shifted which exact frame lands at the fixed instruction-count
+  snapshot at two points in this round - confirmed both times, by
+  dumping several consecutive frames, that the animation itself is
+  still progressing normally, not corrupted):
+    1. **STAT interrupt (bit 1) also fires at VBlank when the mode=2
+       source is enabled** - real hardware fires it at the same
+       T-cycle as the dedicated VBlank interrupt whenever bit 5 is
+       set, even though entering VBlank isn't literally "mode 2".
+       Fixed `vblank_stat_intr-GS`.
+    2. **The STAT interrupt is level-triggered, not edge-per-condition**
+       - real hardware ORs every currently-enabled AND currently-true
+       condition (LYC=LY with bit 6, modes 0/1/2 with bits 3/4/5) into
+       one internal signal, and only fires on that signal's rising
+       edge; if it's already high when a second condition also becomes
+       true, no second interrupt fires until the signal drops back to
+       low first ("STAT IRQ blocking"). The old code requested an
+       interrupt independently at each condition with no shared state,
+       which also hid two real, separate bugs: mode 2's interrupt was
+       requested a *second* time when OAM search ended (entering mode
+       3, which has no STAT source of its own), and mode 0's interrupt
+       was wired to the wrong bit entirely (checked when *entering*
+       OAM mode - backwards - instead of when entering HBlank, which
+       had no check at all). New `UpdateStatLine()` computes the
+       composite signal and fires only on the rising edge, called from
+       every mode transition. Fixed `intr_2_0_timing`,
+       `intr_2_mode0_timing`, `intr_2_mode3_timing`.
+    3. **`UpdateStatLine()` needed calling from STAT and LYC writes
+       too, not just mode transitions** - newly *enabling* a source
+       while its condition is already true (e.g. writing STAT with bit
+       4 set while already in VBlank) is itself a rising edge, and
+       nothing about LY or the PPU mode changes when that happens.
+       Fixed `stat_irq_blocking`.
+    4. **CPU access to OAM is blocked during PPU modes 2 and 3**,
+       separately from the OAM-DMA blocking fixed earlier this
+       session - the PPU itself has exclusive access to OAM while
+       actively searching it (mode 2) or fetching sprite data (mode
+       3), real hardware's CPU reads back `$FF` for OAM during both,
+       independent of whether a DMA transfer is also active. Nothing
+       modeled this before. Fixed `intr_2_oam_ok_timing`.
+    5. **Mode 3's length now varies with SCX** - the background pixel
+       FIFO discards `(SCX mod 8)` pixels from the first tile it
+       fetches each scanline, costing that many extra T-cycles
+       (sampled once from SCX at the moment mode 3 begins), which
+       correspondingly shortens that line's HBlank. Real, independently
+       verified behavior worth keeping (smooth, non-tile-aligned
+       scrolling is common in real games) but **didn't fully fix
+       `hblank_ly_scx_timing-GS`** - its very first check (SCX=0, where
+       this fix contributes nothing) already fails, pointing at a
+       separate, still-unidentified gap in the interrupt-dispatch-to-
+       polling-read latency chain that test depends on.
+  **Result: 45/67 → 50/67.**
+
+  Not attempted this round, each a distinct, bounded-but-substantial
+  gap rather than more of the same fix:
+    - `lcdon_timing-GS`/`lcdon_write_timing-GS` - read `lcdon_timing-GS.s`
+      in full: it needs a documented "the PPU is 2 T-cycles late on
+      line 0 specifically, lines 1+ are normal" quirk modeled precisely
+      enough to reproduce an exact 24-entry table of LY/STAT/OAM-access/
+      VRAM-access values at specific T-cycle offsets after LCDC is
+      written, checked 3 times at slightly different phase offsets -
+      and critically, also needs **VRAM access blocking during mode 3**,
+      a feature that doesn't exist at all yet (only OAM got blocked this
+      session) and is much more central to real games' rendering code
+      than the OAM edge cases fixed above, so wiring it in carries real
+      regression risk that deserves its own dedicated, carefully-
+      verified pass rather than a bolt-on here.
+    - `intr_2_mode0_timing_sprites` - needs mode 3's length to also
+      vary with the number/position of sprites on the current line (on
+      top of the SCX penalty above), a separate, larger penalty model
+      this project doesn't have yet.
+    - `tima_write_reloading`/`tma_write_reloading` remain unchanged
+      from the already-documented prior attempt (exactly which
+      T-cycle(s) within TIMA's 4-cycle reload window a write does or
+      doesn't cancel the reload).
 
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
-   large, real gap, most of it now closed.** Currently 44 of 67
+   large, real gap, most of it now closed.** Currently 50 of 67
    Mooneye acceptance/ppu+timer+interrupts tests pass (up from an
    initial 11). **The entire CALL/PUSH/POP/RST/RET/JP/ADD SP,e/OAM-DMA
    sub-instruction-timing family - the cluster this project's own
    history repeatedly flagged as the highest-regression-risk part of
-   this whole effort - is now fully fixed**, closed out across this
-   session in three rounds (see the detailed entries above): the
-   opcode-table fetch-then-execute restructuring
-   (`OP77`/`OP7E`/`OPE0`/`OPF0`) plus the DMA end-of-transfer timing
-   fix; narrowing OAM DMA's bus-blocking scope to true OAM instead of
-   "everything except HRAM" (the fix that resolved the entire hang
-   sub-cluster at once); and the same fetch-then-execute split applied
-   to `JP`/`JP cc` and `ADD SP,e`/`LD HL,SP+e`. **What's left is two
-   separate, smaller gaps**, not more of this same family:
-   - A PPU mode-timing cluster (`hblank_ly_scx_timing-GS`,
-     `intr_2_0_timing`, `intr_2_mode0_timing`(`_sprites`),
-     `intr_2_mode3_timing`, `intr_2_oam_ok_timing`, `lcdon_timing-GS`,
-     `lcdon_write_timing-GS`, `stat_irq_blocking`,
-     `vblank_stat_intr-GS`) - see the next bullet below for what's
-     known about its scope.
+   this whole effort - is fully fixed**, and **the STAT-interrupt/PPU-
+   mode-timing cluster is mostly fixed too** (see the detailed entries
+   above for exactly what each round did): the opcode-table
+   fetch-then-execute restructuring plus the DMA end-of-transfer timing
+   fix; narrowing OAM DMA's bus-blocking scope to true OAM; the same
+   split applied to `JP`/`JP cc` and `ADD SP,e`/`LD HL,SP+e`; making the
+   STAT interrupt level-triggered with a shared signal line (fixing a
+   double-fire bug and a wrong-bit bug along the way); blocking CPU
+   access to OAM during PPU modes 2-3; and making mode 3's length vary
+   with SCX. **What's left, each a distinct, bounded gap - not more of
+   what's already fixed**:
+   - `lcdon_timing-GS`/`lcdon_write_timing-GS` - needs a documented "the
+     PPU is 2 T-cycles late on line 0 specifically" quirk modeled
+     precisely, *and* VRAM access blocking during mode 3 (a feature
+     that doesn't exist yet - only OAM got blocked this session, and
+     VRAM is much more central to real games' rendering than the OAM
+     edge cases fixed so far, so this needs its own careful,
+     dedicated pass with full real-ROM verification, not a bolt-on).
+   - `intr_2_mode0_timing_sprites` - needs mode 3's length to also
+     vary with the number/position of sprites on the current line (on
+     top of the SCX penalty above) - a separate, larger penalty model.
+   - `hblank_ly_scx_timing-GS` - the SCX-length fix above is real and
+     kept, but doesn't make this test pass: its very first check
+     (SCX=0) already fails, pointing at a still-unidentified gap in the
+     interrupt-dispatch-to-polling-read latency chain it depends on.
    - `tima_write_reloading`/`tma_write_reloading` - a narrow, already-
      investigated edge case (exactly which T-cycle(s) within TIMA's
      4-cycle reload window a write does or doesn't cancel the reload) -
