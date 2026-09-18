@@ -796,7 +796,19 @@ void DMAClock(int cycles) {
 		dmaInternalRead = 0;
 		dmaBytesDone++;
 	}
-	if (dmaBytesDone >= 0xA0) {
+	// BUG FIX (sub-instruction timing): the bus-blocking restriction
+	// (dmaActive/dmaBlockingActive) doesn't lift the instant the 160th
+	// byte's own transfer completes (dmaCyclesElapsed hitting 640) - it
+	// stays active for one more M-cycle beyond that (644T), matching the
+	// same "blocking starts 2 M-cycles after the trigger, not 1" kind of
+	// setup/teardown latency already modeled on the start side (see
+	// dmaBlockCyclesElapsed's declaration comment). Found empirically
+	// (scanning candidate delays against push_timing.gb, oam_dma_timing.gb,
+	// and oam_dma_restart.gb together) after hand-derivation repeatedly
+	// produced self-contradictory answers between these tests - trust
+	// this value because all three independently-authored Mooneye tests
+	// agree on it, not because the arithmetic behind it is obvious.
+	if (dmaBytesDone >= 0xA0 && dmaCyclesElapsed >= 640 + 4) {
 		dmaActive = 0;
 		dmaBlockingActive = 0;
 	}
@@ -3287,7 +3299,22 @@ void OP76(void){// 76 HALT
 }// 76 HALT
 
 void OP77(void){ // case  0x77:
-WriteMEM(reg_HL, reg_A); cycleLength(8); } // 77    LD   (HL),A
+	// BUG FIX (sub-instruction timing): split into its real 2 M-cycles
+	// (fetch, write) instead of one lump cycleLength(8) after the write -
+	// see the comment above push()/pop() for why this matters generally,
+	// and STATUS.md's "concrete next step" entry for the specific,
+	// empirically-traced bug this fixes: a WriteMEM() side effect (an
+	// OAM DMA trigger, a DIV reset) triggered mid-instruction was being
+	// credited with this whole instruction's cost as "time after the
+	// trigger", including the fetch cycle that actually happened
+	// *before* the write - over-crediting real hardware's actual delay
+	// by one M-cycle for every opcode structured this way. Confirmed via
+	// Mooneye's pop_timing.gb (DIV-reset case) and the push/pop_timing-
+	// style OAM-DMA tests.
+	cycleLength(4); // M1: fetch
+	WriteMEM(reg_HL, reg_A);
+	cycleLength(4); // M2: write
+} // 77    LD   (HL),A
 void OP78(void){ // case  0x78:
 reg_A = reg_B; cycleLength(4); } //	78    LD   A,B
 void OP79(void){ // case  0x79:
@@ -3308,8 +3335,13 @@ void OP7D(void){ // case  0x7D:
 } //	7D    LD   A,L
 
 void OP7E(void){ // case  0x7E:
+	// BUG FIX (sub-instruction timing): split into its real 2 M-cycles
+	// (fetch, read) - see the comment on OP77/OPE0/OPF0. Confirmed via
+	// Mooneye's div_timing.gb, which reads DIV back through HL right at
+	// a precisely-timed boundary.
+	cycleLength(4); // M1: fetch
 	reg_A = ReadMEM(reg_HL);
-	cycleLength(8);
+	cycleLength(4); // M2: read
 } // 7E    LD   A,(HL)
 
 void OP7F(void){ // case  0x7F:
@@ -3760,8 +3792,17 @@ void OPDF(void){ // case  0xDF:
 cycleLength(4); reg_PC = rst(0x0018); } // DF    RST  18H
 
 void OPE0(void){ // case  0xE0:
-	WriteMEM((0xFF00 + ReadMEM(reg_PC++)), reg_A);
-	cycleLength(12);
+	// BUG FIX (sub-instruction timing): split into its real 3 M-cycles
+	// (fetch, read operand n, write) - see the comment on OP77 for why.
+	// This is the opcode Mooneye's start_oam_dma macro actually uses to
+	// trigger OAM DMA (LDH ($FF46),A), so this fix is what the whole
+	// push_timing/add_sp_e_timing/call_timing-family cluster of
+	// remaining failures traced back to.
+	cycleLength(4); // M1: fetch
+	BYTE n = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read operand n
+	WriteMEM((0xFF00 + n), reg_A);
+	cycleLength(4); // M3: write
 } // E0    LD   ($FF00+nn),A
 
 void OPE1(void){ // case  0xE1:
@@ -3832,8 +3873,21 @@ reg_PC = rst(0x0028);
 } // EF    RST  28H
 
 void OPF0(void){ // case  0xF0:
-	reg_A = ReadMEM( 0xFF00 | ReadMEM(reg_PC++));
-	cycleLength(12); // BUG FIX: was 8, real hardware is 12
+	// BUG FIX (sub-instruction timing): split into its real 3 M-cycles
+	// (fetch, read operand n, read value) instead of one lump
+	// cycleLength(12) after doing both reads at once - see the comment
+	// on OP77/OPE0 for the general reasoning. This specific opcode is
+	// what Mooneye's tim00.gb (and siblings) use to read TIMA back after
+	// a precisely-timed wait: reading TIMA too early (before this
+	// instruction's own fetch+operand-read M-cycles have elapsed) missed
+	// counting those 8T toward the threshold, silently regressing this
+	// whole test family the moment the *write* side (OPE0) got its own
+	// correct, reduced timing - the two need to move together.
+	cycleLength(4); // M1: fetch
+	BYTE n = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read operand n
+	reg_A = ReadMEM(0xFF00 | n);
+	cycleLength(4); // M3: read value
 } // F0    LD   A,($FF00+nn)
 
 void OPF1(void){ // case  0xF1:
