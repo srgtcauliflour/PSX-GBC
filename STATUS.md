@@ -1755,6 +1755,103 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   the PPU/STAT-request level - a different, not-yet-attempted
   investigation from everything tried so far this session.**
 
+  **Sixteenth follow-up, same session: pulled the CPU-side-dispatch
+  thread the fifteenth follow-up pointed at - found the *opposite*
+  direction actually needed (delay, not early-fire) is correct and
+  sufficient to fully fix `hblank_ly_scx_timing-GS`, but it collides
+  with `intr_2_0_timing` in a way that's now precisely quantified
+  rather than merely observed.** Read both tests' own source directly
+  (`.s` files, not secondhand summaries) to understand their exact
+  measurement mechanisms:
+
+  - `hblank_ly_scx_timing-GS.s` is HALT-based: HALT for the mode=0
+    interrupt, use the interrupt vector itself as a fast return (`add
+    sp,+2; ret`, skipping past the normal HALT-resume path entirely),
+    then a fixed-cost delay plus a variable NOP count, then read `LY`
+    to see whether it's incremented yet.
+  - `intr_2_0_timing.s` is *not* HALT-based for its second half:
+    `setup_and_wait_mode0` arms the mode=0 interrupt then runs a bare
+    `xor a; ld b,a; -inc b; jr -` busy loop with interrupts enabled,
+    using the same vector-as-fast-return trick - B's final value (how
+    many loop iterations elapsed before the interrupt actually fired)
+    is the measurement. This is a materially different, much
+    finer-grained sampling of interrupt timing than a HALT-based wait,
+    confirmed via `DUMP_HRAM` to be genuinely more sensitive: it broke
+    under every single-mechanism change tried this session, whether the
+    fifteenth follow-up's mooneye-derived early-fire or this follow-up's
+    delay.
+
+  Implemented `mode0IntDelayCountdown`: a 4T countdown armed the
+  instant mode 3 ends (`videoMode = HBLANKMODE`), gating
+  `UpdateStatLine()`'s `m0` term until it reaches 0 - the STAT
+  register's visible mode bits still flip immediately as before; only
+  the *interrupt* is delayed. This is the same direction (and matches
+  the same magnitude) the seventh/tenth follow-ups originally found
+  necessary, tried again now that the codebase has the per-T-cycle PPU
+  restructuring (fourteenth/fifteenth follow-ups) as a foundation.
+  Result: **`hblank_ly_scx_timing-GS` now passes outright** (not just
+  its previously-analyzed SCX=0 case - every SCX value 0-8) -
+  genuinely more complete progress than the seventh follow-up's own
+  characterization suggested. `intr_2_0_timing` breaks, as before, but
+  this time precisely diagnosed via its own `regs_save`/`regs_assert`
+  HRAM layout (mapped out from `common/lib/check_asserts_cb.s`'s
+  `setup_assertions` push sequence, not guessed): its two measurements
+  (`D` = 4-NOP-delay phase, `E` = 3-NOP-delay phase) show `E` matching
+  its expected value *exactly*, while `D` is wrong by *precisely one
+  full busy-loop iteration* (16T = `inc b` + `jr -`) - not a few
+  T-cycles of slop, a clean, discrete quantum. Only one of the two
+  phase-relative measurements is affected at all.
+
+  Two follow-up experiments to explain that single remaining
+  discrepancy, both concluded:
+  1. **Ruled out JR-splitting as the explanation.** Reasoned that
+     `intr_2_0_timing`'s busy loop uses unconditional `jr -`, still a
+     single lumped `cycleLength(12)` call at the time, and that this
+     might be swallowing fine-grained interrupt timing the same way the
+     fourteenth follow-up found for other instructions - split all 5 JR
+     opcodes (0x18 unconditional, 0x20/0x28/0x30/0x38 conditional) into
+     per-M-cycle charges (this is the JR-splitting commit that landed
+     separately, since it's independently correct regardless). Tested
+     the mode0 delay with and without these splits in isolation:
+     **byte-identical `DUMP_HRAM` output either way** - the CPU's own
+     interrupt-recognition check happens once per *instruction*
+     regardless of how many `cycleLength()` sub-calls that instruction
+     internally makes (interrupt() is only ever invoked from the main
+     loop, between `instructions[]()` calls, never from inside
+     `cycleLength()` itself) - so splitting JR could never have changed
+     this measurement in the first place. A wrong hypothesis, caught by
+     testing it in isolation rather than assuming it from the
+     combined result.
+  2. **Tried an analogous delay on mode 2's own interrupt** (mirroring
+     mode 0's newly-confirmed-correct treatment), armed at both
+     `OAMMODE`-entry sites. Result: **made things substantially worse**
+     - broke 4 *additional* previously-passing tests
+     (`intr_1_2_timing-GS`, `intr_2_mode0_timing`, `intr_2_mode3_timing`,
+     `intr_2_oam_ok_timing`) without fixing `intr_2_0_timing` either.
+     Confirms mode 2's interrupt-request timing is already correct as
+     it stands and should not be touched.
+
+  Reverted the mode0 delay (net-zero trade: fixes one test, breaks
+  another - the standing rule against this applies regardless of how
+  precisely the remaining gap is now understood) and the mode2 delay
+  (net-negative). **Kept: the JR-splitting commit** (independently
+  correct, zero regression, real hardware timing - see its own commit).
+  **Result: `hblank_ly_scx_timing-GS`'s fix is now fully known,
+  verified, and sitting ready (`mode0IntDelayCountdown`, a ~15-line
+  change) the moment `intr_2_0_timing`'s own remaining, now
+  precisely-quantified gap (exactly one busy-loop iteration, in exactly
+  one of its two phase-relative measurements, not explained by JR-
+  splitting or by any change to mode 2's own timing) is understood.**
+  That gap is likely specific to `intr_2_0_timing`'s own busy-loop-
+  interrupted-mid-flight measurement technique rather than a general
+  PPU-timing question at this point, given how surgically it responds
+  (or doesn't) to changes that otherwise behave exactly as expected
+  elsewhere - worth investigating with the same technique used this
+  round (read the test's own source line-by-line, map out its HRAM
+  register-dump layout from the *shared* `common/lib/` assertion
+  helpers rather than guessing, and isolate each candidate change
+  before combining it with others).
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
