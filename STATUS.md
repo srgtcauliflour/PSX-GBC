@@ -1339,6 +1339,62 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   testcase #0A (10 sprites at X=1, not X=0) is now a precise, narrow
   next data point once mode 2's delay is safe to apply.
 
+  **Tenth follow-up, same session: pinned down exactly why
+  `intr_2_0_timing` resists the delay fix, with hard cycle-level
+  data.** Added a trace at the actual interrupt-dispatch entry point
+  (not just the STAT rising-edge, which fires every line regardless of
+  whether anything is watching) to directly measure the T-cycle gap
+  between catching mode 2's interrupt and catching mode 0's, for both
+  of this test's two rounds (`test_iter 4` producing D, `test_iter 3`
+  producing E - the two nop-delay values differ by exactly one M-cycle
+  between them). **With no delay applied at all** (this test's own
+  currently-passing baseline), that gap is a fixed 252T for *both*
+  rounds regardless of their different nop counts - expected, since
+  mode 0's real firing instant is set entirely by the PPU's own
+  mode2+mode3 duration and doesn't care what the CPU is doing
+  in-between; the nop count only changes how much of that fixed window
+  is left for the measurement loop to run in, not the window itself.
+
+  **With both mode 2 and mode 0 delayed by 4T** (the combination
+  tried in the ninth follow-up), the gap does *not* shift by a uniform
+  amount for both rounds, which is the actual reason this test breaks:
+  round A's (`test_iter 4`, producing D) gap grew by 8T instead of the
+  expected net 4T (mode 0's own +4T, since mode 2's +4T dispatch delay
+  shifts the measurement loop's own start later by the same amount and
+  should cancel out) - checked directly against the ROM's actual D/E
+  register values via `setup_assertions`/`assert_d`/`assert_e`, not
+  inferred: D lands on $08 (one whole extra loop iteration beyond the
+  expected $07). Round B's (`test_iter 3`, producing E) gap shifted by
+  exactly the expected 4T, and E is still correctly $08 - **only round
+  A breaks**, and the two rounds differ from each other only in that
+  one-M-cycle nop-count. This rules out "the model is fundamentally
+  wrong" (a genuinely broken model would be expected to break both
+  rounds, or neither) and points at something alignment/parity-
+  sensitive: `intr_2_0_timing`'s own measurement loop ("inc b; jr -")
+  has two different check-points 4T apart in its 16T period, and
+  exactly which one a given delayed interrupt instant rounds up to
+  can flip depending on sub-4T-scale alignment this project's engine
+  has no way to represent - `cycleLength()` only ever advances in
+  whole CPU-instruction-cost chunks (4, 8, 12T...), never at finer
+  granularity, so two scenarios that differ by less than one CPU
+  M-cycle in when an event *conceptually* happens can't be told apart
+  here. This is a plausible, mechanically consistent explanation for
+  why three flat-4T-delay combinations all failed this one test while
+  helping the other two - not certain, but well-supported by the
+  round-A-breaks/round-B-doesn't asymmetry, which a purely-wrong-model
+  theory doesn't explain as cleanly. Reverted again in full (confirmed
+  byte-identical via a fresh sweep); this remains a genuine, currently
+  unimplementable-without-deeper-architecture-work gap rather than a
+  simple bug, so it's being set aside for now rather than continuing
+  to spend this session's remaining effort on it. **Result: no code
+  change, sweep still 52/67, but the interrupt-timing investigation
+  now has a concrete, falsifiable explanation on record (sub-4T
+  alignment sensitivity in `intr_2_0_timing`'s specific measurement
+  loop) instead of an open "doesn't reconcile" mystery - worth
+  revisiting if this project ever moves to finer-than-M-cycle PPU/CPU
+  interleaving, but not a good use of further effort at the current
+  architecture's resolution.**
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
