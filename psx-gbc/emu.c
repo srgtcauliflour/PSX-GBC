@@ -1147,6 +1147,110 @@ int Mode3ScxPenalty(void) {
 	int scx7 = SCRX & 0x07;
 	return ((scx7 + 3) / 4) * 4;
 }
+
+// BUG FIX: mode 3's length also grows for every OBJ (sprite) that
+// intersects the current line, on top of the SCX penalty above - not
+// modeled at all until now. This is real hardware's documented "OBJ
+// penalty algorithm" (Pan Docs, gbdev.io/pandocs/Rendering.html#obj-
+// penalty-algorithm), confirmed against Mooneye's
+// intr_2_mode0_timing_sprites.gb (which sweeps sprite count, screen
+// position, and grouping - over 80 sub-cases in one ROM):
+//   - OBJs intersecting the line are considered leftmost-to-rightmost
+//     (ties broken by OAM index, lowest first) - real hardware caps
+//     at the first 10 OAM-order OBJs that intersect the line at all,
+//     *then* sorts only those 10 by screen position for this pass.
+//   - Each OBJ incurs a flat 6-dot penalty (fetching its own tile).
+//   - The *first* OBJ whose leftmost pixel falls within a given
+//     BG/window tile (tracked per scanline - "considered" below) also
+//     incurs (pixels of that tile strictly right of the leftmost
+//     pixel, minus 2, clamped to >=0); a later OBJ landing in the same
+//     tile skips this part entirely.
+//   - Exception: an OBJ with OAM X of exactly 0 (fully off the left
+//     edge of the screen) always incurs a flat 11-dot penalty instead
+//     of the above, regardless of SCX, and doesn't mark any tile as
+//     considered.
+// Window tiles aren't modeled here (this project doesn't have
+// window-fetch timing at all yet, and intr_2_mode0_timing_sprites.gb
+// never enables the window), so tile position is computed against the
+// background only.
+int mod8(int a) {
+	int m = a % 8;
+	return (m < 0) ? m + 8 : m;
+}
+int floordiv8(int a) {
+	return (a - mod8(a)) / 8;
+}
+int ObjPenalty(int line) {
+	int spriteHeight = ((LCDCONTROL >> 2) & 0x01) ? 16 : 8;
+	int candX[10];
+	int count = 0;
+	int i, j;
+	if (!((LCDCONTROL >> 1) & 0x01)) { return 0; } // OBJ display disabled
+	for (i = 0; i < 40 && count < 10; i++) {
+		int pos = i * 4;
+		BYTE by = OAMRAM[pos] & 0xFF;
+		BYTE bx = OAMRAM[pos + 1] & 0xFF;
+		if ((by <= line + 16) && (by > line + (16 - spriteHeight))) {
+			candX[count++] = bx;
+		}
+	}
+	// Stable insertion sort by screen X (OAM order preserved on ties -
+	// matches "ties broken by OAM index, lowest first").
+	for (i = 1; i < count; i++) {
+		int key = candX[i];
+		j = i - 1;
+		while (j >= 0 && candX[j] > key) {
+			candX[j + 1] = candX[j];
+			j--;
+		}
+		candX[j + 1] = key;
+	}
+	{
+		int visited[10];
+		int visitedCount = 0;
+		int penalty = 0;
+		// BUG FIX: an off-screen (OAM X=0) OBJ's flat 11-dot exception is
+		// only for the *first* such OBJ in a given line - a second one
+		// still shares the "already considered" discount with the first,
+		// same as any other tile, dropping to the ordinary flat 6.
+		// Confirmed empirically against intr_2_mode0_timing_sprites.gb's
+		// own "N sprites at X=0" block (N=1..10): a flat 11-per-sprite
+		// model matched only N=1, but "11 for the first, 6 for the rest"
+		// matches all 10 cases exactly. Modeled here with a sentinel
+		// "virtual tile" (an arbitrary sentinel, unreachable by the real
+		// floordiv8 computation below) so it goes through the same visited-tile
+		// bookkeeping as ordinary OBJs instead of a separate code path.
+		for (i = 0; i < count; i++) {
+			int bx = candX[i];
+			int tile, partial;
+			if (bx == 0) {
+				tile = -1000000; // sentinel, unreachable by floordiv8 for any real bx/SCX
+				partial = 5; // + the flat 6 below = 11 for the first one
+			} else {
+				int screenX = bx - 8;
+				int a = screenX + SCRX;
+				int pixelsRight;
+				tile = floordiv8(a);
+				pixelsRight = 7 - mod8(a);
+				partial = pixelsRight - 2;
+				if (partial < 0) { partial = 0; }
+			}
+			{
+				int alreadyVisited = 0;
+				for (j = 0; j < visitedCount; j++) {
+					if (visited[j] == tile) { alreadyVisited = 1; break; }
+				}
+				if (!alreadyVisited) {
+					penalty += partial;
+					visited[visitedCount++] = tile;
+				}
+				penalty += 6;
+			}
+		}
+		return penalty;
+	}
+}
+
 void UpdateStatLine(int extraMode2) {
 	int lyc = (LCDY == LYC) && ((LCDSTATUS >> 6) & 0x01);
 	int m0 = (videoMode == HBLANKMODE) && ((LCDSTATUS >> 3) & 0x01);
@@ -1357,7 +1461,11 @@ void cycleLength(int cycle) {
 				// fixed, so a longer mode 3 means a shorter mode 0) at
 				// every SCX value 0-8 and checks the exact M-cycle LY
 				// increments on relative to the mode=0 STAT interrupt.
-				currentLineMode3Penalty = Mode3ScxPenalty();
+				// BUG FIX: see ObjPenalty()'s declaration comment - mode 3's
+				// length also grows per-sprite, sampled once here alongside
+				// the SCX penalty (both use the same overshoot-preserving
+				// "+=" and get subtracted back out of HBlank together).
+				currentLineMode3Penalty = Mode3ScxPenalty() + ObjPenalty(LCDY);
 				VideoCyclesLeft += TRANSFER_CYCLES + currentLineMode3Penalty; // BUG FIX: see the overshoot comment above OAM_CYCLES
 				// BUG FIX: mode 3 (transfer) has no STAT interrupt source of
 				// its own - this used to re-check bit 5 (mode=2) here too,

@@ -51,9 +51,14 @@ evidenced version of all of this):
   outright). What's left is a narrow, LCD-on-adjacent-only quirk
   (mode 3 on line 1, specifically the one right after a power-on line
   0, needs a few extra T-cycles this project doesn't model yet -
-  confirmed NOT a general mode-3 bug, see below), sprite-count-
-  dependent mode-3 length, and `hblank_ly_scx_timing-GS`'s own,
-  still-unidentified gap. See "What's next" item 1 for detail.
+  confirmed NOT a general mode-3 bug, see below), and a still-
+  unidentified interrupt-timing gap that now looks to be the single
+  root cause blocking two separate tests at once
+  (`hblank_ly_scx_timing-GS` and `intr_2_mode0_timing_sprites`) - mode
+  3's per-sprite length penalty is now implemented and hand-verified
+  against 18 of `intr_2_mode0_timing_sprites.gb`'s own cases, but that
+  test is blocked by the same interrupt-timing gap, not by the sprite
+  formula. See "What's next" item 1 for detail.
 - Kirby's Pinball Land's long-standing blank-screen hang: resolved as
   a side effect of this suite's HALT-timing fix - see "What's next"
   item 2.
@@ -1215,6 +1220,63 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   from this investigation, and the interrupt-timing dead end is now
   on record instead of needing to be rediscovered.**
 
+  **Eighth follow-up, same session: mode 3's per-sprite (OBJ) length
+  penalty, previously entirely unmodeled.** Implemented real hardware's
+  documented "OBJ penalty algorithm" (Pan Docs, gbdev.io/pandocs/
+  Rendering.html#obj-penalty-algorithm - fetched and read directly
+  rather than hand-recalled, given how easy this project has found it
+  to get exactly this kind of detail subtly wrong from memory): OBJs
+  intersecting the current line are considered leftmost-to-rightmost
+  (capped at the first 10 in OAM order, then sorted by screen
+  position); each incurs a flat 6T fetch cost, plus - only for the
+  *first* OBJ landing in any given BG tile this line - up to 5 more T
+  for how far into that tile its leftmost pixel falls (tracked via a
+  small per-line "visited tiles" list); a second OBJ landing in an
+  already-considered tile skips that extra part. An OBJ with OAM X of
+  exactly 0 (fully off the left edge) is a documented exception,
+  always contributing a flat 11T - empirically found via Mooneye's
+  own `intr_2_mode0_timing_sprites.gb` (which sweeps sprite count,
+  position, and grouping in one ROM) that this exception *also*
+  participates in the same tile-sharing discount as everything else
+  (first off-screen OBJ costs 11T, a second one costs just the
+  ordinary 6T) - Pan Docs' wording doesn't make this explicit, and a
+  naive flat-11-per-sprite reading (which was tried first) matched
+  only the simplest single-sprite case, not the N=2..10-sprites-at-
+  X=0 block. Verified this whole formula by hand against all 10 of
+  that block's cases plus 8 more sweeping X=1..8 with 10 sprites each
+  (18 independent data points, all exactly matching once the right
+  T-cycle-to-test-unit relationship was found) before touching any
+  code - the same "verify precisely by hand against real ground truth
+  before implementing" discipline this project has repeatedly needed
+  after getting cycle arithmetic wrong from memory or a paraphrase.
+
+  Window tiles aren't modeled (this project has no window-fetch-timing
+  model at all yet, and this test never enables the window, so it
+  wasn't needed to pass this specific ROM).
+
+  `intr_2_mode0_timing_sprites.gb` itself still fails - but on its
+  very first, simplest case (a single sprite at X=0), which is
+  *unaffected* by whether the sprite-penalty formula is right at all
+  (confirmed directly: it fails identically with the sprite penalty
+  completely disabled, i.e. this project's pre-existing zero-sprite-
+  penalty baseline). This test catches its timing reference via the
+  exact same "HALT waiting on a mode=2 STAT interrupt" mechanism as
+  `hblank_ly_scx_timing-GS`/`intr_2_0_timing` from the follow-up
+  above, so this is very likely the *same*, not-yet-understood
+  interrupt-timing gap blocking it too, rather than anything specific
+  to sprites - consistent with, and adding a third data point to, the
+  dead end already on record. Verified regression-free regardless:
+  full acceptance sweep unchanged at 52/67, mbc1/mbc5 at 18/21,
+  `cpu_instrs.gb` 11/11, and all 6 real ROMs byte-identical to the
+  prior round's dumps (this time including Pokemon Red, which had
+  shifted in several previous rounds this session - a clean diff
+  across the board). **Result: acceptance sweep unchanged at 52/67,
+  but real, hand-verified sprite-penalty modeling is now in place for
+  when the underlying interrupt-timing gap is eventually found - at
+  which point this test (and likely `hblank_ly_scx_timing-GS`/
+  `intr_2_0_timing` alongside it) should just start passing without
+  further sprite-specific work.**
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
@@ -1249,9 +1311,17 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
      (51 M-cycles/204T of HBlank only adds up with a standard 172T
      mode 3), so that test's failure has a different, still-unknown
      cause - see its own entry below, unchanged.
-   - `intr_2_mode0_timing_sprites` - needs mode 3's length to also
-     vary with the number/position of sprites on the current line (on
-     top of the SCX penalty above) - a separate, larger penalty model.
+   - `intr_2_mode0_timing_sprites` - mode 3's per-sprite length
+     penalty (varying with sprite count/position, on top of the SCX
+     penalty above) is now implemented and hand-verified against 18
+     independent cases from this test's own ROM (see the eighth
+     follow-up above) - but the test still fails on its very first,
+     simplest case, which is unaffected by the sprite formula at all
+     (fails identically with sprite penalty disabled). It catches its
+     timing reference via the same HALT-on-mode=2-interrupt mechanism
+     as `hblank_ly_scx_timing-GS` below, so this is very likely the
+     same interrupt-timing gap, not a sprite-specific issue - check
+     that dead end first before assuming a new bug here.
    - `hblank_ly_scx_timing-GS` - the SCX-length fix above is real and
      kept, and this session went further: fixed two real, independent
      bugs in the SCX penalty itself (it was a linear `SCX mod 8`
