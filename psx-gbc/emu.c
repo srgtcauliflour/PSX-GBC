@@ -3360,8 +3360,21 @@ void OP17(void){ // case  0x17:
 reg_A = RLA(reg_A);cycleLength(4); } // 17    RLA
 
 void OP18(void){ // case  0x18:
-	reg_PC = jr(reg_PC, ReadMEM(reg_PC++));
-	cycleLength(12);
+	// BUG FIX (sub-instruction timing): split into its real 3 M-cycles
+	// (fetch, read displacement byte, internal delay for the PC add)
+	// instead of one lump cycleLength(12) after - see OPC2/OPC3's
+	// comment for why this matters generally. Found this specific one
+	// unsplit while investigating why the intr_2_0_timing.gb busy-loop
+	// measurement (`inc b; jr -`) couldn't observe a STAT-interrupt-
+	// timing change landing inside this exact instruction's own window
+	// (ultimately a dead end for that specific test - see STATUS.md -
+	// but this split is independently correct real-hardware timing
+	// either way, so kept).
+	cycleLength(4); // M1: fetch
+	BYTE off = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read displacement byte
+	reg_PC = jr(reg_PC, off);
+	cycleLength(4); // M3: internal delay (PC add)
 } // 18    JR   disp
 
 void OP19(void){ // case  0x19:
@@ -3400,12 +3413,16 @@ void OP1F(void){ // case  0x1F:
 }  // 1F    RRA
 
 void OP20(void){ // case  0x20:
+	// BUG FIX (sub-instruction timing): split into its real M-cycles
+	// (fetch, read displacement byte, then an internal delay only when
+	// the branch is actually taken) instead of one lump cycleLength()
+	// after - see OP18/OPC2's comments for why this matters generally.
+	cycleLength(4); // M1: fetch
+	BYTE off = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read displacement byte
 	if (!getZ()) {
-		reg_PC = jr(reg_PC, ReadMEM(reg_PC++));
-		cycleLength(12);
-	} else {
-		ReadMEM(reg_PC++);
-		cycleLength(8);
+		reg_PC = jr(reg_PC, off);
+		cycleLength(4); // M3: internal delay (branch taken)
 	} // 20    JR   NZ,disp
 }
 
@@ -3460,12 +3477,13 @@ void OP27(void){ // DAA - decimal-adjust A after a BCD add/subtract.
 } // 27    DAA
 
 void OP28(void){ // case  0x28:
+	// BUG FIX (sub-instruction timing): see OP20's comment.
+	cycleLength(4); // M1: fetch
+	BYTE off = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read displacement byte
 	if (getZ()) {
-		reg_PC = jr(reg_PC, ReadMEM(reg_PC++));
-		cycleLength(12);
-	} else {
-		ReadMEM(reg_PC++);
-		cycleLength(8);
+		reg_PC = jr(reg_PC, off);
+		cycleLength(4); // M3: internal delay (branch taken)
 	}
 }// 28    JR   Z,disp
 
@@ -3506,11 +3524,13 @@ void OP2F(void){ // case  0x2F:
 } // 2F    CPL
 
 void OP30(void){ // case  0x30:
+	// BUG FIX (sub-instruction timing): see OP20's comment.
+	cycleLength(4); // M1: fetch
+	BYTE off = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read displacement byte
 	if (getC() != 1) {
-		reg_PC = jr(reg_PC, ReadMEM(reg_PC++));
-		cycleLength(12);
-	} else { ReadMEM(reg_PC++);
-		cycleLength(8);
+		reg_PC = jr(reg_PC, off);
+		cycleLength(4); // M3: internal delay (branch taken)
 	}
 } // 30    JR   NC,disp
 
@@ -3554,12 +3574,13 @@ void OP37(void){ // case  0x37:
 } // 37    SCF
 
 void OP38(void){ // case  0x38:
+	// BUG FIX (sub-instruction timing): see OP20's comment.
+	cycleLength(4); // M1: fetch
+	BYTE off = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read displacement byte
 	if (getC() != 0) {
-		reg_PC = jr(reg_PC, ReadMEM(reg_PC++));
-		cycleLength(12);
-	} else {
-		ReadMEM(reg_PC++);
-		cycleLength(8);
+		reg_PC = jr(reg_PC, off);
+		cycleLength(4); // M3: internal delay (branch taken)
 	}
 } // 38    JR   C,disp
 
