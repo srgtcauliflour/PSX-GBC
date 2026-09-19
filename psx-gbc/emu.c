@@ -2589,7 +2589,36 @@ void WriteMEM(WORD loc, BYTE b){
 	if ((LCDCONTROL & 0x80) && (videoMode == TRANSFERMODE) && (loc >= 0x8000 && loc <= 0x9FFF)) {
 		return;
 	}
-	if ( loc <= 0x1FFF ) { // $0000-$1FFF - RAM Enable (MBC1/2/3/5)
+	if ( loc <= 0x3FFF && (( CARTTYPE == 0x05 ) || ( CARTTYPE == 0x06 )) ) {
+		// BUG FIX: MBC2 decodes RAMG vs ROMB using only address bit 8 (A8)
+		// of the write, not the $1FFF/$3FFF ("which half of $0000-$3FFF")
+		// split every other MBC here uses - MBC2 only has that one address
+		// line wired to the mapper for this purpose, so e.g. $0100 (A8=1)
+		// is actually ROMB and $2000 (A8=0) is actually RAMG, both the
+		// opposite of what the generic split below would say. Confirmed
+		// via Mooneye's emulator-only/mbc2/bits_ramg.gb and bits_romb.gb,
+		// which deliberately write across the whole $0000-$3FFF range
+		// checking exactly this.
+		if (loc & 0x0100) {
+			// ROMB - same masked-vs-raw 0-becomes-1 quirk as the other
+			// MBCs below, for MBC2's 4-bit bank number.
+			BYTE lower4 = b & 0x0F;
+			if (!lower4) lower4 = 1;
+			ROMBANKNUMBER = lower4;
+			#if defined(DEBUG)
+			printf("Switching MBC2 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
+			#endif
+		} else {
+			// RAMG
+			int wasEnabled = RAMENABLED;
+			RAMENABLED = ((b & 0x0F) == 0x0A);
+			if (wasEnabled && !RAMENABLED && RAM_DIRTY && CartHasBattery()) {
+				if (SaveCartRAMAndRTC((const char *)CARTTITLE)) {
+					RAM_DIRTY = 0;
+				}
+			}
+		}
+	} else if ( loc <= 0x1FFF ) { // $0000-$1FFF - RAM Enable (MBC1/3/5)
 		if (CARTTYPE != 0x00) {
 			int wasEnabled = RAMENABLED;
 			RAMENABLED = ((b & 0x0F) == 0x0A);
@@ -2625,17 +2654,6 @@ void WriteMEM(WORD loc, BYTE b){
 			ROMBANKNUMBER = (ROMBANKNUMBER & ~0x1F) | lower5;
 			#if defined(DEBUG)
 			printf("Switching MBC1 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
-			#endif
-		}
-		// MBC2
-		if (( CARTTYPE == 0x05 ) || ( CARTTYPE == 0x06 )) {
-			// BUG FIX: same class of masked-vs-raw quirk-check bug as
-			// MBC1 above, for MBC2's 4-bit bank number.
-			BYTE lower4 = b & 0x0F;
-			if (!lower4) lower4 = 1;
-			ROMBANKNUMBER = lower4;
-			#if defined(DEBUG)
-			printf("Switching MBC2 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
 			#endif
 		}
 		// MBC3 - full 7-bit bank number in one write, bank 0 -> bank 1 quirk (same as MBC1)

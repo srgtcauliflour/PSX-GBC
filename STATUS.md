@@ -1527,6 +1527,62 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   above, since that change only affects reads on a cart where `GBC_MODE`
   is already 0).
 
+  **Thirteenth follow-up, same session: fixed MBC2's RAMG/ROMB address
+  decoding, found by running `emulator-only/mbc2` for the first time.**
+  With the full Mooneye suite now being built (twelfth follow-up above),
+  `emulator-only/mbc2` turned out to have two failures alongside its 5
+  existing passes: `bits_ramg.gb` and `bits_romb.gb`. Both write across
+  the *entire* `$0000`-`$3FFF` range (not just their own nominal half)
+  checking exactly which addresses in that range actually gate RAM
+  enable (RAMG) versus select the ROM bank (ROMB). Every other MBC this
+  project implements (MBC1/3/5) decodes that split the same way: address
+  bit 14 divides it cleanly into `$0000`-`$1FFF` (RAMG) and
+  `$2000`-`$3FFF` (ROMB), which is exactly how `WriteMEM`'s existing
+  `loc <= 0x1FFF` / `else if (loc <= 0x3FFF)` structure was written.
+  MBC2 is different at the hardware level: real MBC2 only has *one*
+  address line (A8, bit 8) wired into the mapper for this decision, not
+  the wider bit-14 split - so e.g. `$0100` (A8=1) is actually ROMB, and
+  `$2000` (A8=0) is actually RAMG, both the *opposite* of what the
+  generic bit-14 split would say. This project's existing MBC2 handling
+  sat inside that same generic split (RAMG only recognized in
+  `$0000`-`$1FFF`, ROMB only in `$2000`-`$3FFF`), so it was silently
+  wrong across roughly half the addresses a real game could use for
+  either register - it happened to still work for `$0000`-`$00FF` and
+  `$3F00`-`$3FFF` (the addresses actual games conventionally use), which
+  is presumably why this went unnoticed until a test ROM deliberately
+  swept the entire range. Fixed by giving MBC2 its own dedicated branch
+  ahead of the generic split, dispatching purely on `loc & 0x0100`
+  across the combined `$0000`-`$3FFF` range, keeping the already-correct
+  4-bit-bank/0-becomes-1 ROMB quirk and the RAMG enable/battery-save
+  logic exactly as they were - just gated on the right addresses now.
+  Verified via Mooneye's emulator-only/mbc2/bits_ramg.gb and
+  bits_romb.gb (both now PASS, `mbc2` category now 7/7, up from 5/7).
+  Confirmed regression-free: full acceptance sweep byte-identical to
+  the baseline (52/67), mbc1 unchanged (10/13, same 3 pre-existing
+  failures), mbc5 unchanged (8/8), `cpu_instrs.gb` 11/11, and all 6 real
+  ROMs (including Kirby's Pinball Land, the one MBC2 title in the local
+  real-ROM set) re-dumped and byte-identical to the prior round's
+  framebuffers at the same cycle count.
+
+  Also worth recording: building the full suite surfaced one more
+  category this round, `madness/mgb_oam_dma_halt_sprites.gb` (an
+  obscure HALT-bug/OAM-DMA/sprite-rendering edge case specific to the
+  Game Boy Pocket). It's pathologically slow in this project's
+  interpreter - roughly 30,000 instructions/second on this ROM
+  specifically, versus 400,000+/second on ordinary ROMs like
+  `cpu_instrs.gb` - to the point that reaching even a 1,000,000-
+  instruction cap doesn't complete in 30 real seconds, let alone the
+  usual 30,000,000-instruction cap. Confirmed via a throwaway git
+  worktree at the prior commit that this slowness (and the resulting
+  inability to reach a PASS/FAIL/hang verdict in any reasonable time)
+  already existed before this round's changes - not a regression, just
+  a previously-unbuilt, very obscure edge-case test this project has
+  never been able to evaluate. Not chased further this round: `madness/`
+  is an informal stress-test category (not `acceptance/`), and whatever
+  is making this specific ROM's HALT-heavy code path so slow would need
+  its own dedicated investigation separate from this round's DMA/HWIO/
+  MBC2 fixes.
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
