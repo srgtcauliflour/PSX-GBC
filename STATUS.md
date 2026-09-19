@@ -1682,6 +1682,79 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   is a reusable way to find it) rather than guessing from the opcode
   table alone.**
 
+  **Fifteenth follow-up, same session, on the experimental branch
+  `claude/ppu-per-mcycle-refactor`: did the per-M-cycle restructuring the
+  fourteenth follow-up called for, then re-tried the early-mode0-interrupt
+  fix with full precision - and got a conclusive, valuable negative
+  result, not the hoped-for fix.** Restructured `cycleLength()`'s entire
+  video/LY state machine from a single lumped `VideoCyclesLeft -=
+  sysCycle` + one-time boundary check into a `for` loop over `sysCycle`,
+  one T-cycle per iteration, re-running the full mode-transition check
+  every single iteration (every `return` inside that block became
+  `continue`). This is a pure restructuring - verified via a full
+  regression battery (67-test sweep byte-identical line-by-line, all 7
+  oam_dma/bits/instr tests, mbc1/mbc5/mbc2 at 25/28 with the same 3
+  pre-existing mbc1 failures, `cpu_instrs.gb` 11/11, all 6 real ROMs
+  byte-identical) showing genuinely zero behavioral change on its own -
+  committed as its own isolated checkpoint (`3e5a9bd`) specifically so
+  this architectural improvement is kept and usable regardless of what
+  happened next. It also fixes a latent bug as a side effect: a single
+  lumped call spanning *two* mode-transition boundaries at once used to
+  silently only process the first, leaving the second to be picked up
+  late by some unrelated later call - the per-T-cycle loop can no longer
+  do that, since it re-checks from scratch every iteration.
+
+  With that foundation in place, re-implemented the early-mode0-interrupt
+  fix from the fourteenth follow-up, this time as an *exact* check
+  (`videoMode == TRANSFERMODE && VideoCyclesLeft == 4`, firing precisely
+  once per mode-3 period, T-cycle-exact) rather than the previous fuzzy
+  range test that could get swallowed by a lumped multi-cycle call.
+  Also directly verified, by fetching and reading Mooneye GB's
+  `interrupts.rs`, that its `request_t34_interrupt` and
+  `request_t12_interrupt` are functionally *identical* in the actual
+  implementation (`*self |= interrupt` both ways) - the T1/T2 vs T3/T4
+  naming carries no separate sub-M-cycle delay in mooneye's own code, so
+  there was no hidden extra offset being missed; a straightforward "set
+  the IF bit at this exact tick" is genuinely the whole mechanism.
+
+  Result: **identical to the fourteenth follow-up's outcome, despite the
+  now-exact precision** - `intr_2_0_timing` (previously passing) still
+  breaks, and `hblank_ly_scx_timing-GS`'s own `DUMP_HRAM` failure state
+  is *byte-identical* to the completely-unmodified baseline (not just
+  "still fails" - literally the same bytes, meaning the fix changed
+  nothing observable about this test's outcome at all, even though the
+  new code path does demonstrably execute during its run). This is a
+  materially stronger, more conclusive result than the fourteenth
+  follow-up's: since imprecision/call-lumping is now ruled out as an
+  explanation (the check is exact, and mooneye's own mechanism has no
+  hidden sub-M-cycle wrinkle either), **the mode-0-STAT-interrupt-fires-
+  1-M-cycle-early quirk, while real, confirmed hardware behavior, is
+  conclusively *not* the source of `hblank_ly_scx_timing-GS`'s remaining
+  4T gap.** Whatever this project's own seventh/tenth follow-up
+  empirically measured earlier this session (finding that *delaying*
+  mode 0's interrupt by 4T, in the opposite direction, got this test's
+  SCX=0 case to match) must have been compensating for something else in
+  the measurement chain that happened to respond to that specific
+  change - not a real early-fire timing gap at the PPU level.
+
+  Reverted the early-mode0-interrupt hook back out (per the standing
+  net-negative-trade rule - confirmed via `git checkout --
+  psx-gbc/emu.c` restoring the exact `3e5a9bd` state, re-verified
+  byte-identical to baseline again). **Kept: the per-T-cycle
+  restructuring itself** (a genuine, verified-safe architectural
+  improvement, independent of whether it ever unblocks this cluster -
+  it's simply more correct, and removes a whole latent-bug class).
+  **Result: the interrupt-request-timing angle for this specific
+  cluster is now exhausted with a documented, evidence-backed
+  conclusion, saving whoever picks this up next from re-attempting the
+  same well-motivated-looking idea. The next genuinely new angle, if
+  anyone wants to keep pushing on this specific cluster, is almost
+  certainly CPU-side interrupt-*dispatch* latency (the number of
+  T-cycles between IF being set and the CPU actually jumping to the
+  vector, and/or HALT wake-up timing) rather than anything further at
+  the PPU/STAT-request level - a different, not-yet-attempted
+  investigation from everything tried so far this session.**
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a

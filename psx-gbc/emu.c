@@ -1354,7 +1354,33 @@ void cycleLength(int cycle) {
 	// Confirmed via Mooneye's stat_lyc_onoff.gb, which checks exactly
 	// this freeze-and-resume behavior across several LYC/LCDC sequences.
 	if (!(LCDCONTROL & 0x80)) { return; }
-	VideoCyclesLeft -= sysCycle;
+	// BUG FIX (sub-M-cycle boundary precision): this state machine used to
+	// consume this whole call's sysCycle in one lump subtraction, checking
+	// "did we cross zero" only once per call - which meant a single CPU
+	// instruction whose cost (8T, 12T, 20T...) was large enough to span past
+	// a mode-transition boundary would only ever have that boundary
+	// evaluated at the END of the instruction, never at the exact T-cycle it
+	// actually happens on. Real hardware's PPU (and Mooneye GB's own
+	// reference model, core/src/hardware/ppu.rs at github.com/Gekkio/
+	// mooneye-gb) evaluates this every single M-cycle without exception, so
+	// anything that needs to happen strictly *inside* a multi-cycle CPU
+	// instruction (like an interrupt request landing 1 M-cycle before a
+	// mode's visible switch - see the next BUG FIX below) was structurally
+	// unable to be expressed correctly before this one - confirmed by
+	// direct instrumentation while chasing hblank_ly_scx_timing-GS/
+	// intr_2_mode0_timing_sprites/intr_2_0_timing this session. Looping one
+	// T-cycle at a time (not 4,
+	// despite mode lengths always being multiples of 4) sidesteps any
+	// GBC-double-speed-mode parity concern for free, and as a side benefit
+	// also fixes a latent bug where a single call spanning *two*
+	// mode-transition boundaries at once would silently only process the
+	// first (each iteration re-checks from scratch, so a pathologically
+	// short mode length would correctly cascade into the next transition
+	// within the same original call, instead of waiting for some later,
+	// unrelated cycleLength() call to notice).
+	int vTick;
+	for (vTick = 0; vTick < sysCycle; vTick++) {
+	VideoCyclesLeft -= 1;
 	if(VideoCyclesLeft <= 0) { // Video
 		// BUG FIX: line 0's special post-power-on "fake mode 0" phase (see
 		// lcdOnLine0Phase's declaration comment) ends here - it goes
@@ -1367,7 +1393,7 @@ void cycleLength(int cycle) {
 			VideoCyclesLeft += TRANSFER_CYCLES + currentLineMode3Penalty; // BUG FIX: see the overshoot comment above OAM_CYCLES
 			UpdateStatLine(0);
 			LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
-			return;
+			continue;
 		}
 		if((videoMode == HBLANKMODE) || (videoMode == VBLANKMODE)){
 			LCDY++;
@@ -1476,7 +1502,7 @@ void cycleLength(int cycle) {
 			// bits. Bits 3-7 (interrupt-source enables + unused) are left
 			// exactly as software last set them.
 			LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
-			return;
+			continue;
 		} else {
 			if (videoMode == OAMMODE) {
 				videoMode = TRANSFERMODE;
@@ -1517,7 +1543,7 @@ void cycleLength(int cycle) {
 				// see UpdateStatLine()'s declaration comment.
 				UpdateStatLine(0);
 				LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
-				return;
+				continue;
 			}
 			if (videoMode == TRANSFERMODE) {
 				videoMode = HBLANKMODE;
@@ -1544,10 +1570,11 @@ void cycleLength(int cycle) {
 				// (backwards; fixed there to check bit 5 like it should).
 				UpdateStatLine(0);
 				LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
-				return;
+				continue;
 			}
 		}
   	}
+	}
 }
 
 void doCycles(){
