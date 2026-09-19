@@ -1761,6 +1761,29 @@ materially bigger undertaking than anything else on this list, for a test
 that doesn't reflect real-game compatibility (real games sync to VBlank/
 STAT via interrupts, not an assumption about the exact boot-time phase).
 
+## Known limitation: serial transfer timing
+
+Mooneye's `acceptance/serial/boot_sclk_align-dmgABCmgb.gb` (found this
+session via building the full test suite for the first time) fails.
+Investigated: this project's serial transfer (`onSerialControlWrite()`
+in `emu.c`) completes synchronously, in the same call as the `$FF02`
+write that starts it — real hardware paces a transfer bit-by-bit off
+the same internal divider DIV counts from, taking on the order of 1024
+M-cycles for a full byte at the internal (fastest, non-double-speed)
+clock, with the exact completion time depending on the divider's phase
+*since reset* rather than the time the transfer was started. This is a
+materially different, currently entirely-unimplemented mechanism (a
+real per-bit serial-clock model tied to the shared internal divider),
+not a tunable timing constant - the same class of gap as `instr_timing.gb`
+above (it also needs boot-time divider phase to be exactly right, which
+compounds the same already-documented boot-ROM-timing gap). Not
+pursued this session given the effort involved and the very low
+real-game-compatibility payoff: this project's serial link has no
+actual link-cable partner (`onSerialControlWrite()`'s own comment notes
+the PSX side is always the lone "master"), so no real game's own
+gameplay logic depends on this timing being exact - only Mooneye's own
+synthetic test does.
+
 ## Boot path
 
 CD is the target boot method (burn the final image with `mkpsxiso`, works
