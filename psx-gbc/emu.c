@@ -2472,13 +2472,13 @@ BYTE ReadMEM(WORD loc) {
 			}
 
 			switch (loc) {
-				case 0xFF00: return (BYTE)P1; break; // P1 (R/W)
+				case 0xFF00: return (BYTE)(P1 | 0xC0); break; // P1 (R/W), unused bits 6-7 read as 1
 				case 0xFF01: return (BYTE)SERIALDATA; break; // Serial transfer data (R/W)
 				case 0xFF02: return (BYTE)(SERIALCONTROL | 0x7E); break; // SIO control (R/W), unused bits read as 1
 				case 0xFF04: return DIVREG; break; // Divider Register (R/W)
 				case 0xFF05: return (BYTE)TIMECNT; break;// Timer counter (R/W)
 				case 0xFF06: return (BYTE)TIMEMOD; break;// Timer Modulo (R/W)
-				case 0xFF07: return (BYTE)TIMCONT; break; // Timer Control
+				case 0xFF07: return (BYTE)(TIMCONT | 0xF8); break; // Timer Control, unused bits 3-7 read as 1
 				case 0xFF0F: return (BYTE)(IFLAG | 0xE0); break; // Interrupt Flag (R/W), unused bits read as 1
 
 				// SOUND - many bits across these registers are
@@ -2529,23 +2529,29 @@ BYTE ReadMEM(WORD loc) {
 				case 0xFF4B: return (BYTE)WNDX; break; // Window X Position  (R/W)
 				// GBC registers - real hardware returns these with their
 				// unused upper bits read back as 1, which some games'
-				// hardware-detection code checks for.
-				case 0xFF4D: return (BYTE)(KEY1 | 0x7E); break; // KEY1 - speed switch (R/W)
-				case 0xFF4F: return (BYTE)(VBK | 0xFE); break; // VBK - VRAM bank (R/W)
+				// hardware-detection code checks for. On a DMG-mode cart
+				// (GBC_MODE off) these addresses are entirely unmapped and
+				// always read back as 0xFF, same as the default case below
+				// (confirmed via Mooneye's acceptance/bits/unused_hwio-GS.gb,
+				// which is a DMG-mode test ROM that exercises this whole
+				// $FF4C-$FF7F range expecting 0xFF throughout).
+				case 0xFF4D: return GBC_MODE ? (BYTE)(KEY1 | 0x7E) : 0xFF; break; // KEY1 - speed switch (R/W)
+				case 0xFF4F: return GBC_MODE ? (BYTE)(VBK | 0xFE) : 0xFF; break; // VBK - VRAM bank (R/W)
 				case 0xFF55: // HDMA5 - VRAM DMA status (R/W)
 					// Bit 7 clear = no H-Blank DMA in progress (General-
 					// Purpose transfers always finish immediately, so
 					// this only ever reflects H-Blank DMA state); bits
 					// 0-6 = remaining length in 16-byte blocks minus 1.
+					if (!GBC_MODE) return 0xFF;
 					return (BYTE)(HDMA_REMAINING < 0 ? 0xFF : (((HDMA_REMAINING / 16) - 1) & 0x7F));
 					break;
-				case 0xFF68: return (BYTE)(BCPS | 0x40); break; // BCPS/BGPI - BG palette index (R/W)
-				case 0xFF69: return BGPALRAM[BCPS & 0x3F]; break; // BCPD/BGPD - BG palette data (R/W)
-				case 0xFF6A: return (BYTE)(OCPS | 0x40); break; // OCPS/OBPI - OBJ palette index (R/W)
-				case 0xFF6B: return OBJPALRAM[OCPS & 0x3F]; break; // OCPD/OBPD - OBJ palette data (R/W)
-				case 0xFF70: return (BYTE)(SVBK | 0xF8); break; // SVBK - WRAM bank (R/W)
+				case 0xFF68: return GBC_MODE ? (BYTE)(BCPS | 0x40) : 0xFF; break; // BCPS/BGPI - BG palette index (R/W)
+				case 0xFF69: return GBC_MODE ? BGPALRAM[BCPS & 0x3F] : 0xFF; break; // BCPD/BGPD - BG palette data (R/W)
+				case 0xFF6A: return GBC_MODE ? (BYTE)(OCPS | 0x40) : 0xFF; break; // OCPS/OBPI - OBJ palette index (R/W)
+				case 0xFF6B: return GBC_MODE ? OBJPALRAM[OCPS & 0x3F] : 0xFF; break; // OCPD/OBPD - OBJ palette data (R/W)
+				case 0xFF70: return GBC_MODE ? (BYTE)(SVBK | 0xF8) : 0xFF; break; // SVBK - WRAM bank (R/W)
 
-				default: return 0x00; break;
+				default: return 0xFF; break; // Unmapped $FFxx I/O reads back as 0xFF (open bus)
 			}
 
 		} else if ( ( loc >= 0xFF80 ) &&  ( loc <= 0xFFFE ) ) { // $FF80-$FFFE - High RAM Area

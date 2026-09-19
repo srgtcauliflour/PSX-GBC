@@ -1455,6 +1455,78 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   tracking refinement this project's current `VideoCyclesLeft` model
   doesn't yet carry.**
 
+  **Twelfth follow-up, same session: built Mooneye's *full* test suite
+  (`make all`) for the first time, rather than just the previously-
+  explored `acceptance/{ppu,timer,interrupts}` + top-level subset, and
+  fixed all 3 newly-discovered failures.** This surfaced three entirely
+  unexplored categories this project had never run before:
+  `acceptance/bits`, `acceptance/instr`, and `acceptance/oam_dma`. Of
+  the 7 tests in these categories, 4 were already passing
+  (`mem_oam`, `reg_f`, `daa`, `basic`) and 3 were failing:
+
+  - `reg_read.gb` - `$FF46` (the DMA register) had no `ReadMEM` case at
+    all and fell through to the generic I/O default, always reading
+    back `0x00` regardless of what was written. Real hardware's DMA
+    register is a plain write-then-read-back latch - always readable,
+    fully reflecting the last byte written, independent of any transfer
+    in progress. Fixed by adding a `DMAREG` state variable (set at the
+    top of `doDMA()`) and the missing `ReadMEM` case.
+
+  - `sources-GS.gb` - failed at its `test_fe00` case. Cross-referencing
+    the test's own data-setup (`ram_pattern_1` written to both `$C000`
+    and `$DE00`, `ram_pattern_2` to `$DF00`) against the adjacent
+    already-passing `test_e000` (source `$E000`, echoing WRAM `$C000`)
+    showed real hardware's OAM DMA source-address decoder doesn't fully
+    decode the `$FE00`-`$FFFF` range: source addresses there wrap down
+    to `$DE00`-`$DFFF` (subtract `$20` from the high byte) instead of
+    reading literal OAM/HRAM/IO. Fixed in `doDMA()`'s computation of
+    `dmaSourceBase`.
+
+  - `unused_hwio-GS.gb` - a DMG-mode-specific test (its own header notes
+    it's expected to pass on DMG/MGB/SGB/SGB2 and fail on CGB/AGB/AGS)
+    checking that every unused bit in implemented `$FFxx` I/O registers,
+    and every genuinely unmapped `$FFxx` address, reads back as `1`.
+    Found and fixed four separate gaps, each isolated via a fresh
+    `DUMP_HRAM` readout pinpointing exactly which register/mask the test
+    was currently parked on:
+    - `P1`/`$FF00`: the joypad-select write paths (`b==0x10`/`b==0x20`)
+      did `P1 &= 0x0F`, clobbering the always-1 unused bits 6-7 down to
+      0. Fixed by OR-ing `0xC0` into the read path (matching the
+      existing pattern already used for `SERIALCONTROL`/`$FF02`).
+    - `TAC`/`$FF07`: unused bits 3-7 read back as whatever `TIMCONT`
+      held (usually 0) instead of forced 1s. Fixed with a `| 0xF8` on
+      read.
+    - Genuinely unmapped `$FFxx` I/O (`$FF03`, `$FF08`-`$FF0E`, `$FF15`,
+      `$FF1F`, `$FF27`-`$FF29`, and most of `$FF4C`-`$FF7F`): the
+      switch's `default` case returned `0x00` (real open-bus behavior on
+      this hardware is `0xFF`). Fixed by changing the default to `0xFF`.
+    - The GBC-only registers in `$FF4C`-`$FF7F` (`KEY1`, `VBK`, `HDMA5`,
+      `BCPS`/`BCPD`, `OCPS`/`OCPD`, `SVBK`) had read handlers that
+      always exposed their backing state (OR'd with the documented
+      unused-bit mask) regardless of `GBC_MODE` - correct on real CGB
+      hardware, but wrong for this DMG-mode test ROM, where those
+      addresses are entirely unmapped on real hardware and must read
+      `0xFF` like any other unmapped address. Their write-side handlers
+      were already correctly gated on `GBC_MODE` (confirmed by reading
+      the surrounding code); only the read side needed the same gating,
+      falling back to `0xFF` when `!GBC_MODE`.
+
+  All 7 tests in the newly-discovered categories now pass (was 4/7).
+  Confirmed regression-free: full acceptance sweep byte-identical to the
+  prior round's baseline (52/67, diffed line-by-line against the saved
+  sweep file), mbc1/mbc5 at 18/21 (the 3 failures -
+  `multicart_rom_8Mb`/`rom_16Mb`/`rom_8Mb` - independently confirmed
+  pre-existing by rebuilding and re-running against a stashed pre-change
+  copy of `emu.c`, not something this round introduced), `cpu_instrs.gb`
+  11/11, and all 6 real ROMs re-dumped and visually compared against
+  this session's earlier dumps of the same ROMs at the same cycle count
+  - identical framebuffers throughout (including Pokemon Crystal's
+  "designed only for use on the Game Boy Color" splash screen at the
+  dump's cycle count, confirmed pre-existing via an earlier round's saved
+  dump rather than a new regression from the `GBC_MODE`-gating change
+  above, since that change only affects reads on a cart where `GBC_MODE`
+  is already 0).
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
