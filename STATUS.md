@@ -1395,6 +1395,66 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   interleaving, but not a good use of further effort at the current
   architecture's resolution.**
 
+  **Eleventh follow-up, same session: real, verified progress on the
+  line-1-after-power-on mode-3-length quirk, plus a newly-found deeper
+  layer underneath it.** The eighth follow-up (this session) narrowed
+  `lcdon_timing-GS`'s remaining STAT-sub-check failure to line 1 -
+  specifically the one right after a power-on line 0 - needing mode 3
+  to hold 4T longer (176T, not the standard 172T) before yielding to
+  HBlank. Implemented directly: a one-shot flag
+  (`lcdOnLine1ExtraPending`) set the instant line 0's own special
+  handling finishes, adding the 4T to the very next line's mode 3
+  length and then clearing itself, so every line after that goes
+  through the ordinary, unmodified code path. Verified via Mooneye's
+  own `DUMP_HRAM`-readable failure state: the STAT sub-check's
+  previously-failing index (the line-1 mode-3-length check) now
+  matches exactly. Confirmed regression-free the usual way: full
+  acceptance sweep unchanged at 52/67 (this doesn't flip
+  `lcdon_timing-GS` to PASS outright, only moves its own internal
+  failure point further - see below), mbc1/mbc5 at 18/21,
+  `cpu_instrs.gb` 11/11, and all 6 real ROMs byte-identical to the
+  prior round's dumps.
+
+  Moving past that check exposed a **second, separate, deeper**
+  timing gap on line 0 itself, not line 1: right at the boundary
+  where line 0's initial "fake mode 0" phase hands off to mode 3 (the
+  M-cycle position the STAT test's pass2/pass3 straddle - see the
+  fifth follow-up earlier in this document for the schedule this
+  refers to), the transition needs to become visible one read-instant
+  earlier than the current, already-independently-verified-correct
+  80T fake-mode-0 duration places it. Tried shifting that duration
+  (compensating with an equal-and-opposite change to the immediately
+  following mode 3's own length, to keep its own already-correct end
+  point and the line's total length both unchanged) across several
+  candidate values (-1T, -2T, -3T, -4T, with matching compensation).
+  Only a full -4T/+4T pair actually moved the target boundary (matching
+  this project's now-familiar finding that `VideoCyclesLeft`'s
+  crossing point can only shift in whole-M-cycle steps when the CPU's
+  own instruction-cost charges are always multiples of 4T) - but doing
+  so unexpectedly broke the *next* boundary down the line (mode 3's
+  own end point, previously correct), even though the arithmetic
+  predicts it should cancel out exactly (shorter fake-mode-0 + longer
+  mode 3 = same total, same absolute end point). It doesn't, in
+  practice - almost certainly because the exact overshoot carried
+  across the first boundary (how far `VideoCyclesLeft` actually laps
+  past zero, which depends on precisely which CPU instruction's charge
+  causes the crossing, not just the arithmetic sum) differs between the
+  two threshold values, so the two boundaries don't shift as a clean,
+  independent pair the way flat algebra suggests. None of the
+  combinations tried get both boundaries right at once. Reverted this
+  specific piece back to the plain, original 80T/172T values (keeping
+  only the verified `lcdOnLine1ExtraPending` fix); confirmed via a
+  fresh full regression sweep and all 6 real ROMs that the kept state
+  is byte-identical to the fully-verified baseline. **Result: real,
+  net-positive, verified progress (the line-1 mode-3-length quirk is
+  fixed and kept), plus a precisely located next boundary to chase -
+  the fake-mode-0-to-mode-3 handoff within line 0 itself needs to
+  land 1 M-cycle earlier without disturbing mode 3's own already-
+  correct end point, which needs either finding the actual missing
+  ingredient (not just threshold-shifting) or accepting some overshoot-
+  tracking refinement this project's current `VideoCyclesLeft` model
+  doesn't yet carry.**
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
@@ -1415,20 +1475,22 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    with SCX. **What's left, each a distinct, bounded gap - not more of
    what's already fixed**:
    - `lcdon_timing-GS`/`lcdon_write_timing-GS` - VRAM access blocking
-     during mode 3 (fourth follow-up above) and line 0's own special
-     post-power-on timing (fifth follow-up above, `lcdOnLine0Phase`)
-     are both now implemented and verified regression-free; all 24 of
-     `lcdon_timing-GS`'s `LY` checks now pass exactly. What's left is
-     narrower than it looked at first: the test's STAT sub-check now
-     fails on line 1 - specifically the line immediately after a
-     power-on line 0, not ordinary line 1s in general - where real
-     hardware's mode 3 needs ~4T more than the standard 172T before
-     yielding to HBlank. Confirmed NOT a general mode-3-timing bug: my
-     engine's ordinary-line 172T mode 3 is independently corroborated
-     by `hblank_ly_scx_timing-GS`'s own documented SCX=0 expectation
-     (51 M-cycles/204T of HBlank only adds up with a standard 172T
-     mode 3), so that test's failure has a different, still-unknown
-     cause - see its own entry below, unchanged.
+     during mode 3 (fourth follow-up above), line 0's own special
+     post-power-on timing (fifth follow-up above, `lcdOnLine0Phase`),
+     and line 1's own 4T-longer mode 3 (eleventh follow-up above,
+     `lcdOnLine1ExtraPending`) are all now implemented and verified
+     regression-free; all 24 of `lcdon_timing-GS`'s `LY` checks pass,
+     and the STAT sub-check now gets past line 1 too. What's left is
+     narrower still, and back inside line 0 itself: the handoff from
+     line 0's initial "fake mode 0" phase to mode 3 needs to become
+     visible one M-cycle earlier than the current, already-verified
+     80T duration places it, without disturbing mode 3's own already-
+     correct end point or the line's total length - tried directly
+     shifting the threshold (with a compensating opposite shift to
+     mode 3) and it doesn't cleanly work due to overshoot/carry
+     effects at the boundary (see the eleventh follow-up above for the
+     detail); needs either the actual missing ingredient or some
+     overshoot-tracking refinement, not just threshold-tuning.
    - `intr_2_mode0_timing_sprites` - mode 3's per-sprite length
      penalty (varying with sprite count/position, on top of the SCX
      penalty above) is now implemented and hand-verified against 18

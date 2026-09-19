@@ -1118,6 +1118,21 @@ int statLineActive = 0;
 // increment LY normally).
 int lcdOnLine0Phase = 0;
 
+// BUG FIX: mode 3 on the line immediately after a power-on line 0 -
+// an entirely ordinary line by then, not part of lcdOnLine0Phase's own
+// special-casing above - runs 4T longer (176T instead of the standard
+// 172T) before yielding to HBlank, confirmed via Mooneye's
+// lcdon_timing-GS.gb: its STAT and VRAM-access arrays both place mode
+// 3's end at the same, later M-cycle boundary on this specific line,
+// while hblank_ly_scx_timing-GS's own SCX=0 baseline independently
+// confirms 172T is correct for ordinary lines in general - so this
+// isn't a general mode-3 bug, just a residual one-line effect,
+// plausibly the pixel FIFO not being primed the normal way after line
+// 0's own abbreviated, OAM-search-skipping mode 3. Set the instant
+// line 0's special handling finishes (so it fires on the very next
+// line's mode 3, then never again) and consumed/cleared there.
+int lcdOnLine1ExtraPending = 0;
+
 // BUG FIX: the SCX penalty added to mode 3's length was never
 // subtracted back out of the following HBlank - HBLANK_CYCLES was
 // added as a flat, unconditional 204T every single line, so any line
@@ -1466,6 +1481,13 @@ void cycleLength(int cycle) {
 				// the SCX penalty (both use the same overshoot-preserving
 				// "+=" and get subtracted back out of HBlank together).
 				currentLineMode3Penalty = Mode3ScxPenalty() + ObjPenalty(LCDY);
+				if (lcdOnLine1ExtraPending) {
+					// BUG FIX: see lcdOnLine1ExtraPending's declaration
+					// comment - the one line right after a power-on line 0
+					// needs 4T more here than usual, once, then never again.
+					currentLineMode3Penalty += 4;
+					lcdOnLine1ExtraPending = 0;
+				}
 				VideoCyclesLeft += TRANSFER_CYCLES + currentLineMode3Penalty; // BUG FIX: see the overshoot comment above OAM_CYCLES
 				// BUG FIX: mode 3 (transfer) has no STAT interrupt source of
 				// its own - this used to re-check bit 5 (mode=2) here too,
@@ -1491,6 +1513,7 @@ void cycleLength(int cycle) {
 					// completely normally, as does every following line.
 					VideoCyclesLeft += HBLANK_CYCLES - 8 - currentLineMode3Penalty;
 					lcdOnLine0Phase = 0;
+					lcdOnLine1ExtraPending = 1;
 				} else {
 					// BUG FIX: see currentLineMode3Penalty's declaration
 					// comment - without this, every line with a non-zero
@@ -2919,6 +2942,7 @@ void WriteMEM(WORD loc, BYTE b){
 					// rising edge only when it's a genuine one.
 					statLineActive = ((LCDSTATUS >> 2) & 0x01) && ((LCDSTATUS >> 6) & 0x01);
 					lcdOnLine0Phase = 0;
+					lcdOnLine1ExtraPending = 0;
 				} else if (!(oldLCDC & 0x80) && (b & 0x80)) {
 					LCDY = 0;
 					videoMode = HBLANKMODE;
