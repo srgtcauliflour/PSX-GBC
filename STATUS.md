@@ -1199,11 +1199,14 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   That delay is a real, measured finding, but applying it broke
   `intr_2_0_timing` (which measures the interval between mode 2's and
   mode 0's STAT interrupts, and had been passing): delaying mode 0's
-  interrupt alone stretches that interval by 4T; delaying mode 2's
-  interrupt by the same amount *to compensate* was tried too, but
-  measured zero effect (a direct, reproducible finding, not a guess),
-  meaning the real mechanism isn't as simple as "delay every mode-
-  entry interrupt check uniformly by one M-cycle." Given
+  interrupt alone stretches that interval by 4T. Delaying mode 2's
+  interrupt too, bundled with mode 0's, was tried as a same-round fix
+  and *appeared* to have zero effect on `intr_2_0_timing`'s result -
+  **that specific claim turned out to be wrong; see the ninth
+  follow-up further below, which re-tested mode 2's delay in isolation
+  and found it has a large, real effect (and made genuine progress on
+  a different test) - it just doesn't happen to fix `intr_2_0_timing`
+  either way.** Given
   `intr_2_0_timing` was a currently-passing test, the interrupt-delay
   change was reverted entirely (confirmed by re-running the full
   regression sweep with it removed: byte-identical to the pre-this-
@@ -1277,6 +1280,65 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   `intr_2_0_timing` alongside it) should just start passing without
   further sprite-specific work.**
 
+  **Ninth follow-up, same session: revisited the interrupt-timing dead
+  end with a fresh angle, and corrected a wrong finding from earlier
+  in this session.** The seventh follow-up above claimed "delaying
+  mode 2's STAT interrupt by the same 4T as mode 0's measured zero
+  effect on `intr_2_0_timing`" - re-tested that in isolation this
+  round (mode 2 delayed, mode 0 left alone; the earlier round only
+  ever tested it bundled with mode 0's delay) and that claim was
+  simply wrong, apparently a testing mistake rather than a real
+  result: delaying mode 2 alone has a large, real effect. It **breaks**
+  `intr_2_0_timing` on its own (previously passing, now fails the same
+  way mode 0's delay alone does) - so the two delays are *not*
+  independent/additive the way the seventh follow-up assumed. It also
+  makes real, measurable progress on `intr_2_mode0_timing_sprites.gb`:
+  with mode 2 delayed, testcases #00-#09 (all ten of the "N sprites at
+  X=0" block) now pass outright (confirmed via the ROM's own on-screen
+  "TEST #NN FAILED" readout, the most direct ground truth available -
+  more reliable than guessing WLA-DX's `\@` numbering scheme, which
+  this round's investigation also found starts at 0, not 1, contrary
+  to an unstated assumption made while first reading the ROM's HRAM
+  state). Failure moves to testcase #0A (10, the first "10 sprites at
+  X=1" case) - real forward progress, not a wash, even though the test
+  as a whole still fails.
+
+  Combining both delays (mode 0 *and* mode 2, each independently
+  delayed by 4T) was tried too, on the theory that keeping them
+  matched might preserve whatever relationship `intr_2_0_timing`
+  depends on: it does *not* - `intr_2_0_timing` fails identically
+  (byte-for-byte the same wrong register state) whether mode 0 is
+  delayed alone or both are delayed together, and `intr_2_mode0_timing_sprites`
+  stops at the exact same testcase #0A either way (mode 0's delay has
+  no effect on it at all - consistent with that test's measurement
+  never touching mode 0's interrupt in the first place, see below).
+  So the two tests' requirements don't reconcile via any combination
+  of flat 4T delays tried so far.
+
+  The likely reason `intr_2_0_timing` resists both individually and
+  combined: unlike the other three tests here, its *second* half
+  (`setup_and_wait_mode0`) doesn't poll STAT directly or use HALT - it
+  arms mode 0's STAT interrupt and busy-loops ("xor a; ld b,a; -inc b;
+  jr -") waiting to be *interrupted* by it mid-loop, then reads
+  whatever B reached. That's a third distinct measurement mechanism
+  (HALT-catch, direct-STAT-poll, and now interrupt-mid-active-loop),
+  and it may have its own timing subtlety independent of the "STAT
+  bits visible vs. interrupt fires" gap the other three tests seem to
+  share. Given three separate flat-4T-delay combinations were tried
+  and none reconciles all four tests at once, further guessing wasn't
+  pursued this round - the delay experiment (all of it) was reverted
+  in full and confirmed byte-identical to this session's last clean
+  commit via a fresh regression sweep, so no code changes came out of
+  this follow-up. **Result: no code change, acceptance sweep unchanged
+  at 52/67, but a corrected and considerably more precise picture of
+  the interrupt-timing gap for whoever picks it up next** - mode 0
+  and mode 2 both plausibly need their own 4T interrupt-firing delay
+  (real, reproducible effects, not guesses), `intr_2_0_timing`'s
+  interrupt-mid-active-loop mechanism is the likely odd one out and a
+  good next place to look, and `intr_2_mode0_timing_sprites`'s
+  testcase #0A (10 sprites at X=1, not X=0) is now a precise, narrow
+  next data point once mode 2's delay is safe to apply.
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
@@ -1315,13 +1377,16 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
      penalty (varying with sprite count/position, on top of the SCX
      penalty above) is now implemented and hand-verified against 18
      independent cases from this test's own ROM (see the eighth
-     follow-up above) - but the test still fails on its very first,
-     simplest case, which is unaffected by the sprite formula at all
-     (fails identically with sprite penalty disabled). It catches its
-     timing reference via the same HALT-on-mode=2-interrupt mechanism
-     as `hblank_ly_scx_timing-GS` below, so this is very likely the
-     same interrupt-timing gap, not a sprite-specific issue - check
-     that dead end first before assuming a new bug here.
+     follow-up above). Its own baseline (zero-sprite-penalty) timing
+     needs the *same* mode-2-interrupt-delay fix `hblank_ly_scx_timing-GS`
+     needs for mode 0 (see the ninth follow-up above) - applying it
+     gets testcases #00-#09 (confirmed via the ROM's own on-screen
+     "TEST #NN FAILED" readout - `\@` in this ROM's macros starts at
+     0, not 1) passing outright, real progress, with failure moving to
+     #0A (10 sprites at X=1). Not applied yet only because it currently
+     breaks `intr_2_0_timing` (see that test's entry below) - once that
+     conflict is resolved, this test should move a lot further, though
+     #0A suggests there may be one more distinct gap on top.
    - `hblank_ly_scx_timing-GS` - the SCX-length fix above is real and
      kept, and this session went further: fixed two real, independent
      bugs in the SCX penalty itself (it was a linear `SCX mod 8`
@@ -1336,17 +1401,24 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
      this project currently does. A same-sized delay applied to mode
      0's interrupt alone fixes this test but breaks the currently-
      passing `intr_2_0_timing` (which measures the mode2-to-mode0
-     interrupt interval); the natural fix - delaying mode 2's
-     interrupt by the same 4T to compensate - was tried and measured
-     to have *zero* effect on that interval, a real, reproducible dead
-     end, not a guess. The right mechanism is evidently something more
-     specific than "delay every mode-transition interrupt check by one
-     M-cycle" - worth a dedicated investigation with fresh eyes rather
-     than more guessing here. (This session also briefly suspected a
-     connection to the mode-3-timing quirk found via `lcdon_timing-GS`,
-     but that quirk turned out to be specific to the line right after
-     LCD power-on, not general - see that entry above. Ruled out, not
-     the same bug.)
+     interrupt interval); delaying mode 2's interrupt too was
+     re-investigated this session (ninth follow-up above, correcting
+     an earlier wrong "zero effect" finding) and found to have a real
+     effect of its own (fixing 10 cases of `intr_2_mode0_timing_sprites`
+     above) but *still* doesn't fix `intr_2_0_timing`, whether applied
+     alone or combined with mode 0's delay - all three combinations
+     tried give `intr_2_0_timing` the exact same wrong result. The
+     likely reason: `intr_2_0_timing`'s second half doesn't poll STAT
+     or use HALT like the other three tests here - it arms mode 0's
+     interrupt and busy-loops waiting to be interrupted by it
+     mid-loop, a third, distinct measurement mechanism that may have
+     its own separate timing subtlety. Worth checking `intr_2_0_timing`'s
+     own mechanism specifically next, rather than continuing to guess
+     at flat-delay combinations for the other three tests. (This
+     session also briefly suspected a connection to the mode-3-timing
+     quirk found via `lcdon_timing-GS`, but that quirk turned out to
+     be specific to the line right after LCD power-on, not general -
+     see that entry above. Ruled out, not the same bug.)
 2. ~~**Kirby's Pinball Land hang**~~ **RESOLVED this session** (re-
    confirmed a second time later in the same session, against the
    `oam_dma_start` fix too - still rendering real, active gameplay,
