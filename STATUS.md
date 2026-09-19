@@ -1583,6 +1583,105 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   its own dedicated investigation separate from this round's DMA/HWIO/
   MBC2 fixes.
 
+  **Fourteenth follow-up, same session: researched the still-stuck
+  `hblank_ly_scx_timing-GS`/`intr_2_mode0_timing_sprites`/`intr_2_0_timing`
+  interrupt-timing cluster against Mooneye GB's own reference emulator
+  source (the actual implementation these test ROMs were built from,
+  not just their black-box pass/fail behavior) - found a real, cited
+  mechanism, but the direct translation attempt didn't work and was
+  reverted; the investigation nonetheless narrowed the problem
+  considerably.** Fetched and read
+  `core/src/hardware/ppu.rs` from github.com/Gekkio/mooneye-gb directly
+  (not summarized secondhand). Its `emulate()` function contains this,
+  verbatim:
+  ```rust
+  self.cycles -= 1;
+  if self.cycles == 1 && self.mode == Mode::AccessVram {
+    // STAT mode=0 interrupt happens one cycle before the actual mode switch!
+    if self.stat.contains(Stat::HBLANK_INT) {
+      ctx.request_t34_interrupt(InterruptLine::STAT);
+    }
+  }
+  ```
+  Confirmation, straight from the authoritative source, that mode 0's
+  STAT interrupt is *requested* a full M-cycle before the STAT
+  register's visible mode bits actually flip to 0 - a genuine,
+  deliberate hardware quirk, not a simplification or a test-ROM
+  idiosyncrasy. This matters because Mooneye's own model can express
+  this exactly: `emulate()` is called once per single M-cycle, so
+  "1 cycle before the switch" is always a clean, unambiguous instant.
+
+  Implemented the closest analog in this project: added an `extraMode0`
+  parameter to `UpdateStatLine()` (mirroring the existing `extraMode2`
+  parameter already used for the analogous mode-2-at-VBlank-entry
+  quirk), and a check in `cycleLength()`, before `VideoCyclesLeft -=
+  sysCycle`, firing it when `videoMode == TRANSFERMODE && VideoCyclesLeft
+  > 4 && (VideoCyclesLeft - sysCycle) <= 4` - i.e. "this call's
+  consumption is about to carry the countdown from above 4 down to 4 or
+  less while still in mode 3," the closest this project's architecture
+  can get to Mooneye's exact single-M-cycle checkpoint.
+
+  Empirically, this **broke `intr_2_0_timing`** (a previously-passing
+  test) **while making zero observable difference to
+  `hblank_ly_scx_timing-GS`** (still fails, byte-identical `DUMP_HRAM`
+  output to before the change) - confirmed via temporary debug tracing
+  added to the new branch (`fprintf` on every firing, showing `LY`,
+  `LCDSTATUS`, `sysCycle`, and `VideoCyclesLeft`). The trace explains
+  why: at the exact point `hblank_ly_scx_timing-GS`'s critical mode-3
+  end falls, the instruction executing there has `sysCycle=12` (a
+  single 3-M-cycle-cost `cycleLength(12)` call, not split into
+  individual 4T chunks), and `VideoCyclesLeft` is 8 going into it - so
+  the new "1 M-cycle early" checkpoint (`VideoCyclesLeft` crossing 4)
+  and the real mode-switch checkpoint (`VideoCyclesLeft` crossing 0)
+  both fall *inside that same lumped call*, meaning the "early" fire
+  and the real transition's own `UpdateStatLine` call both run within
+  the same C function invocation - the same CPU-instruction boundary -
+  so nothing about when the interrupt becomes observable to a polling
+  loop actually moves. This is a precise, evidenced instance of the
+  architectural gap the whole cluster has been running into all
+  session: Mooneye's (and real hardware's) reference model evaluates
+  the PPU state machine at true single-M-cycle granularity, with no
+  exceptions, while this project's `cycleLength()` is called with a
+  single instruction's *entire* multi-M-cycle cost in one lump at most
+  call sites (`cycleLength(8)`, `cycleLength(12)`, `cycleLength(20)`,
+  etc. - a `grep` this round found dozens of these) - only the specific
+  instructions this session's earlier rounds already identified as
+  needing sub-instruction accuracy (`CALL`/`PUSH`/`POP`/`RST`/`JP`/
+  `ADD SP,e`/OAM-DMA) were ever split into individual `cycleLength(4)`
+  calls. Any timing event that needs to land strictly *inside* one of
+  the still-lumped instructions - exactly what "1 M-cycle before a
+  mode switch" needs whenever that boundary happens to fall inside one
+  of them - is structurally unable to produce an observable effect in
+  this architecture, no matter how correct the offset itself is.
+  `intr_2_0_timing` broke instead of showing zero effect only because
+  its own critical instant apparently falls on a *different*
+  instruction/timing alignment where the lumped call's boundaries
+  don't coincide the same way - not because the underlying idea is
+  wrong there and right elsewhere.
+
+  Reverted in full per this project's standing rule against keeping a
+  net-negative (here, actually net-negative, not merely net-zero:
+  broke one test, fixed none) trade - confirmed via a fresh full
+  regression sweep byte-identical to the pre-round baseline (52/67)
+  after `git checkout -- psx-gbc/emu.c`. **Result: no code change kept,
+  but the cluster's root cause is now far better understood and
+  precisely evidenced (not just suspected) - the fix isn't a threshold
+  or a direction to tune, it's identifying exactly which of this
+  project's still-lumped multi-M-cycle instruction opcodes fall on each
+  failing test's specific critical boundary and splitting *those*
+  particular `cycleLength(N)` call sites into individual `cycleLength(4)`
+  calls, the same mechanical treatment already proven to work for
+  `CALL`/`PUSH`/`POP`/`RST`/`JP`/`ADD SP,e` earlier this session - not
+  a blanket rewrite of every instruction, which would be both far
+  riskier and unnecessary (most instructions never execute at a
+  timing-critical PPU boundary). Whoever picks this up next should
+  start by identifying the exact opcode executing at each failing
+  test's critical instant (the debug-tracing technique used this round
+  - a temporary `fprintf` gated behind a `#if defined(DEBUG_*)` block,
+  triggered from inside `cycleLength()`'s existing boundary checks -
+  is a reusable way to find it) rather than guessing from the opcode
+  table alone.**
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
