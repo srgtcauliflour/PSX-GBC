@@ -717,6 +717,15 @@ int dmaActive = 0;
 int dmaCyclesElapsed = 0;
 int dmaBytesDone = 0;
 WORD dmaSourceBase = 0;
+// BUG FIX: reading $FF46 (DMA) always returned 0, since it had no read
+// handler at all and fell through to ReadMEM's generic I/O default -
+// real hardware's DMA register is a plain write-then-read-back latch,
+// always returning whatever byte was last written regardless of any
+// transfer's state (it's write-only in *effect*, not in register
+// behavior - the source address is derived from it, but the register
+// itself is fully readable). Confirmed via Mooneye's
+// acceptance/oam_dma/reg_read.gb.
+BYTE DMAREG = 0;
 // Set to 1 only while DMAClock() performs its own source-data read, so
 // ReadMEM's DMA-in-progress restriction (below) doesn't block the DMA
 // controller's own bus access - only the CPU's.
@@ -759,7 +768,15 @@ int dmaBlockCyclesElapsed = 0;
 
 void doDMA(BYTE addr) {
 	int wasActive = dmaActive;
-	dmaSourceBase = (addr & 0xFF) * 0x0100;
+	DMAREG = addr;
+	// BUG FIX: real hardware's OAM DMA source-address decoder doesn't fully
+	// decode the $FE00-$FFFF range - source addresses there wrap/mirror
+	// down to $DE00-$DFFF (subtract $20 from the high byte). Confirmed via
+	// Mooneye's acceptance/oam_dma/sources-GS.gb (test_fe00/test_ff00).
+	{
+		BYTE srcHigh = (addr >= 0xFE) ? (BYTE)(addr - 0x20) : addr;
+		dmaSourceBase = srcHigh * 0x0100;
+	}
 	dmaCyclesElapsed = 0;
 	dmaBytesDone = 0;
 	dmaActive = 1;
@@ -2504,6 +2521,7 @@ BYTE ReadMEM(WORD loc) {
 				case 0xFF43: return (BYTE)SCRX; break; // Scroll X   (R/W)
 				case 0xFF44: return (BYTE)LCDY; break; // LCDC Y-Coordinate (R)
 				case 0xFF45: return (BYTE)LYC; break; // LY Compare  (R/W)
+				case 0xFF46: return (BYTE)DMAREG; break; // DMA Transfer and Start Address (R/W) - see DMAREG's declaration comment
 				case 0xFF47: return (BYTE)BGPAL; break;// BG Palette Data  (W)
 				case 0xFF48: return (BYTE)OBJPAL0; break; // Object Palette 0 Data (W)
 				case 0xFF49: return (BYTE)OBJPAL1; break; // Object Palette 1 Data (W)
