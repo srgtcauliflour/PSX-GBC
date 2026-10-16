@@ -39,6 +39,9 @@
 #define VBLANK_CYCLES   456
 #define HBLANK_CYCLES   204
 #define OAM_CYCLES       80
+#ifndef STATRD_K
+#define STATRD_K 3
+#endif
 #ifndef LYREAD_K
 #define LYREAD_K 4
 #endif
@@ -1307,6 +1310,7 @@ int ObjPenalty(int line) {
 		for (i = 0; i < count; i++) {
 			int bx = candX[i];
 			int tile, partial;
+			if (bx >= 168) continue; // entirely off the right edge: no fetch penalty
 			if (bx == 0) {
 				tile = -1000000; // sentinel, unreachable by floordiv8 for any real bx/SCX
 				partial = 5; // + the flat 6 below = 11 for the first one
@@ -2630,6 +2634,11 @@ BYTE ReadMEM(WORD loc) {
 					if ((LCDCONTROL & 0x80) && videoMode == TRANSFERMODE && LCDY >= 1 && LCDY <= 2 && lcdOnLine1 && !lcdOnLine0Phase
 					    && VideoCyclesLeft > TRANSFER_CYCLES + currentLineMode3Penalty - 4)
 						st = (BYTE)((st & ~0x03) | 0x02);
+					// Same one-M-cycle read lag as $FF44 (see there): mode 3 ending
+					// within STATRD_K T already reads as mode 0.
+					if ((LCDCONTROL & 0x80) && videoMode == TRANSFERMODE && !lcdOnLine1 && !lcdOnLine0Phase
+					    && VideoCyclesLeft <= STATRD_K)
+						st = (BYTE)(st & ~0x03);
 					return st;
 				} // LCDC Status (R/W), unused bit 7 reads as 1
 				case 0xFF42: return (BYTE)SCRY; break; // Scroll Y   (R/W)

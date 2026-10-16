@@ -2131,3 +2131,6 @@ Line 0 after power-on now has a 75T fake-mode-0 phase (tail lengthened to keep a
 
 ### LY read lookahead
 The core steps the PPU after each instruction, so a read of $FF44 sees the PPU one M-cycle early; an LY increment due within 4T is now visible (not during the first frame lines after LCD-on). hblank_ly_scx_timing-GS passes. Acceptance 57/67; the only applicable failure left is intr_2_mode0_timing_sprites.
+
+### intr_2_mode0_timing_sprites passes (acceptance 58/67)
+Two changes: STAT reads show mode 0 when mode 3 ends within 3T (same one-M-cycle read lag as the LY fix), and sprites at OAM X>=168 add no fetch penalty. All DMG-applicable Mooneye acceptance tests now pass; the 9 remaining failures are boot tests for other hardware (dmg0, mgb, sgb, sgb2, S).
