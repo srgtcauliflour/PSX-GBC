@@ -2122,3 +2122,6 @@ the real rendering bugs in this project.
 
 ### Boot I/O snapshot (latest)
 Post-boot values for P1/SB/NR11/NR12/NR50/NR51/NR52 now match DMG. boot_hwio-dmgABCmgb still differs only on timing-phase registers (DIV=$AD, STAT=$80, LY=$0A at entry), which needs starting the PPU/divider at the real boot-ROM hand-off phase.
+
+### DMG boot hand-off phase
+DMG carts now start with the divider at $ABCC and the PPU at the end of VBlank line 153 (found by search against Mooneye). boot_div-dmgABCmgb and boot_hwio-dmgABCmgb pass: acceptance 54/67, cpu_instrs 11/11, mbc 18/21. CGB carts keep the old start phase.

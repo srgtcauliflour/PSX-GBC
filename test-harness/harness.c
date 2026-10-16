@@ -424,6 +424,7 @@ int main(int argc, char **argv) {
     } else if (reg_B == 0x42 && reg_C == 0x42 && reg_D == 0x42 && reg_E == 0x42 && get_rH() == 0x42 && get_rL() == 0x42) {
         // Mooneye failure convention: same parked self-loop, but
         // B=C=D=E=H=L=$42 instead of the success Fibonacci sequence.
+        fprintf(stderr, "[harness] regs A=%02X B=%02X C=%02X D=%02X E=%02X HL=%04X\n", reg_A, reg_B, reg_C, reg_D, reg_E, reg_HL);
         printf("[harness] RESULT: FAIL (Mooneye $42 signature)\n");
         return 1;
     } else {

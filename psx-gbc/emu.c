@@ -389,6 +389,15 @@ void reset_Z80() {
 		SERIALCONTROL = 0x00;
 		DIVREG = 0;
 		DIVCOUNTER = 0;
+		// DMG boot-ROM hand-off phase, found by search against Mooneye's
+		// boot_div-dmgABCmgb (internal counter $ABCC) and boot_hwio-dmgABCmgb
+		// (PPU must be near the end of the last VBlank line, so LY wraps to 0
+		// shortly after PC=$0100).
+		if (!(ROM[0x143] == 0x80 || ROM[0x143] == 0xC0)) {
+			internalDivCounter16 = 0xABCC;
+			DIVREG = 0xAB;
+			LCDY = 153; videoMode = VBLANKMODE; VideoCyclesLeft = 440; LCDSTATUS = 0x81;
+		}
 		MBCMODE = 0;
 }
 
