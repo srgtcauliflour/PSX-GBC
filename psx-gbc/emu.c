@@ -1018,8 +1018,22 @@ void APUStepFrameSequencer(void) {
 // T-cycles, and the 512Hz frame sequencer alongside them. Called once
 // per instruction from cycleLength(), the same place DIV/the CPU timer/
 // the PPU are all driven from.
-int g_audioHookEnabled = 0;
-void APUFlush(void) {}
+// Lazy APU clocking: cycleLength() only accumulates elapsed cycles here;
+// the APU is brought up to date (APUFlush) when sound registers are
+// accessed, when output is sampled, or every 512 cycles. Exact (state is
+// always caught up before anything can observe it) but removes a
+// per-instruction cost that matters a lot on PS1 hardware.
+int g_audioHookEnabled = 0; // set by a host wanting per-cycle audio sampling (harness WAV dump)
+int apuPendingCycles = 0;
+void APUClock(int cycles);
+void APUFlush(void) {
+	if (apuPendingCycles) {
+		int c = apuPendingCycles;
+		apuPendingCycles = 0;
+		APUClock(c);
+	}
+}
+
 void APUClock(int cycles) {
 	if (!(NR52 & 0x80)) {
 		return; // master sound off - real hardware halts all APU clocking
@@ -1060,8 +1074,6 @@ void APUClock(int cycles) {
 			apuCh4.lfsr = (apuCh4.lfsr & ~0x40) | (xorBit << 6);
 		}
 	}
-
-	APUSetNR52Status();
 }
 
 static const BYTE APU_DUTY_TABLE[4] = {0x01, 0x81, 0x87, 0x7E}; // 12.5/25/50/75%, MSB-first per step
@@ -1070,6 +1082,7 @@ static const BYTE APU_DUTY_TABLE[4] = {0x01, 0x81, 0x87, 0x7E}; // 12.5/25/50/75
 // or -1 if its DAC is off (silent, contributes nothing - matches real
 // hardware's DAC producing no signal at all rather than a "0" sample).
 int APUChannelOutput(int channelNum) {
+	APUFlush();
 	switch (channelNum) {
 		case 1: {
 			if (!apuCh1.enabled || !apuCh1.dacEnabled) return -1;
@@ -1333,25 +1346,53 @@ void cycleLength(int cycle) {
 	// mis-detecting (or double-detecting) an edge, or of the reload-
 	// delay countdown being collapsed the way an earlier, coarser
 	// attempt at that fix was (see timaReloadPending's own history).
-	int divTick;
-	for (divTick = 0; divTick < sysCycle; divTick++) {
-		internalDivCounter16 = (internalDivCounter16 + 1) & 0xFFFF;
-		CheckTimerEdge();
-		if (timaReloadPending > 0) {
-			timaReloadPending -= 1;
-			if (timaReloadPending <= 0) {
-				timaReloadPending = 0;
-				TIMECNT = TIMEMOD;
-				timaWriteBlocked = 4;
+	// Fast path: no reload/write-block window active and no TIMA overflow
+	// possible within this step -> count falling edges of the selected
+	// counter bit arithmetically. Anything near an overflow falls back to
+	// the exact per-T-cycle loop below.
+	{
+		int fast = 0;
+		if (timaReloadPending == 0 && timaWriteBlocked == 0) {
+			if (!((TIMCONT >> 2) & 0x01)) {
+				internalDivCounter16 = (internalDivCounter16 + sysCycle) & 0xFFFF;
+				TIMER_BIT_ANDED = 0;
+				fast = 1;
+			} else {
+				int sh = TIMER_BIT_POS[TIMCONT & 0x03] + 1;
+				int c0 = internalDivCounter16;
+				int c1 = c0 + sysCycle;
+				int edges = (c1 >> sh) - (c0 >> sh);
+				if (edges == 0 || TIMECNT + edges <= 255) {
+					TIMECNT += edges;
+					internalDivCounter16 = c1 & 0xFFFF;
+					TIMER_BIT_ANDED = (internalDivCounter16 >> (sh - 1)) & 0x01;
+					fast = 1;
+				}
 			}
-		} else if (timaWriteBlocked > 0) {
-			timaWriteBlocked -= 1;
+		}
+		if (!fast) {
+	int divTick;
+		for (divTick = 0; divTick < sysCycle; divTick++) {
+			internalDivCounter16 = (internalDivCounter16 + 1) & 0xFFFF;
+			CheckTimerEdge();
+			if (timaReloadPending > 0) {
+				timaReloadPending -= 1;
+				if (timaReloadPending <= 0) {
+					timaReloadPending = 0;
+					TIMECNT = TIMEMOD;
+					timaWriteBlocked = 4;
+				}
+			} else if (timaWriteBlocked > 0) {
+				timaWriteBlocked -= 1;
+			}
+		}
 		}
 	}
 	DIVREG = (BYTE)(internalDivCounter16 >> 8);
-	APUClock(sysCycle);
-	AudioSampleHook(sysCycle);
-	DMAClock(sysCycle);
+	apuPendingCycles += sysCycle;
+	if (apuPendingCycles >= 512) APUFlush();
+	if (g_audioHookEnabled) AudioSampleHook(sysCycle);
+	if (dmaActive) DMAClock(sysCycle);
 	// BUG FIX: the PPU mode/LY state machine below ran completely
 	// unconditionally, even while LCDC bit 7 (LCD/PPU enable) is 0 - real
 	// hardware freezes LY, the STAT mode bits, and critically the STAT
@@ -1387,6 +1428,8 @@ void cycleLength(int cycle) {
 	// short mode length would correctly cascade into the next transition
 	// within the same original call, instead of waiting for some later,
 	// unrelated cycleLength() call to notice).
+	// Fast path: no PPU event inside this step.
+	if (VideoCyclesLeft > sysCycle) { VideoCyclesLeft -= sysCycle; return; }
 	int vTick;
 	for (vTick = 0; vTick < sysCycle; vTick++) {
 	VideoCyclesLeft -= 1;
@@ -2496,6 +2539,7 @@ BYTE ReadMEM(WORD loc) {
 
 		}
 		if ( ( loc >= 0xFF00 ) &&  ( loc <= 0xFF7F ) ) { // $FF00-$FF7F - Hardware I/O Registers
+			if (loc >= 0xFF10 && loc <= 0xFF3F) APUFlush(); // catch the lazy APU up before any sound register is observed
 
 			if (loc >= 0xFF30 && loc <= 0xFF3F) { // Wave RAM
 				return WAVERAM[loc - 0xFF30];
@@ -2802,6 +2846,7 @@ void WriteMEM(WORD loc, BYTE b){
 	} else if ( ( loc >= 0xFE00 ) &&  ( loc <= 0xFE9F ) ) { // $FE00-$FE9F - Object Attribute Memory (OAM)
 		OAMRAM[loc - 0xFE00] = b;
 	} else if ( ( loc >= 0xFF00 ) &&  ( loc <= 0xFF7F ) ) { // $FF00-$FF7F - Hardware I/O Registers
+		if (loc >= 0xFF10 && loc <= 0xFF3F) APUFlush(); // catch the lazy APU up before a sound register changes
 		if (loc >= 0xFF30 && loc <= 0xFF3F) { // Wave RAM - writable regardless of APU power state
 			WAVERAM[loc - 0xFF30] = b;
 			return;
@@ -3780,7 +3825,21 @@ void OP76(void){// 76 HALT
 	// exact DIV value afterward.
 	cycleLength(4);
 	while (!(IFLAG & IER)) {
-		cycleLength(4);
+		// Fast-forward in multiples of 4 cycles, but never within 12 cycles
+		// of the next PPU event or a possible TIMA overflow, so the wake-up
+		// cycle stays exact (halt_* timing tests).
+		int skip = 4;
+		if (!(GBC_MODE && (KEY1 & 0x80)) && timaReloadPending == 0 && timaWriteBlocked == 0 && !dmaActive) {
+			int lim = 1 << 20;
+			if (LCDCONTROL & 0x80) lim = VideoCyclesLeft - 12;
+			if ((TIMCONT >> 2) & 0x01) {
+				int per = 1 << (TIMER_BIT_POS[TIMCONT & 0x03] + 1);
+				int t = (255 - TIMECNT) * per - 12;
+				if (t < lim) lim = t;
+			}
+			if (lim >= 8) skip = lim & ~3;
+		}
+		cycleLength(skip);
 	}
 }// 76 HALT
 

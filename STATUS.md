@@ -216,6 +216,13 @@ implementation was kept because it passes more Mooneye tests (52/67 vs 28/67). U
 - CGB boot registers (A=$11, ...) for CGB carts: Pokemon Crystal now passes its "Game Boy Color only" check.
 - `screenBuffer` is `BYTE` not `int` (frees ~69KB of the PS1's 2MB RAM; heap headroom after statics is ~122KB,
   and the core allocates ~49KB + cart RAM, so carts with <=32KB RAM fit; 128KB-RAM MBC5 carts do not).
+- Performance pass (re-applied on top of the timing branch): timer edges counted arithmetically with the exact
+  per-T-cycle loop as fallback near TIMA overflow / reload windows; PPU fast path when no mode event falls inside
+  a step; HALT fast-forwards in 4-cycle multiples while staying >=12 cycles clear of the next PPU/timer event;
+  APU is clocked lazily (flushed on any $FF10-$FF3F access, `APUChannelOutput`, `UpdateAudio`, or every 512
+  cycles); per-cycle audio-hook/DMA calls skipped unless needed (`g_audioHookEnabled`, `dmaActive`). Host speed:
+  Pokemon Red 300 frames 10.9s -> 2.6s, identical test results (52/67, 18/21, 11/11) and identical frames.
+  Host harness tip: build with -O2 and use DUMP_AT<=600 for real ROMs.
 - PS1 executable verified to build with PSn00bSDK v0.24 (`psxgbc.exe`, ~118KB). Not run on hardware/emulator.
 
 - **CPU/MBC/PPU core correctness**: dozens of real, confirmed bugs fixed
