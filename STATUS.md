@@ -2119,3 +2119,6 @@ core's output to a real image file, verified extensively earlier this
 session) remains the one visual-correctness technique that has
 genuinely worked throughout, and is what actually found and helped fix
 the real rendering bugs in this project.
+
+### Boot I/O snapshot (latest)
+Post-boot values for P1/SB/NR11/NR12/NR50/NR51/NR52 now match DMG. boot_hwio-dmgABCmgb still differs only on timing-phase registers (DIV=$AD, STAT=$80, LY=$0A at entry), which needs starting the PPU/divider at the real boot-ROM hand-off phase.

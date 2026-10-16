@@ -300,6 +300,12 @@ int main(int argc, char **argv) {
             argv[1], size, CARTTYPE, ROMSIZE, RAMSIZE);
 
     int do_trace = (argc >= 4 && strcmp(argv[3], "trace") == 0);
+    if (getenv("DUMP_IO")) {   // DUMP_IO=1: print $FF00-$FF7F + IE as read at boot (before any instruction runs)
+        int a;
+        for (a = 0xFF00; a <= 0xFF7F; a++) fprintf(stderr, "IO %04X %02X\n", a, (unsigned)ReadMEM((WORD)a) & 0xFF);
+        fprintf(stderr, "IO FFFF %02X\n", (unsigned)ReadMEM(0xFFFF) & 0xFF);
+        return 0;
+    }
 
     long i;
     static long pcHistBuf[65536];

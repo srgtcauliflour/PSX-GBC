@@ -314,6 +314,12 @@ void reset_Z80() {
         // snapshot exactly is what real cartridge code expects to see.
 		LCDCONTROL = 0x91;
 		LCDSTATUS = 0x85;
+		// Post-boot-ROM register snapshot: joypad idle, NR50/NR51 and
+		// channel 1 left configured by the boot chime.
+		P1 = 0x0F;
+		NR50 = 0x77; NR51 = 0xF3;
+		apuCh1.nrX1 = 0xBF; apuCh1.nrX2 = 0xF3; apuCh1.enabled = 1;
+		NR52 = 0xF1;
 		// BUG FIX: BGPAL/OBJPAL0/OBJPAL1 (the BGP/OBP0/OBP1 palette
 		// registers) were never initialized here either, defaulting to 0
 		// unless the ROM happened to write to them first. A palette value
@@ -379,7 +385,7 @@ void reset_Z80() {
 		TIMCONT = 0;
 		RTCSELECT = 0;
 		RTCLATCH = 0xFF;
-		SERIALDATA = 0xFF;
+		SERIALDATA = 0x00;
 		SERIALCONTROL = 0x00;
 		DIVREG = 0;
 		DIVCOUNTER = 0;
