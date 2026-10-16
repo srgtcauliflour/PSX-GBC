@@ -2157,3 +2157,9 @@ Not yet verified on a PS1 or by ear.
 - R3 cycles speed up (wraps 10x -> 1x), L3 cycles down (wraps 1x -> 10x); an on-screen "SPEED NX" OSD shows for ~1.5s.
 - Implemented by emulating N frames per presented frame; skipped frames also skip scanline rendering. FramePace() keeps 1x at 60/50 Hz.
 - Verified on the host harness (SPEED env var); real PS1 speed and audio at >1x are untested on hardware.
+
+## Large ROM streaming
+- ROMs up to 1.5MB (MAX_ROM_SIZE) are still loaded whole. Anything bigger keeps bank 0 resident and treats the rest of the 1.5MB buffer as a cache of 16KB banks (95 slots, least-recently-fetched replacement), filled on demand with CD reads (ReadROMBank in psx.c). Supports up to 8MB (512 banks).
+- Core hook: g_romBankLoader / romBankPtr() in emu.c; bank 0 and the 1.5MB-and-under path are unchanged.
+- Host harness: STREAM=n runs any ROM through the streaming path with an n-slot cache. With 2 and 5 slots mbc1/mbc5 stays 18/21 (same as unstreamed) and 8 real ROMs render identically at 3 slots.
+- Untested on hardware: CD read latency (a miss stalls the frame while 8 sectors load; expect a hitch on bank switches that miss).

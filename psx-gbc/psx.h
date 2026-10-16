@@ -58,11 +58,16 @@ unsigned long PadRead(int pad_num);
 // Pokemon Red/Blue and Yellow are both exactly 1MB) while leaving safe
 // headroom in the PS1's 2MB of RAM for everything else the emulator
 // needs (VRAM/internal RAM/OAM/cart RAM buffers, code, stack). The small
-// number of even larger late-era GBC games (up to 4-8MB) still won't
-// fit this way - see STATUS.md for the real fix (stream only the active
-// MBC bank from CD on demand), which is a separate, bigger task.
+// number of even larger late-era GBC games (up to 4-8MB) are streamed from
+// the CD bank by bank instead - see EnableROMStreaming() in emu.h.
 #define MAX_ROM_SIZE (1536 * 1024)
 int LoadROMFromCD(const char *filename, BYTE *dest, int maxSize);
+
+// Streaming access for ROMs larger than MAX_ROM_SIZE: open once, then read
+// 16KB banks on demand (see EnableROMStreaming in emu.h).
+int OpenROMFile(const char *filename);
+int ReadROMBytes(int offset, BYTE *dest, int bytes);
+int ReadROMBank(int bank, BYTE *dest);
 
 // List up to maxFiles entries from the disc's root directory into
 // outFiles (an array of CdlFILE, from psxcd.h - forward-declared via

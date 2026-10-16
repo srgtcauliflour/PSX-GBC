@@ -27,7 +27,7 @@
 #include "gui.h"
 #include "demo_rom.h"
 
-static BYTE rom_buffer[MAX_ROM_SIZE];
+static BYTE rom_buffer[MAX_ROM_SIZE] __attribute__((aligned(4)));
 
 int main(void) {
 	init_PSX();
@@ -36,7 +36,19 @@ int main(void) {
 	int size = -1;
 
 	if (ShowROMMenu(selectedFilename, sizeof(selectedFilename))) {
-		size = LoadROMFromCD(selectedFilename, rom_buffer, MAX_ROM_SIZE);
+		size = OpenROMFile(selectedFilename);
+		if (size > 0 && size <= MAX_ROM_SIZE) {
+			if (!ReadROMBytes(0, rom_buffer, size)) size = -3;
+		} else if (size > MAX_ROM_SIZE) {
+			// Too big to hold whole: bank 0 stays resident, the rest of
+			// the buffer becomes a cache of 16KB banks read from the CD
+			// as the game switches banks.
+			if (ReadROMBytes(0, rom_buffer, 0x4000)) {
+				EnableROMStreaming(rom_buffer + 0x4000, (MAX_ROM_SIZE - 0x4000) / 0x4000, ReadROMBank);
+			} else {
+				size = -3;
+			}
+		}
 	}
 
 	if (size > 0) {

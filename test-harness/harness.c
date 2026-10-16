@@ -267,6 +267,13 @@ static void on_serial_byte(BYTE b) {
     fflush(stdout);
 }
 
+static BYTE *g_fullRom; static long g_fullRomSize;
+static int harness_bank_loader(int bank, BYTE *dest) {
+    long off = (long)bank * 0x4000;
+    memset(dest, 0xFF, 0x4000);
+    if (off < g_fullRomSize) memcpy(dest, g_fullRom + off, (g_fullRomSize - off) < 0x4000 ? (g_fullRomSize - off) : 0x4000);
+    return 1;
+}
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <rom.gb> [max_instructions]\n", argv[0]);
@@ -285,6 +292,14 @@ int main(int argc, char **argv) {
     fclose(f);
 
     ROM = buf;
+    if (getenv("STREAM")) {   // STREAM=n: run through the ROM bank streaming path with an n-slot cache
+        int slots = atoi(getenv("STREAM"));
+        BYTE *b0 = (BYTE *)malloc(0x4000);
+        memcpy(b0, buf, size < 0x4000 ? size : 0x4000);
+        g_fullRom = buf; g_fullRomSize = size;
+        ROM = b0;
+        EnableROMStreaming((BYTE *)malloc(slots * 0x4000), slots, harness_bank_loader);
+    }
     SerialByteSentHook = on_serial_byte;
 
     loadRom();
@@ -370,6 +385,7 @@ int main(int argc, char **argv) {
             pcHist[best] = 0;
         }
     }
+    if (getenv("STREAM")) fprintf(stderr, "[harness] ROM bank loads: %d\n", g_romBankLoads);
     if (i >= max_instr) {
         fprintf(stderr, "\n[harness] hit instruction cap (%ld) without the CPU parking - treating as hang/timeout.\n", max_instr);
     }

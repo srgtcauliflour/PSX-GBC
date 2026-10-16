@@ -289,6 +289,50 @@ BYTE RTCL_S, RTCL_M, RTCL_H, RTCL_DL, RTCL_DH;     // Latched (readable) copies
 
 BYTE ROMSIZE, CARTTYPE, RAMSIZE, VERSIONNUMBER;
 int iROMSIZE, iRAMSIZE;
+
+// ---- ROM bank streaming ---------------------------------------------------
+// ROMs larger than the resident buffer keep only bank 0 in ROM[] plus a cache
+// of 16KB slots filled on demand by g_romBankLoader (CD reads on the PS1).
+// Replacement is least-recently-fetched. NULL loader = whole ROM is resident.
+int (*g_romBankLoader)(int bank, BYTE *dest) = 0;
+#define ROM_MAX_SLOTS 128
+#define ROM_MAX_BANKS 512
+static BYTE *romCache = 0;
+static int romCacheSlots = 0;
+static short slotBank[ROM_MAX_SLOTS];
+static short bankSlot[ROM_MAX_BANKS];
+static unsigned slotAge[ROM_MAX_SLOTS];
+static unsigned romAgeClock = 0;
+static int lastRomBank = -1;
+static BYTE *lastRomPtr = 0;
+int g_romBankLoads = 0;
+
+void EnableROMStreaming(BYTE *cache, int slots, int (*loader)(int bank, BYTE *dest)) {
+	int i;
+	if (slots > ROM_MAX_SLOTS) slots = ROM_MAX_SLOTS;
+	romCache = cache; romCacheSlots = slots;
+	for (i = 0; i < ROM_MAX_SLOTS; i++) { slotBank[i] = -1; slotAge[i] = 0; }
+	for (i = 0; i < ROM_MAX_BANKS; i++) bankSlot[i] = -1;
+	romAgeClock = 0; lastRomBank = -1; g_romBankLoads = 0;
+	g_romBankLoader = loader;
+}
+
+BYTE *romBankPtr(int bank) {
+	if (bank == lastRomBank) return lastRomPtr;
+	int s = bankSlot[bank & (ROM_MAX_BANKS - 1)];
+	if (s < 0) {
+		int i, best = 0;
+		for (i = 1; i < romCacheSlots; i++) if (slotAge[i] < slotAge[best]) best = i;
+		if (slotBank[best] >= 0) bankSlot[slotBank[best]] = -1;
+		g_romBankLoader(bank, romCache + best * 0x4000);
+		g_romBankLoads++;
+		slotBank[best] = (short)bank; bankSlot[bank & (ROM_MAX_BANKS - 1)] = (short)best;
+		s = best;
+	}
+	slotAge[s] = ++romAgeClock;
+	lastRomBank = bank; lastRomPtr = romCache + s * 0x4000;
+	return lastRomPtr;
+}
 BYTE CARTTITLE[16];
 BYTE MANUCODE[2];
 
@@ -2458,6 +2502,12 @@ BYTE ReadMEM(WORD loc) {
 			// console this is undefined behaviour reading whatever
 			// happens to sit past the buffer instead of crashing
 			// outright, but no less wrong.
+			if (g_romBankLoader) {
+				// Streamed ROM (bigger than the resident buffer): only bank 0 and
+				// a cache of recently used banks live in RAM, see romBankPtr().
+				int sb = ROMBANKNUMBER % (iROMSIZE ? iROMSIZE : 1);
+				return (sb ? romBankPtr(sb) : ROM)[loc & 0x3FFF];
+			}
         	return ROM[loc + ((ROMBANKNUMBER % (iROMSIZE ? iROMSIZE : 1)) - 1 ) * 0x4000];
 		}
 		if ( loc < 0xA000 ) { // $8000-$9FFF - VRAM

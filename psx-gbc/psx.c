@@ -608,6 +608,50 @@ int LoadROMFromCD(const char *filename, BYTE *dest, int maxSize) {
 	return file.size;
 }
 
+// ---- Streamed ROM access (ROMs bigger than MAX_ROM_SIZE) ----------------
+static CdlFILE streamFile;
+static int streamValid = 0;
+
+// Finds the file on the disc and remembers it; returns its size or -1.
+int OpenROMFile(const char *filename) {
+	char name[32];
+	strncpy(name, filename, sizeof(name) - 3);
+	name[sizeof(name) - 3] = '\0';
+	if (!strchr(name, ';')) {
+		strcat(name, ";1");
+	}
+	if (!CdSearchFile(&streamFile, name)) {
+		streamValid = 0;
+		return -1;
+	}
+	streamValid = 1;
+	return (int) streamFile.size;
+}
+
+// Reads `bytes` (rounded up to whole 2048-byte sectors) from the opened
+// file starting at `offset` (a multiple of 2048). Bytes past the end of
+// the file are filled with $FF. Returns 1 on success.
+int ReadROMBytes(int offset, BYTE *dest, int bytes) {
+	CdlLOC loc;
+	int sectors = (bytes + 2047) / 2048;
+	if (!streamValid || offset >= (int) streamFile.size) {
+		memset(dest, 0xFF, bytes);
+		return 0;
+	}
+	CdIntToPos(CdPosToInt(&streamFile.pos) + offset / 2048, &loc);
+	CdControl(CdlSetloc, &loc, 0);
+	if (!CdRead(sectors, (uint32_t *) dest, 0)) {
+		memset(dest, 0xFF, bytes);
+		return 0;
+	}
+	CdReadSync(0, 0);
+	return 1;
+}
+
+int ReadROMBank(int bank, BYTE *dest) {
+	return ReadROMBytes(bank * 0x4000, dest, 0x4000);
+}
+
 int ListRootDirectory(void *outFiles, int maxFiles) {
 	CdlFILE *files = (CdlFILE *) outFiles;
 	CdlDIR *dir = CdOpenDir("\\");
