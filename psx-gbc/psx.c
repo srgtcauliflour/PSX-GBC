@@ -654,6 +654,20 @@ int ReadROMBytes(int offset, BYTE *dest, int bytes) {
 	return 1;
 }
 
+// Reads the first sector of a file found via ListRootDirectory (the cart
+// header lives at $100-$14F, well inside it). `dest` must be 2048 bytes and
+// 4-byte aligned. Returns 1 on success.
+int ReadFirstSector(const void *cdFile, BYTE *dest) {
+	const CdlFILE *file = (const CdlFILE *) cdFile;
+	CdlLOC loc = file->pos;
+	CdControl(CdlSetloc, &loc, 0);
+	if (!CdRead(1, (uint32_t *) dest, 0)) {
+		return 0;
+	}
+	CdReadSync(0, 0);
+	return 1;
+}
+
 int ReadROMBank(int bank, BYTE *dest) {
 	return ReadROMBytes(bank * 0x4000, dest, 0x4000);
 }

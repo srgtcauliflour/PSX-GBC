@@ -13,6 +13,7 @@
 // needing its own separate display setup.
 
 #include <string.h>
+#include <stdio.h>
 #include <psxgpu.h>
 #include <psxetc.h>
 #include <psxcd.h>
@@ -22,6 +23,7 @@
 #include "gui.h"
 
 #define MAX_MENU_ENTRIES 30
+#define MAX_VISIBLE      8
 
 // Case-insensitive check for whether `name` ends with `suffix`.
 static int has_suffix_ci(const char *name, const char *suffix) {
@@ -87,6 +89,8 @@ static void draw_rect(uint32_t *ot, char **next, int x, int y, int w, int h,
 int ShowROMMenu(char *selectedFilename, int maxLen) {
 	CdlFILE allFiles[MAX_MENU_ENTRIES];
 	char gameNames[MAX_MENU_ENTRIES][16];
+	char gameLabels[MAX_MENU_ENTRIES][32];
+	static BYTE sector[2048] __attribute__((aligned(4)));
 	int gameCount = 0;
 	int i;
 
@@ -97,6 +101,30 @@ int ShowROMMenu(char *selectedFilename, int maxLen) {
 			strncpy(gameNames[gameCount], allFiles[i].name, 15);
 			gameNames[gameCount][15] = '\0';
 			strip_version_suffix(gameNames[gameCount]);
+
+			// Label = cart header title + GB/GBC + size, falling back to
+			// the file name if the header can't be read or has no title.
+			char title[16];
+			int n = 0, k;
+			title[0] = '\0';
+			if (ReadFirstSector(&allFiles[i], sector)) {
+				for (k = 0; k < 15; k++) {
+					unsigned char c = sector[0x134 + k];
+					if (c == 0) break;
+					title[n++] = (c >= 32 && c < 127) ? (char) c : ' ';
+				}
+				title[n] = '\0';
+				while (n > 0 && title[n - 1] == ' ') title[--n] = '\0';
+			}
+			if (title[0] == '\0') {
+				strncpy(title, gameNames[gameCount], 15);
+				title[15] = '\0';
+			}
+			int isGbc = (sector[0x143] == 0x80 || sector[0x143] == 0xC0);
+			int kb = (int) (allFiles[i].size / 1024);
+			char sz[8];
+			if (kb >= 1024) sprintf(sz, "%dM", kb / 1024); else sprintf(sz, "%dK", kb);
+			sprintf(gameLabels[gameCount], "%-15s %-3s %4s", title, isGbc ? "GBC" : "GB", sz);
 			gameCount++;
 		}
 	}
@@ -105,14 +133,16 @@ int ShowROMMenu(char *selectedFilename, int maxLen) {
 		return 0;
 	}
 
-	int panelHeight = LIST_MARGIN * 2 + gameCount * ROW_HEIGHT + FONT_LINE * 4;
+	int visible = gameCount < MAX_VISIBLE ? gameCount : MAX_VISIBLE;
+	int scroll = 0;
+	int panelHeight = LIST_MARGIN * 2 + visible * ROW_HEIGHT + FONT_LINE * 4;
 
 	// Two independent text streams so the title and the game list can be
 	// positioned precisely, rather than relying on a fixed number of
 	// leading blank lines to separate them (fragile if that count ever
 	// needs to change).
 	FntOpen(TITLE_X, TITLE_Y, 280, FONT_LINE * 2, 0, 64);
-	FntOpen(LIST_X, LIST_Y, PANEL_WIDTH - (LIST_X - PANEL_X) * 2, panelHeight, 0, 512);
+	FntOpen(LIST_X, LIST_Y, PANEL_WIDTH - (LIST_X - PANEL_X) * 2, panelHeight, 0, 1024);
 
 	static uint32_t ot[1];
 	static char primBuffer[4096];
@@ -138,6 +168,8 @@ int ShowROMMenu(char *selectedFilename, int maxLen) {
 				cursor = 0;
 			}
 		}
+		if (cursor < scroll) scroll = cursor;
+		if (cursor >= scroll + visible) scroll = cursor - visible + 1;
 		if (pressed & (Pad1x | Pad1Start)) {
 			confirmed = 1;
 		}
@@ -179,16 +211,16 @@ int ShowROMMenu(char *selectedFilename, int maxLen) {
 		// pass so it's guaranteed to paint over the panel fill above.
 		ClearOTagR(ot, 1);
 		next = primBuffer;
-		draw_rect(ot, &next, offsetX + PANEL_X + 4, offsetY + LIST_Y + cursor * ROW_HEIGHT,
+		draw_rect(ot, &next, offsetX + PANEL_X + 4, offsetY + LIST_Y + (cursor - scroll) * ROW_HEIGHT,
 		          PANEL_WIDTH - 8, ROW_HEIGHT, 64, 72, 160);
 		DrawOTag(ot);
 		DrawSync(0);
 
 		FntPrint(0, "PSX-GBC - select a game");
-		for (i = 0; i < gameCount; i++) {
-			FntPrint(1, "%s\n\n", gameNames[i]);
+		for (i = scroll; i < scroll + visible; i++) {
+			FntPrint(1, "%s\n\n", gameLabels[i]);
 		}
-		FntPrint(1, "\nUp/Down: move\nCross/Start: play");
+		FntPrint(1, "\n%d/%d  Up/Down: move\nCross/Start: play", cursor + 1, gameCount);
 		FntFlush(0);
 		FntFlush(1);
 

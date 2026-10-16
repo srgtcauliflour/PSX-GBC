@@ -69,6 +69,7 @@ int LoadROMFromCD(const char *filename, BYTE *dest, int maxSize);
 int OpenROMFile(const char *filename);
 int ReadROMBytes(int offset, BYTE *dest, int bytes);
 int ReadROMBank(int bank, BYTE *dest);
+int ReadFirstSector(const void *cdFile, BYTE *dest);  // cdFile: a CdlFILE from ListRootDirectory
 
 // List up to maxFiles entries from the disc's root directory into
 // outFiles (an array of CdlFILE, from psxcd.h - forward-declared via
