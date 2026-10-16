@@ -26,7 +26,7 @@ void init_PSX(void);
 // stores them internally) and is only ever populated - and only ever
 // looked at here - when gbcMode is set. A DMG cart calls this with
 // gbcMode always 0, and screenBufferColor can be NULL in that case.
-void Draw_Buffer(int *screenBuffer, unsigned short *screenBufferColor, int gbcMode);
+void Draw_Buffer(unsigned char *screenBuffer, unsigned short *screenBufferColor, int gbcMode);
 void PrepScreen(void);
 // Called once per frame from vblank() - reads the core's current APU
 // channel state (see emu.h's APUChannel externs) and drives the PS1

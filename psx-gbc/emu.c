@@ -85,7 +85,7 @@ int pauseMnuPos = 0;
 double CLOCKSPEED = 4.123;
 
 //char buff[200];
-int screenBuffer[160*144];
+BYTE screenBuffer[160*144]; // 0-3 shade indices (BYTE not int: saves ~69KB of the PS1's 2MB RAM)
 // Parallel to screenBuffer, only ever populated when GBC_MODE is set:
 // the actual 15-bit RGB555 color (little-endian, matching how it's
 // stored in BGPALRAM/OBJPALRAM) for each pixel, rather than a 0-3 DMG
@@ -1370,7 +1370,7 @@ void DrawBGline(int line, int BGaddr, int TILEaddr) {
 	{
 		int mapRow = BGaddr + (by / 8) * 32;
 		int tileRowOff = (by % 8) * 2;
-		int *dst = &screenBuffer[0] + (LCDY * 160);
+		BYTE *dst = &screenBuffer[0] + (LCDY * 160);
 		int px = 0;
 		while (px < 160) {
 			int xs = (px + bx) & 0xFF;            // x in the 256-px plane

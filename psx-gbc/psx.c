@@ -94,7 +94,7 @@ void PresentFrame(void) {
 	db = !db;
 }
 
-void Draw_Buffer(int *screenBuffer, unsigned short *screenBufferColor, int gbcMode) {
+void Draw_Buffer(unsigned char *screenBuffer, unsigned short *screenBufferColor, int gbcMode) {
 	int i;
 	if (gbcMode) {
 		// CGB colors are already stored 15-bit RGB555, little-endian,

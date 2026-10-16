@@ -27,7 +27,7 @@
 unsigned long PadRead(int pad_num) { (void)pad_num; return 0; }
 void PadInit(int mode) { (void)mode; }
 static int draw_buffer_call_count = 0;
-void Draw_Buffer(int *screenBuffer, unsigned short *screenBufferColor, int gbcMode) {
+void Draw_Buffer(unsigned char *screenBuffer, unsigned short *screenBufferColor, int gbcMode) {
     draw_buffer_call_count++;
     if (getenv("TRACE")) fprintf(stderr, "[Draw_Buffer] call #%d\n", draw_buffer_call_count);
     if (getenv("ROWSUMMARY")) {
@@ -79,8 +79,8 @@ void Draw_Buffer(int *screenBuffer, unsigned short *screenBufferColor, int gbcMo
         }
     }
 }
-void Draw_Buffer_SPRT(int *screenBuffer) { (void)screenBuffer; }
-void Draw_Buffer_Pixel_Blitting(int *screenBuffer) { (void)screenBuffer; }
+void Draw_Buffer_SPRT(unsigned char *screenBuffer) { (void)screenBuffer; }
+void Draw_Buffer_Pixel_Blitting(unsigned char *screenBuffer) { (void)screenBuffer; }
 
 // Host stub for the real PS1 SPU-driving UpdateAudio() in psx.c (which
 // this harness doesn't build at all - it uses real PSn00bSDK headers
