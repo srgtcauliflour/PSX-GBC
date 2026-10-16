@@ -2128,3 +2128,6 @@ DMG carts now start with the divider at $ABCC and the PPU at the end of VBlank l
 
 ### LCD-on timing (lcdon_timing-GS, lcdon_write_timing-GS)
 Line 0 after power-on now has a 75T fake-mode-0 phase (tail lengthened to keep a 448T line); STAT reads report mode 0/no coincidence for the first 4T of OAM mode on visible lines; on lines 1-2 right after power-on the mode 2->3 boundary is also seen 4T late by STAT reads and OAM/VRAM writes. Acceptance 56/67 (of the 11 failures, 9 are boot tests for other hardware models: dmg0, mgb, sgb, sgb2, S); remaining real failures: hblank_ly_scx_timing-GS, intr_2_mode0_timing_sprites.
+
+### LY read lookahead
+The core steps the PPU after each instruction, so a read of $FF44 sees the PPU one M-cycle early; an LY increment due within 4T is now visible (not during the first frame lines after LCD-on). hblank_ly_scx_timing-GS passes. Acceptance 57/67; the only applicable failure left is intr_2_mode0_timing_sprites.

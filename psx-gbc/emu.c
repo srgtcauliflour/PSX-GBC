@@ -39,6 +39,9 @@
 #define VBLANK_CYCLES   456
 #define HBLANK_CYCLES   204
 #define OAM_CYCLES       80
+#ifndef LYREAD_K
+#define LYREAD_K 4
+#endif
 #ifndef STATQ2
 #define STATQ2 1
 #endif
@@ -2631,7 +2634,12 @@ BYTE ReadMEM(WORD loc) {
 				} // LCDC Status (R/W), unused bit 7 reads as 1
 				case 0xFF42: return (BYTE)SCRY; break; // Scroll Y   (R/W)
 				case 0xFF43: return (BYTE)SCRX; break; // Scroll X   (R/W)
-				case 0xFF44: return (BYTE)LCDY; break; // LCDC Y-Coordinate (R)
+				case 0xFF44:
+					// The core steps the PPU after each instruction, so a read lands
+					// slightly "early" relative to real hardware; an LY increment
+					// due within LYREAD_K T is already visible.
+					if ((LCDCONTROL & 0x80) && videoMode == HBLANKMODE && LCDY < 143 && !lcdOnLine1 && VideoCyclesLeft <= LYREAD_K) return (BYTE)(LCDY + 1);
+					return (BYTE)LCDY; break; // LCDC Y-Coordinate (R)
 				case 0xFF45: return (BYTE)LYC; break; // LY Compare  (R/W)
 				case 0xFF46: return (BYTE)DMAREG; break; // DMA Transfer and Start Address (R/W) - see DMAREG's declaration comment
 				case 0xFF47: return (BYTE)BGPAL; break;// BG Palette Data  (W)
