@@ -39,6 +39,15 @@
 #define VBLANK_CYCLES   456
 #define HBLANK_CYCLES   204
 #define OAM_CYCLES       80
+#ifndef STATQ2
+#define STATQ2 1
+#endif
+#ifndef LCDON_E
+#define LCDON_E 0
+#endif
+#ifndef LCDON_P
+#define LCDON_P 75
+#endif
 #define TRANSFER_CYCLES 172
 
 
@@ -1186,6 +1195,9 @@ int lcdOnLine0Phase = 0;
 // line 0's special handling finishes (so it fires on the very next
 // line's mode 3, then never again) and consumed/cleared there.
 int lcdOnLine1ExtraPending = 0;
+// Nonzero from power-on until LY reaches 2: line 1 after power-on has its
+// mode 2->3 boundary visible 4T later (lcdon_timing/lcdon_write_timing).
+int lcdOnLine1 = 0;
 
 // BUG FIX: the SCX penalty added to mode 3's length was never
 // subtracted back out of the following HBlank - HBLANK_CYCLES was
@@ -1464,6 +1476,7 @@ void cycleLength(int cycle) {
 		}
 		if((videoMode == HBLANKMODE) || (videoMode == VBLANKMODE)){
 			LCDY++;
+			if (LCDY >= 3) lcdOnLine1 = 0;
 			// BUG FIX: was wrapping at 0x100 (256) instead of 154 (144 visible
 			// lines + 10 VBlank lines) - real hardware's LY never exceeds 153.
 			// This alone made VBlank last roughly 10x too long relative to a
@@ -1621,7 +1634,7 @@ void cycleLength(int cycle) {
 					// declaration comment. Once this fires, line 0's special
 					// handling is done; the LY++ this triggers next proceeds
 					// completely normally, as does every following line.
-					VideoCyclesLeft += HBLANK_CYCLES - 8 - currentLineMode3Penalty;
+					VideoCyclesLeft += HBLANK_CYCLES - 8 + (OAM_CYCLES - LCDON_P) + LCDON_E - currentLineMode3Penalty;
 					lcdOnLine0Phase = 0;
 					lcdOnLine1ExtraPending = 1;
 				} else {
@@ -2605,7 +2618,17 @@ BYTE ReadMEM(WORD loc) {
 
 			// VIDEO
 				case 0xFF40: return (BYTE)LCDCONTROL; break; // LCD Control (R/W)
-				case 0xFF41: return (BYTE)(LCDSTATUS | 0x80); break; // LCDC Status (R/W), unused bit 7 reads as 1
+				case 0xFF41: {
+					BYTE st = (BYTE)(LCDSTATUS | 0x80);
+					// For the first 4T after LY increments on a visible line, real
+					// hardware still reports mode 0 and a cleared coincidence flag.
+					if ((LCDCONTROL & 0x80) && videoMode == OAMMODE && LCDY > 0 && LCDY < 144
+					    && VideoCyclesLeft > OAM_CYCLES - 4) st &= (BYTE)~0x07;
+					if ((LCDCONTROL & 0x80) && videoMode == TRANSFERMODE && LCDY >= 1 && LCDY <= 2 && lcdOnLine1 && !lcdOnLine0Phase
+					    && VideoCyclesLeft > TRANSFER_CYCLES + currentLineMode3Penalty - 4)
+						st = (BYTE)((st & ~0x03) | 0x02);
+					return st;
+				} // LCDC Status (R/W), unused bit 7 reads as 1
 				case 0xFF42: return (BYTE)SCRY; break; // Scroll Y   (R/W)
 				case 0xFF43: return (BYTE)SCRX; break; // Scroll X   (R/W)
 				case 0xFF44: return (BYTE)LCDY; break; // LCDC Y-Coordinate (R)
@@ -2671,12 +2694,20 @@ void WriteMEM(WORD loc, BYTE b){
 	// BUG FIX: same PPU-owns-OAM-during-modes-2-and-3 restriction as
 	// ReadMEM - see that comment for the full explanation.
 	if ((LCDCONTROL & 0x80) && (videoMode == OAMMODE || videoMode == TRANSFERMODE) && (loc >= 0xFE00 && loc <= 0xFE9F)) {
-		return;
+		// Writes are let through for 4T after LY increments (OAM mode's
+		// first 4T) and for the first 4T of mode 3 - Mooneye's
+		// lcdon_write_timing-GS. Line 0 after power-on is exempt.
+		int winOam = videoMode == OAMMODE && LCDY > 0 && LCDY < 144 && VideoCyclesLeft > OAM_CYCLES - 4;
+		int winXfer = videoMode == TRANSFERMODE && LCDY >= 1 && LCDY <= 2 && lcdOnLine1 && !lcdOnLine0Phase
+		              && VideoCyclesLeft > TRANSFER_CYCLES + currentLineMode3Penalty - 4;
+		if (!winOam && !winXfer) return;
 	}
 	// BUG FIX: same PPU-owns-VRAM-during-mode-3 restriction as ReadMEM -
 	// see that comment for the full explanation.
 	if ((LCDCONTROL & 0x80) && (videoMode == TRANSFERMODE) && (loc >= 0x8000 && loc <= 0x9FFF)) {
-		return;
+		int winXfer = LCDY >= 1 && LCDY <= 2 && lcdOnLine1 && !lcdOnLine0Phase
+		              && VideoCyclesLeft > TRANSFER_CYCLES + currentLineMode3Penalty - 4;
+		if (!winXfer) return;
 	}
 	if ( loc <= 0x3FFF && (( CARTTYPE == 0x05 ) || ( CARTTYPE == 0x06 )) ) {
 		// BUG FIX: MBC2 decodes RAMG vs ROMB using only address bit 8 (A8)
@@ -3075,10 +3106,11 @@ void WriteMEM(WORD loc, BYTE b){
 					statLineActive = ((LCDSTATUS >> 2) & 0x01) && ((LCDSTATUS >> 6) & 0x01);
 					lcdOnLine0Phase = 0;
 					lcdOnLine1ExtraPending = 0;
+					lcdOnLine1 = 0;
 				} else if (!(oldLCDC & 0x80) && (b & 0x80)) {
 					LCDY = 0;
 					videoMode = HBLANKMODE;
-					VideoCyclesLeft = OAM_CYCLES;
+					VideoCyclesLeft = LCDON_P;
 					// BUG FIX: line 0 right after power-on isn't a normal
 					// scanline - see lcdOnLine0Phase's declaration comment.
 					// This flags the state machine to skip mode 2 and end
@@ -3086,6 +3118,7 @@ void WriteMEM(WORD loc, BYTE b){
 					// same length as normal mode 2/OAM search, just
 					// reported as mode 0 and not OAM/VRAM-blocking) expire.
 					lcdOnLine0Phase = 1;
+					lcdOnLine1 = 1;
 					LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
 					// Powering on restarts the comparison at LY=0 and
 					// immediately recomputes the composite STAT line

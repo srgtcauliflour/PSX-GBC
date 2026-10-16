@@ -2125,3 +2125,6 @@ Post-boot values for P1/SB/NR11/NR12/NR50/NR51/NR52 now match DMG. boot_hwio-dmg
 
 ### DMG boot hand-off phase
 DMG carts now start with the divider at $ABCC and the PPU at the end of VBlank line 153 (found by search against Mooneye). boot_div-dmgABCmgb and boot_hwio-dmgABCmgb pass: acceptance 54/67, cpu_instrs 11/11, mbc 18/21. CGB carts keep the old start phase.
+
+### LCD-on timing (lcdon_timing-GS, lcdon_write_timing-GS)
+Line 0 after power-on now has a 75T fake-mode-0 phase (tail lengthened to keep a 448T line); STAT reads report mode 0/no coincidence for the first 4T of OAM mode on visible lines; on lines 1-2 right after power-on the mode 2->3 boundary is also seen 4T late by STAT reads and OAM/VRAM writes. Acceptance 56/67 (of the 11 failures, 9 are boot tests for other hardware models: dmg0, mgb, sgb, sgb2, S); remaining real failures: hblank_ly_scx_timing-GS, intr_2_mode0_timing_sprites.
