@@ -382,7 +382,7 @@ int main(int argc, char **argv) {
         for (r = 0; r < 32; r++) {
             fprintf(stderr, "  ");
             for (c = 0; c < 20; c++) {
-                fprintf(stderr, "%02X ", ReadMEM(0x9800 + r*32 + c));
+                { fprintf(stderr, "%02X ", VRAM[0x1800 + r*32 + c]); }
             }
             fprintf(stderr, "\n");
         }
