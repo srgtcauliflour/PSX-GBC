@@ -926,6 +926,21 @@ void APUStepFrameSequencer(void) {
 // T-cycles, and the 512Hz frame sequencer alongside them. Called once
 // per instruction from cycleLength(), the same place DIV/the CPU timer/
 // the PPU are all driven from.
+// Lazy APU clocking: cycleLength() only accumulates elapsed cycles here;
+// the APU is brought up to date (APUFlush) when sound registers are
+// accessed, when output is sampled, or every 512 cycles. Keeps results
+// exact (state is always caught up before anything can observe it) while
+// removing a per-instruction cost that mattered a lot on PS1 hardware.
+int apuPendingCycles = 0;
+void APUClock(int cycles);
+void APUFlush(void) {
+	if (apuPendingCycles) {
+		int c = apuPendingCycles;
+		apuPendingCycles = 0;
+		APUClock(c);
+	}
+}
+
 void APUClock(int cycles) {
 	if (!(NR52 & 0x80)) {
 		return; // master sound off - real hardware halts all APU clocking
@@ -966,8 +981,6 @@ void APUClock(int cycles) {
 			apuCh4.lfsr = (apuCh4.lfsr & ~0x40) | (xorBit << 6);
 		}
 	}
-
-	APUSetNR52Status();
 }
 
 static const BYTE APU_DUTY_TABLE[4] = {0x01, 0x81, 0x87, 0x7E}; // 12.5/25/50/75%, MSB-first per step
@@ -976,6 +989,7 @@ static const BYTE APU_DUTY_TABLE[4] = {0x01, 0x81, 0x87, 0x7E}; // 12.5/25/50/75
 // or -1 if its DAC is off (silent, contributes nothing - matches real
 // hardware's DAC producing no signal at all rather than a "0" sample).
 int APUChannelOutput(int channelNum) {
+	APUFlush();
 	switch (channelNum) {
 		case 1: {
 			if (!apuCh1.enabled || !apuCh1.dacEnabled) return -1;
@@ -1035,20 +1049,49 @@ void cycleLength(int cycle) {
 	// mis-detecting (or double-detecting) an edge, or of the reload-
 	// delay countdown being collapsed the way an earlier, coarser
 	// attempt at that fix was (see timaReloadPending's own history).
-	int divTick;
-	for (divTick = 0; divTick < sysCycle; divTick++) {
-		internalDivCounter16 = (internalDivCounter16 + 1) & 0xFFFF;
-		CheckTimerEdge();
-		if (timaReloadPending > 0) {
-			timaReloadPending -= 1;
-			if (timaReloadPending <= 0) {
-				timaReloadPending = 0;
-				TIMECNT = TIMEMOD;
+	// Fast path: no reload pending and no TIMA overflow possible within this
+	// step -> count the falling edges of the selected counter bit
+	// arithmetically (edges = number of multiples of 2^(bit+1) crossed).
+	// Anything near an overflow falls back to the exact per-T-cycle loop.
+	{
+		int fast = 0;
+		if (timaReloadPending == 0) {
+			if (!((TIMCONT >> 2) & 0x01)) {
+				// timer disabled: the ANDed bit is 0, no edges can occur
+				internalDivCounter16 = (internalDivCounter16 + sysCycle) & 0xFFFF;
+				TIMER_BIT_ANDED = 0;
+				fast = 1;
+			} else {
+				int sh = TIMER_BIT_POS[TIMCONT & 0x03] + 1;
+				int c0 = internalDivCounter16;
+				int c1 = c0 + sysCycle;                    /* may exceed 16 bits */
+				int edges = (c1 >> sh) - (c0 >> sh);
+				if (edges == 0 || TIMECNT + edges <= 255) {
+					TIMECNT += edges;
+					internalDivCounter16 = c1 & 0xFFFF;
+					TIMER_BIT_ANDED = (internalDivCounter16 >> (sh - 1)) & 0x01;
+					fast = 1;
+				}
+			}
+		}
+		if (!fast) {
+			int divTick;
+			for (divTick = 0; divTick < sysCycle; divTick++) {
+				internalDivCounter16 = (internalDivCounter16 + 1) & 0xFFFF;
+				CheckTimerEdge();
+				if (timaReloadPending > 0) {
+					timaReloadPending -= 1;
+					if (timaReloadPending <= 0) {
+						timaReloadPending = 0;
+						TIMECNT = TIMEMOD;
+					}
+				}
 			}
 		}
 	}
 	DIVREG = (BYTE)(internalDivCounter16 >> 8);
-	APUClock(sysCycle);
+	apuPendingCycles += sysCycle;
+	if (apuPendingCycles >= 512) APUFlush();
 	AudioSampleHook(sysCycle);
 	DMAClock(sysCycle);
 	if (LCDCONTROL & 0x80) VideoCyclesLeft -= sysCycle;
@@ -1318,25 +1361,27 @@ void DrawBGline(int line, int BGaddr, int TILEaddr) {
 		return;
 	}
 
-	for (i = 0; i < 160; i++) {
-		if (BGaddr == 0x9C00) {//
-			tileNo = (signed int)ReadMEM(BGaddr + (by/8) * 32 + (i+ bx)/8);
-		} else {
-			tileNo = (unsigned char)ReadMEM(BGaddr + (by/8) * 32 + (i+bx)/8);
-		}
-		if (tileNo != oldtileNo) {
-	 		B1 = (unsigned char)ReadMEM(TILEaddr + (tileNo) * 16  + (by%8)*2 );
-	 		B2 = (unsigned char)ReadMEM(TILEaddr + (tileNo) * 16  + (by%8)*2 + 1 );
-	 		oldtileNo = tileNo;
-		}
-	 	if (((B1 >> (7-(i%8))) & 0x01) == 1) {
-			if (((B2 >> (7-(i%8))) & 0x01) == 1) { colour = (BGPAL >> 6) & 0x3; //3;
-			} else { colour = (BGPAL >> 4) & 0x3; //2;
+	// DMG path: fetch the map byte and tile row once per 8-pixel tile, read
+	// VRAM directly (bank 0), wrap the map column at 32 tiles, and use LCDC
+	// bit 4 (via TILEaddr) to decide signed vs unsigned tile numbers.
+	{
+		int mapRow = BGaddr + (by / 8) * 32;
+		int tileRowOff = (by % 8) * 2;
+		int *dst = &screenBuffer[0] + (LCDY * 160);
+		int px = 0;
+		while (px < 160) {
+			int xs = (px + bx) & 0xFF;            // x in the 256-px plane
+			int col = xs >> 3;
+			int inTile = xs & 7;
+			int tn = VRAM[mapRow + col - 0x8000];
+			int eff = (TILEaddr == 0x8000) ? tn : (signed char)tn;
+			int da = TILEaddr + eff * 16 + tileRowOff - 0x8000;
+			BYTE t1 = VRAM[da], t2 = VRAM[da + 1];
+			for (; inTile < 8 && px < 160; inTile++, px++) {
+				int bp = 7 - inTile;
+				dst[px] = ((BGPAL >> ((((t2 >> bp) & 1) << 1 | ((t1 >> bp) & 1)) * 2)) & 0x3);
 			}
-	 	} else if (((B2 >> 7-(i%8)) & 0x01) == 1) { colour = (BGPAL >> 2) & 0x3; //1;
-	 	} else { colour = BGPAL & 0x3; //0;
-	 	}
- 		screenBuffer[(LCDY * 160) + i] = colour;
+		}
 	}
 }
 
@@ -1390,36 +1435,28 @@ void DrawWINline(int line, int WINaddr, int TILEaddr) {
 		return;
 	}
 
-	for (i = 0; i < 160; i++) {
-		if (WINaddr == 0x9C00) {
-			tileNo = (signed int)ReadMEM(WINaddr + (by/8) * 32 + (i)/8);
-		} else {
-			tileNo = (unsigned char)ReadMEM(WINaddr + (by/8) * 32 + (i)/8);
-		}
-		if (tileNo != oldtileNo) {
-			 B1 = (unsigned char)ReadMEM(TILEaddr + ((tileNo) * 16)  + (by%8)*2 );
-			 B2 = (unsigned char)ReadMEM(TILEaddr + ((tileNo) * 16)  + (by%8)*2 + 1 );
-			 oldtileNo = tileNo;
-		}
-		// BUG FIX: window tiles never went through the BGP palette
-		// lookup at all - real hardware uses the same BGP register for
-		// both background and window rendering, so a game whose BGP
-		// isn't the identity mapping ($E4) would see the window's
-		// colors come out wrong (a plain 0-3 shade index instead of
-		// whatever BGP actually maps that index to).
-		if (((B1 >> (7-(i%8))) & 0x01) == 1) {
-			if (((B2 >> (7-(i%8))) &0x01) == 1) { colour = (BGPAL >> 6) & 0x3;
-			} else { colour = (BGPAL >> 4) & 0x3;
-			}
-		} else if (((B2 >> (7-(i%8))) &0x01) == 1) { colour = (BGPAL >> 2) & 0x3;
-		} else {
-			if(Transparency == 1){
-				colour = screenBuffer[(LCDY * 160) + i + WNDX - 7]; // Or Better yet, skip the output.
-			} else {
-				colour = BGPAL & 0x3;
+	// DMG window: per-tile fetch, direct VRAM reads, signed tile numbers
+	// chosen by LCDC bit 4 (TILEaddr), output clamped to the visible line.
+	{
+		int mapRow = WINaddr + (by / 8) * 32;
+		int tileRowOff = (by % 8) * 2;
+		int wi = 0;
+		while (wi < 160) {
+			int col = wi >> 3;
+			int inTile = wi & 7;
+			int tn = VRAM[mapRow + col - 0x8000];
+			int eff = (TILEaddr == 0x8000) ? tn : (signed char)tn;
+			int da = TILEaddr + eff * 16 + tileRowOff - 0x8000;
+			BYTE t1 = VRAM[da], t2 = VRAM[da + 1];
+			for (; inTile < 8 && wi < 160; inTile++, wi++) {
+				int bp = 7 - inTile;
+				int idx = ((t2 >> bp) & 1) << 1 | ((t1 >> bp) & 1);
+				int x = wi + WNDX - 7;
+				if (x < 0 || x >= 160) continue;
+				if (idx == 0 && Transparency == 1) continue; // keep what BG drew
+				screenBuffer[(LCDY * 160) + x] = (BGPAL >> (idx * 2)) & 0x3;
 			}
 		}
-		screenBuffer[(LCDY * 160) + i + WNDX - 7] = colour;
 	}
 }
 
@@ -2066,6 +2103,7 @@ BYTE ReadMEM(WORD loc) {
 
 		}
 		if ( ( loc >= 0xFF00 ) &&  ( loc <= 0xFF7F ) ) { // $FF00-$FF7F - Hardware I/O Registers
+			if (loc >= 0xFF10 && loc <= 0xFF3F) APUFlush(); // catch the lazy APU up before any sound register is observed
 
 			if (loc >= 0xFF30 && loc <= 0xFF3F) { // Wave RAM
 				return WAVERAM[loc - 0xFF30];
@@ -2338,6 +2376,7 @@ void WriteMEM(WORD loc, BYTE b){
 	} else if ( ( loc >= 0xFE00 ) &&  ( loc <= 0xFE9F ) ) { // $FE00-$FE9F - Object Attribute Memory (OAM)
 		OAMRAM[loc - 0xFE00] = b;
 	} else if ( ( loc >= 0xFF00 ) &&  ( loc <= 0xFF7F ) ) { // $FF00-$FF7F - Hardware I/O Registers
+		if (loc >= 0xFF10 && loc <= 0xFF3F) APUFlush(); // catch the lazy APU up before a sound register changes
 		if (loc >= 0xFF30 && loc <= 0xFF3F) { // Wave RAM - writable regardless of APU power state
 			WAVERAM[loc - 0xFF30] = b;
 			return;
@@ -3199,7 +3238,21 @@ void OP76(void){// 76 HALT
 	// executed twice). A handful of commercial games and test ROMs rely on
 	// this exact quirk; left as a known follow-up.
 	while (!(IFLAG & IER)) {
-		cycleLength(4);
+		// Fast-forward: skip ahead in multiples of 4 cycles, but never past
+		// the next PPU mode change or a possible TIMA overflow, so the wake-up
+		// cycle stays exact (halt_* timing tests).
+		int skip = 4;
+		if (!(GBC_MODE && (KEY1 & 0x80)) && timaReloadPending == 0) {
+			int lim = 1 << 20;
+			if (LCDCONTROL & 0x80) lim = VideoCyclesLeft - 8;
+			if ((TIMCONT >> 2) & 0x01) {
+				int per = 1 << (TIMER_BIT_POS[TIMCONT & 0x03] + 1);
+				int t = (255 - TIMECNT) * per - 8;
+				if (t < lim) lim = t;
+			}
+			if (lim >= 8) skip = lim & ~3;
+		}
+		cycleLength(skip);
 	}
 	cycleLength(4);
 }// 76 HALT

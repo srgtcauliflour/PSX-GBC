@@ -130,9 +130,12 @@ static void WriteWavFile(void) {
 }
 
 void AudioSampleHook(int cycles) {
-    if (!getenv("DUMP_WAV")) {
+    static int wavEnabled = -1;
+    if (wavEnabled < 0) wavEnabled = getenv("DUMP_WAV") != NULL;
+    if (!wavEnabled) {
         return;
     }
+    APUFlush();
     if (!wavBuffer) {
         wavMaxSamples = WAV_SAMPLE_RATE * WAV_MAX_SECONDS;
         wavBuffer = malloc(wavMaxSamples * 2 * sizeof(int16_t));

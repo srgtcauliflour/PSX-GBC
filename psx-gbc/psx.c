@@ -345,6 +345,7 @@ static uint16_t WavePitch(int freq11) {
 }
 
 void UpdateAudio(void) {
+	APUFlush();
 	if (!audioInitialized) {
 		return;
 	}
