@@ -512,12 +512,27 @@ void interrupt(void){
 		// supplies the middle 3 (idle + both writes), so this only needs
 		// to charge the first idle cycle (before) and the final PC-set
 		// cycle (after) explicitly: 4 + 12 + 4 = 20.
+		// Real dispatch order: 2 idle M-cycles, push PC high byte, push PC
+		// low byte, set PC. The vector is chosen *after* the high-byte push,
+		// so a push that lands on IE ($FFFF) can cancel the interrupt
+		// (PC becomes $0000 and IF is left untouched) - acceptance/interrupts/ie_push.
+		WORD pcSave = reg_PC;
+		BYTE pend;
+		WORD vec = 0x0000;
 		cycleLength(4);
-		if 		  (IFLAG & IER & 0x01) 	      { IFLAG &= ~0x01; IME = 0; reg_PC = rst(0x0040); }  // Bit 0: V-Blank
-		else if (((IFLAG & IER) >> 1) & 0x01) { IFLAG &= ~0x02; IME = 0; reg_PC = rst(0x0048); } //  Bit 1: LCD
-		else if (((IFLAG & IER) >> 2) & 0x01) { IFLAG &= ~0x04; IME = 0; reg_PC = rst(0x0050); } //  Bit 2: Timer Overflow
-		else if (((IFLAG & IER) >> 3) & 0x01) { IFLAG &= ~0x08; IME = 0; reg_PC = rst(0x0058); } //  Bit 3: Serial I/O transfer end
-		else if (((IFLAG & IER) >> 4) & 0x01) { IFLAG &= ~0x10; IME = 0; reg_PC = rst(0x0060); } //  Bit 4: New Value on Selected Joypad Keyline(s)
+		cycleLength(4);
+		reg_SP--; WriteMEM(reg_SP, (BYTE)(pcSave >> 8));
+		cycleLength(4);
+		pend = IFLAG & IER;
+		reg_SP--; WriteMEM(reg_SP, (BYTE)(pcSave & 0xFF));
+		cycleLength(4);
+		IME = 0;
+		if      (pend & 0x01) { IFLAG &= ~0x01; vec = 0x0040; }
+		else if (pend & 0x02) { IFLAG &= ~0x02; vec = 0x0048; }
+		else if (pend & 0x04) { IFLAG &= ~0x04; vec = 0x0050; }
+		else if (pend & 0x08) { IFLAG &= ~0x08; vec = 0x0058; }
+		else if (pend & 0x10) { IFLAG &= ~0x10; vec = 0x0060; }
+		reg_PC = vec;
 		cycleLength(4);
 	}
 }
@@ -2048,7 +2063,7 @@ BYTE ReadMEM(WORD loc) {
 				case 0xFF05: return (BYTE)TIMECNT; break;// Timer counter (R/W)
 				case 0xFF06: return (BYTE)TIMEMOD; break;// Timer Modulo (R/W)
 				case 0xFF07: return (BYTE)TIMCONT; break; // Timer Control
-				case 0xFF0F: return (BYTE)IFLAG; break; // Interrupt Flag (R/W)
+				case 0xFF0F: return (BYTE)(IFLAG | 0xE0); break; // Interrupt Flag (R/W)
 
 				// SOUND - many bits across these registers are
 				// write-only on real hardware and read back as 1
@@ -3731,6 +3746,7 @@ void OPF2(void){ // case  0xF2:
 
 void OPF3(void){ // case  0xF3:
 	IME = 0;
+	EI_PENDING = 0; // DI cancels a pending EI (rapid_di_ei)
 	cycleLength(4);
 } // F3    DI
 
@@ -3779,7 +3795,8 @@ void OPFA(void){ // case  0xFA:
 } // FA    LD   A,(nnnn)
 
 void OPFB(void){ // case  0xFB:
-	EI_PENDING = 2;
+	// A second EI while one is already pending must NOT restart the delay (ei_sequence).
+	if (EI_PENDING == 0 && !IME) EI_PENDING = 2;
 	cycleLength(4);
 } // FB    EI
 
