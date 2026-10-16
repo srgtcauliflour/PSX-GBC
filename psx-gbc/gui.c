@@ -60,7 +60,8 @@ static void strip_version_suffix(char *name) {
 // highlight bar tracks the text exactly. If a future PSn00bSDK version
 // changes the built-in font's line spacing, this is the constant to
 // revisit.
-#define ROW_HEIGHT   8
+#define ROW_HEIGHT   16
+#define FONT_LINE    8
 #define TITLE_X      20
 #define TITLE_Y      8
 #define PANEL_X      24
@@ -104,13 +105,13 @@ int ShowROMMenu(char *selectedFilename, int maxLen) {
 		return 0;
 	}
 
-	int panelHeight = LIST_MARGIN * 2 + gameCount * ROW_HEIGHT + ROW_HEIGHT + 8;
+	int panelHeight = LIST_MARGIN * 2 + gameCount * ROW_HEIGHT + FONT_LINE * 4;
 
 	// Two independent text streams so the title and the game list can be
 	// positioned precisely, rather than relying on a fixed number of
 	// leading blank lines to separate them (fragile if that count ever
 	// needs to change).
-	FntOpen(TITLE_X, TITLE_Y, 280, ROW_HEIGHT * 2, 0, 64);
+	FntOpen(TITLE_X, TITLE_Y, 280, FONT_LINE * 2, 0, 64);
 	FntOpen(LIST_X, LIST_Y, PANEL_WIDTH - (LIST_X - PANEL_X) * 2, panelHeight, 0, 512);
 
 	static uint32_t ot[1];
@@ -183,11 +184,11 @@ int ShowROMMenu(char *selectedFilename, int maxLen) {
 		DrawOTag(ot);
 		DrawSync(0);
 
-		FntPrint(0, "aGBe - select a game");
+		FntPrint(0, "PSX-GBC - select a game");
 		for (i = 0; i < gameCount; i++) {
-			FntPrint(1, "%s\n", gameNames[i]);
+			FntPrint(1, "%s\n\n", gameNames[i]);
 		}
-		FntPrint(1, "\nUp/Down: move   Cross/Start: play");
+		FntPrint(1, "\nUp/Down: move\nCross/Start: play");
 		FntFlush(0);
 		FntFlush(1);
 
