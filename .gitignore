@@ -9,3 +9,8 @@ toolchain/
 test-harness/build/
 test-harness/harness
 test-harness/refharness
+psn00bsdk-build/disc_roms/
+psn00bsdk-build/iso_custom.xml
+*.gb
+*.gbc
+!psn00bsdk-build/iso_files/*.GB
