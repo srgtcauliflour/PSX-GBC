@@ -304,6 +304,7 @@ int main(int argc, char **argv) {
     long i;
     static long pcHistBuf[65536];
     int traceEnv = getenv("TRACE") != NULL;
+    g_audioHookEnabled = getenv("DUMP_WAV") != NULL;
     long *pcHist = getenv("PCHIST") ? pcHistBuf : NULL;  // PCHIST=1: print top-15 executed PCs at exit
     WORD lastPC = 0xFFFF;
     int stuckCount = 0;

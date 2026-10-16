@@ -931,6 +931,9 @@ void APUStepFrameSequencer(void) {
 // accessed, when output is sampled, or every 512 cycles. Keeps results
 // exact (state is always caught up before anything can observe it) while
 // removing a per-instruction cost that mattered a lot on PS1 hardware.
+// Set by a host that wants per-cycle audio sampling (the test harness's WAV dump).
+// Off by default so the PS1 build never pays for the call.
+int g_audioHookEnabled = 0;
 int apuPendingCycles = 0;
 void APUClock(int cycles);
 void APUFlush(void) {
@@ -1092,8 +1095,8 @@ void cycleLength(int cycle) {
 	DIVREG = (BYTE)(internalDivCounter16 >> 8);
 	apuPendingCycles += sysCycle;
 	if (apuPendingCycles >= 512) APUFlush();
-	AudioSampleHook(sysCycle);
-	DMAClock(sysCycle);
+	if (g_audioHookEnabled) AudioSampleHook(sysCycle);
+	if (dmaActive) DMAClock(sysCycle);
 	if (LCDCONTROL & 0x80) VideoCyclesLeft -= sysCycle;
 	if((LCDCONTROL & 0x80) && VideoCyclesLeft <= 0) { // Video
 		if((videoMode == HBLANKMODE) || (videoMode == VBLANKMODE)){
@@ -1453,7 +1456,7 @@ void DrawWINline(int line, int WINaddr, int TILEaddr) {
 				int idx = ((t2 >> bp) & 1) << 1 | ((t1 >> bp) & 1);
 				int x = wi + WNDX - 7;
 				if (x < 0 || x >= 160) continue;
-				if (idx == 0 && Transparency == 1) continue; // keep what BG drew
+				// The window is always opaque on real hardware (colour 0 draws as BGP[0]).
 				screenBuffer[(LCDY * 160) + x] = (BGPAL >> (idx * 2)) & 0x3;
 			}
 		}

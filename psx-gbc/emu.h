@@ -75,6 +75,7 @@ extern BYTE WAVERAM[16];
 extern BYTE NR50, NR51, NR52;
 int APUChannelOutput(int channelNum);
 void APUFlush(void);
+extern int g_audioHookEnabled;
 int CartHasBattery(void);
 int CartHasRTC(void);
 int GetCartSaveSize(void);
