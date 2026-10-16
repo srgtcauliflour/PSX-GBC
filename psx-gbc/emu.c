@@ -1027,8 +1027,8 @@ void cycleLength(int cycle) {
 	APUClock(sysCycle);
 	AudioSampleHook(sysCycle);
 	DMAClock(sysCycle);
-	VideoCyclesLeft -= sysCycle;
-	if(VideoCyclesLeft <= 0) { // Video
+	if (LCDCONTROL & 0x80) VideoCyclesLeft -= sysCycle;
+	if((LCDCONTROL & 0x80) && VideoCyclesLeft <= 0) { // Video
 		if((videoMode == HBLANKMODE) || (videoMode == VBLANKMODE)){
 			LCDY++;
 			// BUG FIX: was wrapping at 0x100 (256) instead of 154 (144 visible
@@ -2461,6 +2461,25 @@ void WriteMEM(WORD loc, BYTE b){
 
 			// VIDEO
 			case 0xFF40:
+				// LCD power transitions (LCDC bit 7). Previously the PPU
+				// clock ran unconditionally, so a game that switched the LCD
+				// off (very common during screen transitions) saw LY keep
+				// counting and VBlank keep firing. Real hardware: switching
+				// the LCD off resets LY to 0 and the STAT mode to 0 and
+				// freezes the PPU (no VBlank/STAT interrupts); switching it
+				// on restarts the PPU at the beginning of line 0. Found via
+				// Kirby's Pinball Land, whose VBlank handler waits for
+				// LY==$91 and then turns the LCD off.
+				if ((LCDCONTROL & 0x80) && !(b & 0x80)) {
+					LCDY = 0;
+					videoMode = HBLANKMODE;
+					LCDSTATUS = (LCDSTATUS & 0xF8);
+				} else if (!(LCDCONTROL & 0x80) && (b & 0x80)) {
+					LCDY = 0;
+					videoMode = OAMMODE;
+					VideoCyclesLeft = OAM_CYCLES;
+					LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
+				}
 				LCDCONTROL = b;
 				break; // LCD Control (R/W)
 			case 0xFF41:

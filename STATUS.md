@@ -104,6 +104,7 @@ TRACE_AUDIO=1 ./harness rom.gb 3000000         # per-frame channel freq/volume/e
 ROWSUMMARY=1 ./harness rom.gb 30000000         # per-row non-white pixel counts
 DUMP_VRAM=1 ./harness rom.gb 30000000          # tile map/tile data/palette dump at exit
 DUMP_HRAM=1 ./harness rom.gb 60000000          # Mooneye pass/fail HRAM diagnostic fields
+PCHIST=1 ./harness rom.gb 20000000            # top-15 most-executed PCs at exit (finds hot wait loops)
 NOSTUCK=1 ./harness rom.gb 30000000            # disable the stuck-loop early-exit (needed for infinite-loop test ROMs with no HALT)
 ```
 
@@ -330,7 +331,15 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   render correctly without CGB tile-attribute support — an expected
   consequence of this project's already-documented lack of GBC support,
   not a new bug.
-- **One real, unresolved issue found and deeply investigated: Kirby's
+- **RESOLVED: Kirby's Pinball Land hang (and Kirby's Dream Land 2 blank screen) - the PPU never modelled the LCD being switched off.**
+  Root cause found by PC-histogram profiling (`PCHIST=1` in the harness): the game's VBlank handler waits
+  for `LY==$91` and then clears LCDC bit 7. The core ignored bit 7, so LY kept counting and VBlank kept
+  firing while the "LCD" was off; the handler then re-entered late every frame and never recovered. The
+  earlier "Timer starvation" hypothesis above was a red herring. Fix (emu.c, $FF40 write + PPU clock):
+  LCD off resets LY=0 / STAT mode=0 and freezes the PPU; LCD on restarts at line 0 in OAM mode. Both games
+  now render (pinball table / DL2 title screen). Regression sweep unchanged: cpu_instrs 11/11,
+  Mooneye mbc1+mbc5 18/21, acceptance 21/67 with the identical pass list.
+- (SUPERSEDED - see RESOLVED note above) **Kirby's
   Pinball Land hangs on a blank screen.** Traced via the same reference-
   diffing technique to a Timer-interrupt-gated countdown flag in HRAM
   that only this emulator fails to ever fully decrement — the Timer
@@ -678,7 +687,7 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
    session - a dedicated pass, not a quick fix, and one where every
    change needs the full regression sweep (see above) before being
    trusted.
-2. **Kirby's Pinball Land hang (see above) — real, unresolved, deeply
+2. **(DONE - fixed by LCD-off modelling, see above)** Kirby's Pinball Land hang - formerly real, unresolved, deeply
    investigated but not fixed.** A genuine MBC2-cartridge compatibility
    issue on the one MBC2 game tested so far. A real PPU frame-timing
    bug found during a second investigation pass (see above) turned out

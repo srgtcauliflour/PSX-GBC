@@ -299,6 +299,8 @@ int main(int argc, char **argv) {
     int do_trace = (argc >= 4 && strcmp(argv[3], "trace") == 0);
 
     long i;
+    static long pcHistBuf[65536];
+    long *pcHist = getenv("PCHIST") ? pcHistBuf : NULL;  // PCHIST=1: print top-15 executed PCs at exit
     WORD lastPC = 0xFFFF;
     int stuckCount = 0;
     for (i = 0; i < max_instr && EMULATING; i++) {
@@ -329,6 +331,7 @@ int main(int argc, char **argv) {
                     i, reg_PC, reg_SP, reg_A, ReadMEM(reg_PC), IME, IER, IFLAG, LCDY, dmaActive, dmaBytesDone);
         }
 
+        if (pcHist) pcHist[reg_PC]++;
         instructions[ReadMEM(reg_PC++)]();
 
         // Mirrors the EI-delay fix in emu.c's real runEmu() - this
@@ -342,6 +345,16 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (pcHist) {
+        int k, n;
+        for (n = 0; n < 15; n++) {
+            int best = 0;
+            for (k = 1; k < 65536; k++) if (pcHist[k] > pcHist[best]) best = k;
+            if (!pcHist[best]) break;
+            fprintf(stderr, "[PCHIST] %04X %ld\n", best, pcHist[best]);
+            pcHist[best] = 0;
+        }
+    }
     if (i >= max_instr) {
         fprintf(stderr, "\n[harness] hit instruction cap (%ld) without the CPU parking - treating as hang/timeout.\n", max_instr);
     }
