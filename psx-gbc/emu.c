@@ -74,8 +74,6 @@ int IME;
 // EI dispatches; IME only becomes 1 once it reaches 0, in the main
 // dispatch loop below (not here) - see runEmu().
 int EI_PENDING = 0;
-void StatUpdate(void);
-int statLine = 0;
 int EMULATING;
 BYTE *VRAM, *EXTRNRAM, *RAM, *OAMRAM, *HIRAM;
 int temp;
@@ -123,6 +121,18 @@ int TIMECNT;
 // to 0 immediately on overflow, then to TMA once this reaches 0), so
 // the $FF05 read handler needs no changes of its own.
 int timaReloadPending = 0;
+// BUG FIX (Mooneye's tima_write_reloading.gb/tma_write_reloading.gb):
+// the write-blocking window is one M-cycle *longer* than the visible
+// "reads as $00" window above - a TIMA write during that first window
+// (timaReloadPending>0) cancels the reload and the written value sticks
+// (already handled below), but a TIMA write during the *following*
+// M-cycle (once TIMECNT has already become TMA and reads normally) is
+// silently ignored instead - the reload has already "committed" from
+// the write-arbitration hardware's perspective even though nothing
+// about its visible state distinguishes that cycle from any other
+// ordinary one. timaWriteBlocked counts down that second, write-only
+// window the same way timaReloadPending counts down the first.
+int timaWriteBlocked = 0;
 
 // Real hardware bit positions of the 16-bit internal counter each TAC
 // clock-select value watches for a falling edge (Pan Docs "Timer
@@ -510,32 +520,45 @@ void interrupt(void){
 		// function used to *also* charge the full 20T total afterward,
 		// double-counting those 12T and making every interrupt dispatch
 		// take 32T instead of 20T. Real hardware's 5 M-cycles break down
-		// as idle, idle, write-hi, write-lo, set-PC - push() now
-		// supplies the middle 3 (idle + both writes), so this only needs
-		// to charge the first idle cycle (before) and the final PC-set
-		// cycle (after) explicitly: 4 + 12 + 4 = 20.
-		// Real dispatch order: 2 idle M-cycles, push PC high byte, push PC
-		// low byte, set PC. The vector is chosen *after* the high-byte push,
-		// so a push that lands on IE ($FFFF) can cancel the interrupt
-		// (PC becomes $0000 and IF is left untouched) - acceptance/interrupts/ie_push.
-		WORD pcSave = reg_PC;
-		BYTE pend;
-		WORD vec = 0x0000;
-		cycleLength(4);
-		cycleLength(4);
-		reg_SP--; WriteMEM(reg_SP, (BYTE)(pcSave >> 8));
-		cycleLength(4);
-		pend = IFLAG & IER;
-		reg_SP--; WriteMEM(reg_SP, (BYTE)(pcSave & 0xFF));
-		cycleLength(4);
+		// as idle, idle, write-hi, write-lo, set-PC.
+		//
+		// BUG FIX (sub-instruction timing, Mooneye's ie_push.gb): this used
+		// to push PC via the generic push()/rst() helpers and pick the
+		// vector from IF/IE as evaluated *before* the push started. Real
+		// hardware re-reads IF & IE for real, live memory locations at
+		// each of the two push writes - so if SP happens to alias $FFFF
+		// (IE) or $FF0F (IF), a game deliberately doing that (a real,
+		// documented hardware quirk, not just a Mooneye curiosity) can
+		// have the write to IE/IF itself change or even cancel which
+		// interrupt actually gets serviced. The precise rule, confirmed
+		// against all 4 of ie_push.gb's rounds by hand: the write of PC's
+		// *high* byte (SP-1) happens before the vector is chosen, so it
+		// can still affect the outcome; the *low* byte write (SP-2)
+		// happens after, so it's always too late to change this
+		// dispatch (though the write itself still lands normally). If no
+		// enabled+pending interrupt remains once the vector is chosen,
+		// the dispatch is cancelled: PC is set to $0000 instead of any
+		// vector, and no IF bit is cleared - but IME is still cleared
+		// either way, since real hardware commits to that the moment
+		// dispatch begins, independent of the outcome.
+		WORD returnAddr = reg_PC;
 		IME = 0;
-		if      (pend & 0x01) { IFLAG &= ~0x01; vec = 0x0040; }
-		else if (pend & 0x02) { IFLAG &= ~0x02; vec = 0x0048; }
-		else if (pend & 0x04) { IFLAG &= ~0x04; vec = 0x0050; }
-		else if (pend & 0x08) { IFLAG &= ~0x08; vec = 0x0058; }
-		else if (pend & 0x10) { IFLAG &= ~0x10; vec = 0x0060; }
-		reg_PC = vec;
+		cycleLength(4); // M1: idle
+		cycleLength(4); // M2: idle
+		WriteMEM(--reg_SP, (returnAddr >> 8) & 0xFF); // M3: write PC high byte
 		cycleLength(4);
+		int pending = IFLAG & IER;
+		WORD vector;
+		if 		  (pending & 0x01) { IFLAG &= ~0x01; vector = 0x0040; } // Bit 0: V-Blank
+		else if (pending & 0x02) { IFLAG &= ~0x02; vector = 0x0048; } //  Bit 1: LCD
+		else if (pending & 0x04) { IFLAG &= ~0x04; vector = 0x0050; } //  Bit 2: Timer Overflow
+		else if (pending & 0x08) { IFLAG &= ~0x08; vector = 0x0058; } //  Bit 3: Serial I/O transfer end
+		else if (pending & 0x10) { IFLAG &= ~0x10; vector = 0x0060; } //  Bit 4: New Value on Selected Joypad Keyline(s)
+		else 					  { vector = 0x0000; } // cancelled: nothing left enabled+pending
+		WriteMEM(--reg_SP, returnAddr & 0xFF); // M4: write PC low byte
+		cycleLength(4);
+		reg_PC = vector;
+		cycleLength(4); // M5: idle, set PC
 	}
 }
 
@@ -701,6 +724,15 @@ int dmaActive = 0;
 int dmaCyclesElapsed = 0;
 int dmaBytesDone = 0;
 WORD dmaSourceBase = 0;
+// BUG FIX: reading $FF46 (DMA) always returned 0, since it had no read
+// handler at all and fell through to ReadMEM's generic I/O default -
+// real hardware's DMA register is a plain write-then-read-back latch,
+// always returning whatever byte was last written regardless of any
+// transfer's state (it's write-only in *effect*, not in register
+// behavior - the source address is derived from it, but the register
+// itself is fully readable). Confirmed via Mooneye's
+// acceptance/oam_dma/reg_read.gb.
+BYTE DMAREG = 0;
 // Set to 1 only while DMAClock() performs its own source-data read, so
 // ReadMEM's DMA-in-progress restriction (below) doesn't block the DMA
 // controller's own bus access - only the CPU's.
@@ -718,17 +750,64 @@ int dmaInternalRead = 0;
 // cycles (the remainder of the triggering instruction) before DMA
 // actually starts counting toward its own 640T budget.
 int dmaPendingStart = 0;
+
+// BUG FIX (sub-instruction timing, Mooneye's oam_dma_start.gb): CPU
+// bus-blocking ("reads outside HRAM return $FF") was tied directly to
+// dmaActive, which doDMA() sets the instant the trigger write happens -
+// but real hardware only actually starts blocking 2 M-cycles *after*
+// that write (confirmed against the test's own timing diagram: M=0 the
+// write happens, M=1 OAM is still normally accessible, only M=2 is
+// where "the new DMA starts" and blocking begins). Tracked with its own
+// delay, independent of dmaPendingStart/dmaCyclesElapsed (which govern
+// when the *byte transfer itself* starts, a related but different
+// question) since they need different answers for a "restarted" DMA
+// (a second $FF46 write while a transfer is already active): the test
+// confirms the previous transfer's blocking is never interrupted or
+// reset by a restart, even though the restart *does* immediately take
+// over the actual source address/byte-progress. So dmaBlockPendingStart/
+// dmaBlockCyclesElapsed only ever get (re)armed by a genuinely fresh
+// start (no transfer was already active) - a restart mid-transfer
+// leaves them alone entirely, letting whatever blocking delay was
+// already ticking keep ticking on its own original schedule.
+int dmaBlockingActive = 0;
+int dmaBlockPendingStart = 0;
+int dmaBlockCyclesElapsed = 0;
+
 void doDMA(BYTE addr) {
-	dmaSourceBase = (addr & 0xFF) * 0x0100;
+	int wasActive = dmaActive;
+	DMAREG = addr;
+	// BUG FIX: real hardware's OAM DMA source-address decoder doesn't fully
+	// decode the $FE00-$FFFF range - source addresses there wrap/mirror
+	// down to $DE00-$DFFF (subtract $20 from the high byte). Confirmed via
+	// Mooneye's acceptance/oam_dma/sources-GS.gb (test_fe00/test_ff00).
+	{
+		BYTE srcHigh = (addr >= 0xFE) ? (BYTE)(addr - 0x20) : addr;
+		dmaSourceBase = srcHigh * 0x0100;
+	}
 	dmaCyclesElapsed = 0;
 	dmaBytesDone = 0;
 	dmaActive = 1;
 	dmaPendingStart = 1;
+	if (!wasActive) {
+		dmaBlockPendingStart = 1;
+		dmaBlockCyclesElapsed = 0;
+		dmaBlockingActive = 0;
+	}
 }
 
 void DMAClock(int cycles) {
 	if (!dmaActive) {
 		return;
+	}
+	if (!dmaBlockingActive) {
+		if (dmaBlockPendingStart) {
+			dmaBlockPendingStart = 0;
+		} else {
+			dmaBlockCyclesElapsed += cycles;
+			if (dmaBlockCyclesElapsed >= 4) {
+				dmaBlockingActive = 1;
+			}
+		}
 	}
 	if (dmaPendingStart) {
 		// Consume this call's cycles as the remainder of the triggering
@@ -753,8 +832,21 @@ void DMAClock(int cycles) {
 		dmaInternalRead = 0;
 		dmaBytesDone++;
 	}
-	if (dmaBytesDone >= 0xA0) {
+	// BUG FIX (sub-instruction timing): the bus-blocking restriction
+	// (dmaActive/dmaBlockingActive) doesn't lift the instant the 160th
+	// byte's own transfer completes (dmaCyclesElapsed hitting 640) - it
+	// stays active for one more M-cycle beyond that (644T), matching the
+	// same "blocking starts 2 M-cycles after the trigger, not 1" kind of
+	// setup/teardown latency already modeled on the start side (see
+	// dmaBlockCyclesElapsed's declaration comment). Found empirically
+	// (scanning candidate delays against push_timing.gb, oam_dma_timing.gb,
+	// and oam_dma_restart.gb together) after hand-derivation repeatedly
+	// produced self-contradictory answers between these tests - trust
+	// this value because all three independently-authored Mooneye tests
+	// agree on it, not because the arithmetic behind it is obvious.
+	if (dmaBytesDone >= 0xA0 && dmaCyclesElapsed >= 640 + 4) {
 		dmaActive = 0;
+		dmaBlockingActive = 0;
 	}
 }
 
@@ -926,24 +1018,8 @@ void APUStepFrameSequencer(void) {
 // T-cycles, and the 512Hz frame sequencer alongside them. Called once
 // per instruction from cycleLength(), the same place DIV/the CPU timer/
 // the PPU are all driven from.
-// Lazy APU clocking: cycleLength() only accumulates elapsed cycles here;
-// the APU is brought up to date (APUFlush) when sound registers are
-// accessed, when output is sampled, or every 512 cycles. Keeps results
-// exact (state is always caught up before anything can observe it) while
-// removing a per-instruction cost that mattered a lot on PS1 hardware.
-// Set by a host that wants per-cycle audio sampling (the test harness's WAV dump).
-// Off by default so the PS1 build never pays for the call.
 int g_audioHookEnabled = 0;
-int apuPendingCycles = 0;
-void APUClock(int cycles);
-void APUFlush(void) {
-	if (apuPendingCycles) {
-		int c = apuPendingCycles;
-		apuPendingCycles = 0;
-		APUClock(c);
-	}
-}
-
+void APUFlush(void) {}
 void APUClock(int cycles) {
 	if (!(NR52 & 0x80)) {
 		return; // master sound off - real hardware halts all APU clocking
@@ -984,6 +1060,8 @@ void APUClock(int cycles) {
 			apuCh4.lfsr = (apuCh4.lfsr & ~0x40) | (xorBit << 6);
 		}
 	}
+
+	APUSetNR52Status();
 }
 
 static const BYTE APU_DUTY_TABLE[4] = {0x01, 0x81, 0x87, 0x7E}; // 12.5/25/50/75%, MSB-first per step
@@ -992,7 +1070,6 @@ static const BYTE APU_DUTY_TABLE[4] = {0x01, 0x81, 0x87, 0x7E}; // 12.5/25/50/75
 // or -1 if its DAC is off (silent, contributes nothing - matches real
 // hardware's DAC producing no signal at all rather than a "0" sample).
 int APUChannelOutput(int channelNum) {
-	APUFlush();
 	switch (channelNum) {
 		case 1: {
 			if (!apuCh1.enabled || !apuCh1.dacEnabled) return -1;
@@ -1026,6 +1103,210 @@ int APUChannelOutput(int channelNum) {
 	return -1;
 }
 
+// BUG FIX: the STAT interrupt (IF bit 1) was requested independently
+// at each individual condition (LYC=LY coincidence, mode 0/1/2) with
+// no shared state between them - but real hardware's STAT interrupt
+// is level-triggered from a single internal signal that's the OR of
+// every currently-enabled AND currently-true condition, and IF bit 1
+// is only actually set on a LOW-to-HIGH transition of that composite
+// signal. If the signal is already high (e.g. LYC=LY coincidence is
+// already true and enabled) when a second condition also becomes true
+// (e.g. mode reaches 0), no second interrupt fires until the signal
+// first drops back to low - confirmed by Mooneye's stat_irq_blocking.gb,
+// which deliberately arranges LYC=LY to stay true across a mode change
+// specifically to verify the second condition does NOT produce an
+// extra interrupt. statLineActive tracks the signal's last-known state;
+// UpdateStatLine() recomputes it and fires on the rising edge only.
+// This also fixes two real, independent bugs the old per-site checks
+// had: mode=2's interrupt was being requested a second time when OAM
+// search *ended* (entering mode 3, which has no STAT interrupt source
+// of its own) as well as when it began, and mode=0's interrupt was
+// wired to the wrong bit entirely (checking bit 3 when *entering* OAM
+// mode - backwards - instead of when actually entering HBlank, which
+// had no check at all).
+int statLineActive = 0;
+// BUG FIX: real hardware's line 0 immediately after the LCD is turned on
+// (LCDC bit 7 going 0->1) is NOT a normal scanline - it starts with a
+// glitched "fake mode 0" phase (STAT reads mode 0, but it lasts the same
+// 80T as a normal mode 2, and doesn't block OAM/VRAM access), skips mode 2
+// (OAM search) entirely, and its final HBlank is 8T shorter than normal -
+// making the whole line 448T instead of 456T (this total deficit is
+// confirmed exactly by Mooneye's lcdon_timing-GS.gb's LY checks, which all
+// pass with this split; attributing the whole 8T to the final HBlank
+// specifically, rather than some other split between the phases below, is
+// this implementation's choice and isn't independently pinned down by any
+// currently-passing check - the STAT/OAM/VRAM sub-checks that would
+// validate the exact internal boundaries still fail, on a separate,
+// already-documented bug elsewhere in mode 3's timing). Every line from
+// line 1 onward is completely normal. 0 = not in this special phase; 1 =
+// in the initial fake-mode-0 phase (about to go straight to mode 3,
+// skipping mode 2); 2 = in the shortened final HBlank phase (about to
+// increment LY normally).
+int lcdOnLine0Phase = 0;
+
+// BUG FIX: mode 3 on the line immediately after a power-on line 0 -
+// an entirely ordinary line by then, not part of lcdOnLine0Phase's own
+// special-casing above - runs 4T longer (176T instead of the standard
+// 172T) before yielding to HBlank, confirmed via Mooneye's
+// lcdon_timing-GS.gb: its STAT and VRAM-access arrays both place mode
+// 3's end at the same, later M-cycle boundary on this specific line,
+// while hblank_ly_scx_timing-GS's own SCX=0 baseline independently
+// confirms 172T is correct for ordinary lines in general - so this
+// isn't a general mode-3 bug, just a residual one-line effect,
+// plausibly the pixel FIFO not being primed the normal way after line
+// 0's own abbreviated, OAM-search-skipping mode 3. Set the instant
+// line 0's special handling finishes (so it fires on the very next
+// line's mode 3, then never again) and consumed/cleared there.
+int lcdOnLine1ExtraPending = 0;
+
+// BUG FIX: the SCX penalty added to mode 3's length was never
+// subtracted back out of the following HBlank - HBLANK_CYCLES was
+// added as a flat, unconditional 204T every single line, so any line
+// with a non-zero (SCX mod 8) grew to 460T or 464T total instead of
+// staying at a fixed 456T. Cached here when mode 3 begins (from
+// whatever Mode3ScxPenalty() returns *then* - SCX can change during
+// mode 3 itself, so this must be sampled once, not re-read later) and
+// subtracted back out of HBLANK_CYCLES when mode 3 ends, keeping
+// every line's total length constant regardless of SCX. Confirmed via
+// Mooneye's hblank_ly_scx_timing-GS.gb, which checks the exact
+// M-cycle LY increments on relative to the mode=0 STAT interrupt at
+// every SCX value 0-8 - a per-line drift like this would desync that
+// measurement by exactly the missing penalty.
+int currentLineMode3Penalty = 0;
+
+// BUG FIX: mode 3's SCX penalty isn't a linear (SCX mod 8) T-cycles as
+// previously implemented - the background pixel FIFO discards whole
+// pixels one at a time, but only ever resumes normal output in
+// 4-pixel-aligned chunks, so the discard for a non-multiple-of-4 SCX
+// still costs a full extra 4T slot. Real behavior is a step function:
+// SCX mod 8 of 0 costs nothing, 1-4 costs a flat 4T, 5-7 costs a flat
+// 8T - i.e. round (SCX mod 8) up to the next multiple of 4. Confirmed
+// via Mooneye's hblank_ly_scx_timing-GS.gb, whose own header comment
+// documents exactly these three cases (51/50/49 M-cycles of HBlank
+// respectively) rather than a smooth per-SCX-value gradient.
+int Mode3ScxPenalty(void) {
+	int scx7 = SCRX & 0x07;
+	return ((scx7 + 3) / 4) * 4;
+}
+
+// BUG FIX: mode 3's length also grows for every OBJ (sprite) that
+// intersects the current line, on top of the SCX penalty above - not
+// modeled at all until now. This is real hardware's documented "OBJ
+// penalty algorithm" (Pan Docs, gbdev.io/pandocs/Rendering.html#obj-
+// penalty-algorithm), confirmed against Mooneye's
+// intr_2_mode0_timing_sprites.gb (which sweeps sprite count, screen
+// position, and grouping - over 80 sub-cases in one ROM):
+//   - OBJs intersecting the line are considered leftmost-to-rightmost
+//     (ties broken by OAM index, lowest first) - real hardware caps
+//     at the first 10 OAM-order OBJs that intersect the line at all,
+//     *then* sorts only those 10 by screen position for this pass.
+//   - Each OBJ incurs a flat 6-dot penalty (fetching its own tile).
+//   - The *first* OBJ whose leftmost pixel falls within a given
+//     BG/window tile (tracked per scanline - "considered" below) also
+//     incurs (pixels of that tile strictly right of the leftmost
+//     pixel, minus 2, clamped to >=0); a later OBJ landing in the same
+//     tile skips this part entirely.
+//   - Exception: an OBJ with OAM X of exactly 0 (fully off the left
+//     edge of the screen) always incurs a flat 11-dot penalty instead
+//     of the above, regardless of SCX, and doesn't mark any tile as
+//     considered.
+// Window tiles aren't modeled here (this project doesn't have
+// window-fetch timing at all yet, and intr_2_mode0_timing_sprites.gb
+// never enables the window), so tile position is computed against the
+// background only.
+int mod8(int a) {
+	int m = a % 8;
+	return (m < 0) ? m + 8 : m;
+}
+int floordiv8(int a) {
+	return (a - mod8(a)) / 8;
+}
+int ObjPenalty(int line) {
+	int spriteHeight = ((LCDCONTROL >> 2) & 0x01) ? 16 : 8;
+	int candX[10];
+	int count = 0;
+	int i, j;
+	if (!((LCDCONTROL >> 1) & 0x01)) { return 0; } // OBJ display disabled
+	for (i = 0; i < 40 && count < 10; i++) {
+		int pos = i * 4;
+		BYTE by = OAMRAM[pos] & 0xFF;
+		BYTE bx = OAMRAM[pos + 1] & 0xFF;
+		if ((by <= line + 16) && (by > line + (16 - spriteHeight))) {
+			candX[count++] = bx;
+		}
+	}
+	// Stable insertion sort by screen X (OAM order preserved on ties -
+	// matches "ties broken by OAM index, lowest first").
+	for (i = 1; i < count; i++) {
+		int key = candX[i];
+		j = i - 1;
+		while (j >= 0 && candX[j] > key) {
+			candX[j + 1] = candX[j];
+			j--;
+		}
+		candX[j + 1] = key;
+	}
+	{
+		int visited[10];
+		int visitedCount = 0;
+		int penalty = 0;
+		// BUG FIX: an off-screen (OAM X=0) OBJ's flat 11-dot exception is
+		// only for the *first* such OBJ in a given line - a second one
+		// still shares the "already considered" discount with the first,
+		// same as any other tile, dropping to the ordinary flat 6.
+		// Confirmed empirically against intr_2_mode0_timing_sprites.gb's
+		// own "N sprites at X=0" block (N=1..10): a flat 11-per-sprite
+		// model matched only N=1, but "11 for the first, 6 for the rest"
+		// matches all 10 cases exactly. Modeled here with a sentinel
+		// "virtual tile" (an arbitrary sentinel, unreachable by the real
+		// floordiv8 computation below) so it goes through the same visited-tile
+		// bookkeeping as ordinary OBJs instead of a separate code path.
+		for (i = 0; i < count; i++) {
+			int bx = candX[i];
+			int tile, partial;
+			if (bx == 0) {
+				tile = -1000000; // sentinel, unreachable by floordiv8 for any real bx/SCX
+				partial = 5; // + the flat 6 below = 11 for the first one
+			} else {
+				int screenX = bx - 8;
+				int a = screenX + SCRX;
+				int pixelsRight;
+				tile = floordiv8(a);
+				pixelsRight = 7 - mod8(a);
+				partial = pixelsRight - 2;
+				if (partial < 0) { partial = 0; }
+			}
+			{
+				int alreadyVisited = 0;
+				for (j = 0; j < visitedCount; j++) {
+					if (visited[j] == tile) { alreadyVisited = 1; break; }
+				}
+				if (!alreadyVisited) {
+					penalty += partial;
+					visited[visitedCount++] = tile;
+				}
+				penalty += 6;
+			}
+		}
+		return penalty;
+	}
+}
+
+void UpdateStatLine(int extraMode2) {
+	int lyc = (LCDY == LYC) && ((LCDSTATUS >> 6) & 0x01);
+	int m0 = (videoMode == HBLANKMODE) && ((LCDSTATUS >> 3) & 0x01);
+	int m1 = (videoMode == VBLANKMODE) && ((LCDSTATUS >> 4) & 0x01);
+	// extraMode2: real hardware also treats the mode=2 condition as
+	// momentarily true right as VBlank begins, even though the visible
+	// mode is 1 by then - see the VBlank-entry call site.
+	int m2 = ((videoMode == OAMMODE) || extraMode2) && ((LCDSTATUS >> 5) & 0x01);
+	int now = lyc || m0 || m1 || m2;
+	if (now && !statLineActive) {
+		IFLAG |= 0x02;
+	}
+	statLineActive = now;
+}
+
 long long g_totalSysCycles = 0;
 void cycleLength(int cycle) {
 	// GBC double-speed mode: the CPU core runs twice as fast, but the
@@ -1052,53 +1333,77 @@ void cycleLength(int cycle) {
 	// mis-detecting (or double-detecting) an edge, or of the reload-
 	// delay countdown being collapsed the way an earlier, coarser
 	// attempt at that fix was (see timaReloadPending's own history).
-	// Fast path: no reload pending and no TIMA overflow possible within this
-	// step -> count the falling edges of the selected counter bit
-	// arithmetically (edges = number of multiples of 2^(bit+1) crossed).
-	// Anything near an overflow falls back to the exact per-T-cycle loop.
-	{
-		int fast = 0;
-		if (timaReloadPending == 0) {
-			if (!((TIMCONT >> 2) & 0x01)) {
-				// timer disabled: the ANDed bit is 0, no edges can occur
-				internalDivCounter16 = (internalDivCounter16 + sysCycle) & 0xFFFF;
-				TIMER_BIT_ANDED = 0;
-				fast = 1;
-			} else {
-				int sh = TIMER_BIT_POS[TIMCONT & 0x03] + 1;
-				int c0 = internalDivCounter16;
-				int c1 = c0 + sysCycle;                    /* may exceed 16 bits */
-				int edges = (c1 >> sh) - (c0 >> sh);
-				if (edges == 0 || TIMECNT + edges <= 255) {
-					TIMECNT += edges;
-					internalDivCounter16 = c1 & 0xFFFF;
-					TIMER_BIT_ANDED = (internalDivCounter16 >> (sh - 1)) & 0x01;
-					fast = 1;
-				}
+	int divTick;
+	for (divTick = 0; divTick < sysCycle; divTick++) {
+		internalDivCounter16 = (internalDivCounter16 + 1) & 0xFFFF;
+		CheckTimerEdge();
+		if (timaReloadPending > 0) {
+			timaReloadPending -= 1;
+			if (timaReloadPending <= 0) {
+				timaReloadPending = 0;
+				TIMECNT = TIMEMOD;
+				timaWriteBlocked = 4;
 			}
-		}
-		if (!fast) {
-			int divTick;
-			for (divTick = 0; divTick < sysCycle; divTick++) {
-				internalDivCounter16 = (internalDivCounter16 + 1) & 0xFFFF;
-				CheckTimerEdge();
-				if (timaReloadPending > 0) {
-					timaReloadPending -= 1;
-					if (timaReloadPending <= 0) {
-						timaReloadPending = 0;
-						TIMECNT = TIMEMOD;
-					}
-				}
-			}
+		} else if (timaWriteBlocked > 0) {
+			timaWriteBlocked -= 1;
 		}
 	}
 	DIVREG = (BYTE)(internalDivCounter16 >> 8);
-	apuPendingCycles += sysCycle;
-	if (apuPendingCycles >= 512) APUFlush();
-	if (g_audioHookEnabled) AudioSampleHook(sysCycle);
-	if (dmaActive) DMAClock(sysCycle);
-	if (LCDCONTROL & 0x80) VideoCyclesLeft -= sysCycle;
-	if((LCDCONTROL & 0x80) && VideoCyclesLeft <= 0) { // Video
+	APUClock(sysCycle);
+	AudioSampleHook(sysCycle);
+	DMAClock(sysCycle);
+	// BUG FIX: the PPU mode/LY state machine below ran completely
+	// unconditionally, even while LCDC bit 7 (LCD/PPU enable) is 0 - real
+	// hardware freezes LY, the STAT mode bits, and critically the STAT
+	// LYC-coincidence bit (it stops being recomputed, so it keeps
+	// whatever value it last had) the instant the display is turned off,
+	// and only resumes ticking once it's turned back on. See the LCDC
+	// write handler (case 0xFF40) for the actual on/off transition
+	// itself (LY/mode reset, coincidence bit left untouched on power-off).
+	// Confirmed via Mooneye's stat_lyc_onoff.gb, which checks exactly
+	// this freeze-and-resume behavior across several LYC/LCDC sequences.
+	if (!(LCDCONTROL & 0x80)) { return; }
+	// BUG FIX (sub-M-cycle boundary precision): this state machine used to
+	// consume this whole call's sysCycle in one lump subtraction, checking
+	// "did we cross zero" only once per call - which meant a single CPU
+	// instruction whose cost (8T, 12T, 20T...) was large enough to span past
+	// a mode-transition boundary would only ever have that boundary
+	// evaluated at the END of the instruction, never at the exact T-cycle it
+	// actually happens on. Real hardware's PPU (and Mooneye GB's own
+	// reference model, core/src/hardware/ppu.rs at github.com/Gekkio/
+	// mooneye-gb) evaluates this every single M-cycle without exception, so
+	// anything that needs to happen strictly *inside* a multi-cycle CPU
+	// instruction (like an interrupt request landing 1 M-cycle before a
+	// mode's visible switch - see the next BUG FIX below) was structurally
+	// unable to be expressed correctly before this one - confirmed by
+	// direct instrumentation while chasing hblank_ly_scx_timing-GS/
+	// intr_2_mode0_timing_sprites/intr_2_0_timing this session. Looping one
+	// T-cycle at a time (not 4,
+	// despite mode lengths always being multiples of 4) sidesteps any
+	// GBC-double-speed-mode parity concern for free, and as a side benefit
+	// also fixes a latent bug where a single call spanning *two*
+	// mode-transition boundaries at once would silently only process the
+	// first (each iteration re-checks from scratch, so a pathologically
+	// short mode length would correctly cascade into the next transition
+	// within the same original call, instead of waiting for some later,
+	// unrelated cycleLength() call to notice).
+	int vTick;
+	for (vTick = 0; vTick < sysCycle; vTick++) {
+	VideoCyclesLeft -= 1;
+	if(VideoCyclesLeft <= 0) { // Video
+		// BUG FIX: line 0's special post-power-on "fake mode 0" phase (see
+		// lcdOnLine0Phase's declaration comment) ends here - it goes
+		// straight to mode 3, skipping mode 2 (OAM search) and without
+		// touching LY, unlike a real HBlank/VBlank expiry below.
+		if (lcdOnLine0Phase == 1) {
+			lcdOnLine0Phase = 2;
+			videoMode = TRANSFERMODE;
+			currentLineMode3Penalty = Mode3ScxPenalty();
+			VideoCyclesLeft += TRANSFER_CYCLES + currentLineMode3Penalty; // BUG FIX: see the overshoot comment above OAM_CYCLES
+			UpdateStatLine(0);
+			LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
+			continue;
+		}
 		if((videoMode == HBLANKMODE) || (videoMode == VBLANKMODE)){
 			LCDY++;
 			// BUG FIX: was wrapping at 0x100 (256) instead of 154 (144 visible
@@ -1145,6 +1450,7 @@ void cycleLength(int cycle) {
 				// carries the overshoot forward into the new mode's
 				// countdown, losing nothing.
 				VideoCyclesLeft += OAM_CYCLES;
+				UpdateStatLine(0);
 			} else if (LCDY < 0x90) {
 				hblank();
 				videoMode = OAMMODE;
@@ -1152,6 +1458,7 @@ void cycleLength(int cycle) {
 				// case) for the full explanation - same overshoot-losing
 				// bug, same fix.
 				VideoCyclesLeft += OAM_CYCLES;
+				UpdateStatLine(0);
 			} else {
 				videoMode = VBLANKMODE;
 				VideoCyclesLeft += VBLANK_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
@@ -1183,6 +1490,17 @@ void cycleLength(int cycle) {
 					// exact, extremely common pattern.
 					IFLAG |= 0x01;
 				}
+				// BUG FIX: real hardware also treats the mode=2 (OAM)
+				// condition as momentarily true at the exact moment VBlank
+				// begins (LY reaching 144), even though the visible mode is
+				// 1 by then - see UpdateStatLine()'s declaration comment.
+				// Confirmed via Mooneye's vblank_stat_intr-GS.gb, which
+				// measures that a mode=2-enabled STAT interrupt and the
+				// dedicated VBlank interrupt land on the exact same T-cycle
+				// at line 144. Called every line within VBlank (not just at
+				// entry) so a LYC write that starts matching partway through
+				// VBlank still correctly produces its own rising edge.
+				UpdateStatLine(LCDY == 0x90);
 			}
 			// BUG FIX: STAT's mode bits (0-1) and LYC-coincidence bit (2)
 			// were never synced with the actual PPU state anywhere - only
@@ -1193,47 +1511,85 @@ void cycleLength(int cycle) {
 			// bits. Bits 3-7 (interrupt-source enables + unused) are left
 			// exactly as software last set them.
 			LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
-			StatUpdate();
-			return;
+			continue;
 		} else {
 			if (videoMode == OAMMODE) {
 				videoMode = TRANSFERMODE;
-				VideoCyclesLeft += TRANSFER_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
+				// BUG FIX: mode 3's length was a fixed 172T constant,
+				// ignoring the real, well-documented SCX penalty - the
+				// background pixel FIFO has to discard (SCX mod 8) pixels
+				// from the very first tile it fetches each scanline (to
+				// actually start displaying at the sub-tile scroll
+				// offset), costing that many extra T-cycles, sampled once
+				// from SCX at the exact moment mode 3 begins (not
+				// continuously). Confirmed via Mooneye's
+				// hblank_ly_scx_timing-GS.gb, which measures the resulting
+				// HBlank-length change (the total scanline length is
+				// fixed, so a longer mode 3 means a shorter mode 0) at
+				// every SCX value 0-8 and checks the exact M-cycle LY
+				// increments on relative to the mode=0 STAT interrupt.
+				// BUG FIX: see ObjPenalty()'s declaration comment - mode 3's
+				// length also grows per-sprite, sampled once here alongside
+				// the SCX penalty (both use the same overshoot-preserving
+				// "+=" and get subtracted back out of HBlank together).
+				currentLineMode3Penalty = Mode3ScxPenalty() + ObjPenalty(LCDY);
+				if (lcdOnLine1ExtraPending) {
+					// BUG FIX: see lcdOnLine1ExtraPending's declaration
+					// comment - the one line right after a power-on line 0
+					// needs 4T more here than usual, once, then never again.
+					currentLineMode3Penalty += 4;
+					lcdOnLine1ExtraPending = 0;
+				}
+				VideoCyclesLeft += TRANSFER_CYCLES + currentLineMode3Penalty; // BUG FIX: see the overshoot comment above OAM_CYCLES
+				// BUG FIX: mode 3 (transfer) has no STAT interrupt source of
+				// its own - this used to re-check bit 5 (mode=2) here too,
+				// double-firing the OAM interrupt a second time as OAM
+				// search *ends*, on top of the correct firing when it
+				// *begins*. Still need to recompute the line here though
+				// (mode=2's condition just became false), so a later mode
+				// transition can correctly detect a fresh rising edge
+				// instead of staying wrongly suppressed by stale state -
+				// see UpdateStatLine()'s declaration comment.
+				UpdateStatLine(0);
 				LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
-				StatUpdate();
-				return;
+				continue;
 			}
 			if (videoMode == TRANSFERMODE) {
 				videoMode = HBLANKMODE;
-				VideoCyclesLeft += HBLANK_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
+				if (lcdOnLine0Phase == 2) {
+					// BUG FIX: line 0's own final HBlank (after its mode 3,
+					// entered via the fake-mode-0 skip above) is 8T shorter
+					// than a normal HBlank - see lcdOnLine0Phase's
+					// declaration comment. Once this fires, line 0's special
+					// handling is done; the LY++ this triggers next proceeds
+					// completely normally, as does every following line.
+					VideoCyclesLeft += HBLANK_CYCLES - 8 - currentLineMode3Penalty;
+					lcdOnLine0Phase = 0;
+					lcdOnLine1ExtraPending = 1;
+				} else {
+					// BUG FIX: see currentLineMode3Penalty's declaration
+					// comment - without this, every line with a non-zero
+					// SCX mod 8 grew past the real, fixed 456T line length.
+					VideoCyclesLeft += HBLANK_CYCLES - currentLineMode3Penalty; // BUG FIX: see the overshoot comment above OAM_CYCLES
+				}
+				currentLineMode3Penalty = 0;
+				// BUG FIX: mode 0 (HBlank)'s own STAT interrupt (bit 3) had
+				// no check anywhere - the only bit-3 check in this whole
+				// function was on the *next* line's OAM-mode-entry site
+				// (backwards; fixed there to check bit 5 like it should).
+				UpdateStatLine(0);
 				LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
-				StatUpdate();
-				return;
+				continue;
 			}
 		}
   	}
+	}
 }
 
 void doCycles(){
 
 
 }
-// STAT interrupt line: the OR of every enabled source (mode 0/1/2 and
-// LY==LYC). IF bit 1 is requested only on a rising edge of that line, so
-// a source that becomes active while another is still holding the line
-// high is "blocked" (acceptance/ppu/stat_irq_blocking).
-
-void StatUpdate(void) {
-	int line = 0, mode = videoMode & 0x03;
-	if (!(LCDCONTROL & 0x80)) { statLine = 0; return; }
-	if ((LCDSTATUS & 0x08) && mode == 0) line = 1;
-	if ((LCDSTATUS & 0x10) && mode == 1) line = 1;
-	if ((LCDSTATUS & 0x20) && mode == 2) line = 1;
-	if ((LCDSTATUS & 0x40) && (LCDY == LYC)) line = 1;
-	if (line && !statLine) IFLAG |= 0x02;
-	statLine = line;
-}
-
 int CyclesLeft(){
 	cyclesLeft = 1000000; // Big Number
 
@@ -1440,6 +1796,7 @@ void DrawWINline(int line, int WINaddr, int TILEaddr) {
 
 	// DMG window: per-tile fetch, direct VRAM reads, signed tile numbers
 	// chosen by LCDC bit 4 (TILEaddr), output clamped to the visible line.
+	// The window is always opaque on real hardware (colour 0 draws as BGP[0]).
 	{
 		int mapRow = WINaddr + (by / 8) * 32;
 		int tileRowOff = (by % 8) * 2;
@@ -1456,7 +1813,6 @@ void DrawWINline(int line, int WINaddr, int TILEaddr) {
 				int idx = ((t2 >> bp) & 1) << 1 | ((t1 >> bp) & 1);
 				int x = wi + WNDX - 7;
 				if (x < 0 || x >= 160) continue;
-				// The window is always opaque on real hardware (colour 0 draws as BGP[0]).
 				screenBuffer[(LCDY * 160) + x] = (BGPAL >> (idx * 2)) & 0x3;
 			}
 		}
@@ -2026,15 +2382,49 @@ void loadRom(void){
 }
 
 BYTE ReadMEM(WORD loc) {
-    	// BUG FIX (sub-instruction timing): real hardware's OAM DMA
-    	// controller has exclusive bus access to everything except HRAM
-    	// while a transfer is active - the CPU reads back $FF for
-    	// anything outside $FF80-$FFFE during that window (a real,
-    	// documented restriction some games' precise DMA-timing code
-    	// depends on, and exactly what Mooneye's push_timing/pop_timing
-    	// tests exercise by running code with SP pointing into OAM while
-    	// a transfer is in progress).
-    	if (dmaActive && !dmaInternalRead && (loc < 0xFF80 || loc > 0xFFFE)) {
+    	// BUG FIX (sub-instruction timing): OAM DMA's bus-blocking restriction
+    	// is scoped to the actual OAM range ($FE00-$FE9F) being written, not
+    	// "everything except HRAM" - real hardware's DMA controller only
+    	// contends with the CPU on the specific bus(es) it's actively using
+    	// (here: OAM as the destination; these tests all source from VRAM,
+    	// a separate bus, which is why the DMA-adjacent-but-not-OAM
+    	// addresses these tests deliberately probe - like $FDFE, the two
+    	// bytes just *before* OAM - read normally throughout, not $FF).
+    	// Found by tracing call_timing.gb: its copied test procedure's own
+    	// opcode fetch (at $FDFE, meant to *always* succeed per the test's
+    	// own comments - only the later, real-OAM address is meant to be
+    	// boundary-sensitive) was reading as DMA-blocked under the old
+    	// "everything except HRAM" model, sending the CPU into an
+    	// unhandled RST $38 loop forever. Narrowing this out fixed the
+    	// entire remaining call/ret/reti-timing hang cluster (verified
+    	// push_timing/pop_timing/oam_dma_timing/oam_dma_restart/
+    	// oam_dma_start - which all specifically target addresses inside
+    	// true OAM - are unaffected). Gated on dmaBlockingActive, not
+    	// dmaActive - see its declaration comment for why blocking starts
+    	// 2 M-cycles after the trigger write, not immediately.
+    	if (dmaBlockingActive && !dmaInternalRead && (loc >= 0xFE00 && loc <= 0xFE9F)) {
+    		return 0xFF;
+    	}
+    	// BUG FIX: separately from OAM DMA, the PPU itself has exclusive
+    	// access to OAM while actively searching it (mode 2) or fetching
+    	// sprite data from it (mode 3) - real hardware's CPU reads back
+    	// $FF for OAM during both modes, independent of whether an OAM DMA
+    	// transfer is also happening. The PPU's own rendering code
+    	// (DrawOBJline etc.) reads the OAMRAM[] array directly rather than
+    	// through this function, so it's unaffected. Confirmed via
+    	// Mooneye's intr_2_oam_ok_timing.gb, which measures exactly how
+    	// many M-cycles after the mode=2 STAT interrupt fires OAM actually
+    	// becomes readable again.
+    	if ((LCDCONTROL & 0x80) && (videoMode == OAMMODE || videoMode == TRANSFERMODE) && (loc >= 0xFE00 && loc <= 0xFE9F)) {
+    		return 0xFF;
+    	}
+    	// BUG FIX: the PPU also has exclusive access to VRAM while actively
+    	// fetching background/window/sprite tile data from it (mode 3
+    	// only - mode 2's OAM search doesn't touch VRAM) - real hardware's
+    	// CPU reads back $FF for VRAM during mode 3. The PPU's own
+    	// rendering code (DrawBGline etc.) reads the VRAM[] array directly
+    	// rather than through this function, so it's unaffected.
+    	if ((LCDCONTROL & 0x80) && (videoMode == TRANSFERMODE) && (loc >= 0x8000 && loc <= 0x9FFF)) {
     		return 0xFF;
     	}
     	if (loc < 0x4000) {  // ROM Bank 0
@@ -2106,21 +2496,20 @@ BYTE ReadMEM(WORD loc) {
 
 		}
 		if ( ( loc >= 0xFF00 ) &&  ( loc <= 0xFF7F ) ) { // $FF00-$FF7F - Hardware I/O Registers
-			if (loc >= 0xFF10 && loc <= 0xFF3F) APUFlush(); // catch the lazy APU up before any sound register is observed
 
 			if (loc >= 0xFF30 && loc <= 0xFF3F) { // Wave RAM
 				return WAVERAM[loc - 0xFF30];
 			}
 
 			switch (loc) {
-				case 0xFF00: return (BYTE)P1; break; // P1 (R/W)
+				case 0xFF00: return (BYTE)(P1 | 0xC0); break; // P1 (R/W), unused bits 6-7 read as 1
 				case 0xFF01: return (BYTE)SERIALDATA; break; // Serial transfer data (R/W)
 				case 0xFF02: return (BYTE)(SERIALCONTROL | 0x7E); break; // SIO control (R/W), unused bits read as 1
 				case 0xFF04: return DIVREG; break; // Divider Register (R/W)
 				case 0xFF05: return (BYTE)TIMECNT; break;// Timer counter (R/W)
 				case 0xFF06: return (BYTE)TIMEMOD; break;// Timer Modulo (R/W)
-				case 0xFF07: return (BYTE)TIMCONT; break; // Timer Control
-				case 0xFF0F: return (BYTE)(IFLAG | 0xE0); break; // Interrupt Flag (R/W)
+				case 0xFF07: return (BYTE)(TIMCONT | 0xF8); break; // Timer Control, unused bits 3-7 read as 1
+				case 0xFF0F: return (BYTE)(IFLAG | 0xE0); break; // Interrupt Flag (R/W), unused bits read as 1
 
 				// SOUND - many bits across these registers are
 				// write-only on real hardware and read back as 1
@@ -2157,11 +2546,12 @@ BYTE ReadMEM(WORD loc) {
 
 			// VIDEO
 				case 0xFF40: return (BYTE)LCDCONTROL; break; // LCD Control (R/W)
-				case 0xFF41: return (BYTE)LCDSTATUS; break; // LCDC Status   (R/W)
+				case 0xFF41: return (BYTE)(LCDSTATUS | 0x80); break; // LCDC Status (R/W), unused bit 7 reads as 1
 				case 0xFF42: return (BYTE)SCRY; break; // Scroll Y   (R/W)
 				case 0xFF43: return (BYTE)SCRX; break; // Scroll X   (R/W)
 				case 0xFF44: return (BYTE)LCDY; break; // LCDC Y-Coordinate (R)
 				case 0xFF45: return (BYTE)LYC; break; // LY Compare  (R/W)
+				case 0xFF46: return (BYTE)DMAREG; break; // DMA Transfer and Start Address (R/W) - see DMAREG's declaration comment
 				case 0xFF47: return (BYTE)BGPAL; break;// BG Palette Data  (W)
 				case 0xFF48: return (BYTE)OBJPAL0; break; // Object Palette 0 Data (W)
 				case 0xFF49: return (BYTE)OBJPAL1; break; // Object Palette 1 Data (W)
@@ -2169,23 +2559,29 @@ BYTE ReadMEM(WORD loc) {
 				case 0xFF4B: return (BYTE)WNDX; break; // Window X Position  (R/W)
 				// GBC registers - real hardware returns these with their
 				// unused upper bits read back as 1, which some games'
-				// hardware-detection code checks for.
-				case 0xFF4D: return (BYTE)(KEY1 | 0x7E); break; // KEY1 - speed switch (R/W)
-				case 0xFF4F: return (BYTE)(VBK | 0xFE); break; // VBK - VRAM bank (R/W)
+				// hardware-detection code checks for. On a DMG-mode cart
+				// (GBC_MODE off) these addresses are entirely unmapped and
+				// always read back as 0xFF, same as the default case below
+				// (confirmed via Mooneye's acceptance/bits/unused_hwio-GS.gb,
+				// which is a DMG-mode test ROM that exercises this whole
+				// $FF4C-$FF7F range expecting 0xFF throughout).
+				case 0xFF4D: return GBC_MODE ? (BYTE)(KEY1 | 0x7E) : 0xFF; break; // KEY1 - speed switch (R/W)
+				case 0xFF4F: return GBC_MODE ? (BYTE)(VBK | 0xFE) : 0xFF; break; // VBK - VRAM bank (R/W)
 				case 0xFF55: // HDMA5 - VRAM DMA status (R/W)
 					// Bit 7 clear = no H-Blank DMA in progress (General-
 					// Purpose transfers always finish immediately, so
 					// this only ever reflects H-Blank DMA state); bits
 					// 0-6 = remaining length in 16-byte blocks minus 1.
+					if (!GBC_MODE) return 0xFF;
 					return (BYTE)(HDMA_REMAINING < 0 ? 0xFF : (((HDMA_REMAINING / 16) - 1) & 0x7F));
 					break;
-				case 0xFF68: return (BYTE)(BCPS | 0x40); break; // BCPS/BGPI - BG palette index (R/W)
-				case 0xFF69: return BGPALRAM[BCPS & 0x3F]; break; // BCPD/BGPD - BG palette data (R/W)
-				case 0xFF6A: return (BYTE)(OCPS | 0x40); break; // OCPS/OBPI - OBJ palette index (R/W)
-				case 0xFF6B: return OBJPALRAM[OCPS & 0x3F]; break; // OCPD/OBPD - OBJ palette data (R/W)
-				case 0xFF70: return (BYTE)(SVBK | 0xF8); break; // SVBK - WRAM bank (R/W)
+				case 0xFF68: return GBC_MODE ? (BYTE)(BCPS | 0x40) : 0xFF; break; // BCPS/BGPI - BG palette index (R/W)
+				case 0xFF69: return GBC_MODE ? BGPALRAM[BCPS & 0x3F] : 0xFF; break; // BCPD/BGPD - BG palette data (R/W)
+				case 0xFF6A: return GBC_MODE ? (BYTE)(OCPS | 0x40) : 0xFF; break; // OCPS/OBPI - OBJ palette index (R/W)
+				case 0xFF6B: return GBC_MODE ? OBJPALRAM[OCPS & 0x3F] : 0xFF; break; // OCPD/OBPD - OBJ palette data (R/W)
+				case 0xFF70: return GBC_MODE ? (BYTE)(SVBK | 0xF8) : 0xFF; break; // SVBK - WRAM bank (R/W)
 
-				default: return 0x00; break;
+				default: return 0xFF; break; // Unmapped $FFxx I/O reads back as 0xFF (open bus)
 			}
 
 		} else if ( ( loc >= 0xFF80 ) &&  ( loc <= 0xFFFE ) ) { // $FF80-$FFFE - High RAM Area
@@ -2199,22 +2595,60 @@ BYTE ReadMEM(WORD loc) {
 
 void WriteMEM(WORD loc, BYTE b){
 	// BUG FIX (sub-instruction timing): same restriction as ReadMEM
-	// above - the CPU can't write anywhere but HRAM while OAM DMA is
-	// actively transferring, since the DMA controller owns the bus.
-	// Real hardware simply ignores such writes rather than redirecting
-	// or erroring. $FF46 itself (the DMA trigger register) is always
-	// writable regardless - it has to be, since that's how a game
-	// re-triggers the very next transfer, typically once per frame,
-	// and real hardware never blocks this register's own trigger.
-	// (Investigated as a candidate cause for a real Pokemon Red
-	// regression during this same work - it turned out not to be the
-	// actual cause that time, but keeping the exception regardless
-	// since it's independently correct real-hardware behavior either
-	// way.)
-	if (dmaActive && loc != 0xFF46 && (loc < 0xFF80 || loc > 0xFFFE)) {
+	// above, narrowed to true OAM ($FE00-$FE9F) for the same reason -
+	// see that comment for the full explanation. Real hardware simply
+	// ignores such writes rather than redirecting or erroring. $FF46
+	// itself (the DMA trigger register) is always writable regardless -
+	// it has to be, since that's how a game re-triggers the very next
+	// transfer, typically once per frame, and real hardware never
+	// blocks this register's own trigger. (Investigated as a candidate
+	// cause for a real Pokemon Red regression during this same work -
+	// it turned out not to be the actual cause that time, but keeping
+	// the exception regardless since it's independently correct
+	// real-hardware behavior either way.)
+	if (dmaBlockingActive && loc != 0xFF46 && (loc >= 0xFE00 && loc <= 0xFE9F)) {
 		return;
 	}
-	if ( loc <= 0x1FFF ) { // $0000-$1FFF - RAM Enable (MBC1/2/3/5)
+	// BUG FIX: same PPU-owns-OAM-during-modes-2-and-3 restriction as
+	// ReadMEM - see that comment for the full explanation.
+	if ((LCDCONTROL & 0x80) && (videoMode == OAMMODE || videoMode == TRANSFERMODE) && (loc >= 0xFE00 && loc <= 0xFE9F)) {
+		return;
+	}
+	// BUG FIX: same PPU-owns-VRAM-during-mode-3 restriction as ReadMEM -
+	// see that comment for the full explanation.
+	if ((LCDCONTROL & 0x80) && (videoMode == TRANSFERMODE) && (loc >= 0x8000 && loc <= 0x9FFF)) {
+		return;
+	}
+	if ( loc <= 0x3FFF && (( CARTTYPE == 0x05 ) || ( CARTTYPE == 0x06 )) ) {
+		// BUG FIX: MBC2 decodes RAMG vs ROMB using only address bit 8 (A8)
+		// of the write, not the $1FFF/$3FFF ("which half of $0000-$3FFF")
+		// split every other MBC here uses - MBC2 only has that one address
+		// line wired to the mapper for this purpose, so e.g. $0100 (A8=1)
+		// is actually ROMB and $2000 (A8=0) is actually RAMG, both the
+		// opposite of what the generic split below would say. Confirmed
+		// via Mooneye's emulator-only/mbc2/bits_ramg.gb and bits_romb.gb,
+		// which deliberately write across the whole $0000-$3FFF range
+		// checking exactly this.
+		if (loc & 0x0100) {
+			// ROMB - same masked-vs-raw 0-becomes-1 quirk as the other
+			// MBCs below, for MBC2's 4-bit bank number.
+			BYTE lower4 = b & 0x0F;
+			if (!lower4) lower4 = 1;
+			ROMBANKNUMBER = lower4;
+			#if defined(DEBUG)
+			printf("Switching MBC2 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
+			#endif
+		} else {
+			// RAMG
+			int wasEnabled = RAMENABLED;
+			RAMENABLED = ((b & 0x0F) == 0x0A);
+			if (wasEnabled && !RAMENABLED && RAM_DIRTY && CartHasBattery()) {
+				if (SaveCartRAMAndRTC((const char *)CARTTITLE)) {
+					RAM_DIRTY = 0;
+				}
+			}
+		}
+	} else if ( loc <= 0x1FFF ) { // $0000-$1FFF - RAM Enable (MBC1/3/5)
 		if (CARTTYPE != 0x00) {
 			int wasEnabled = RAMENABLED;
 			RAMENABLED = ((b & 0x0F) == 0x0A);
@@ -2250,17 +2684,6 @@ void WriteMEM(WORD loc, BYTE b){
 			ROMBANKNUMBER = (ROMBANKNUMBER & ~0x1F) | lower5;
 			#if defined(DEBUG)
 			printf("Switching MBC1 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
-			#endif
-		}
-		// MBC2
-		if (( CARTTYPE == 0x05 ) || ( CARTTYPE == 0x06 )) {
-			// BUG FIX: same class of masked-vs-raw quirk-check bug as
-			// MBC1 above, for MBC2's 4-bit bank number.
-			BYTE lower4 = b & 0x0F;
-			if (!lower4) lower4 = 1;
-			ROMBANKNUMBER = lower4;
-			#if defined(DEBUG)
-			printf("Switching MBC2 to %d. [PC: %04X | LOC: %04X]\n", ROMBANKNUMBER, reg_PC, loc);
 			#endif
 		}
 		// MBC3 - full 7-bit bank number in one write, bank 0 -> bank 1 quirk (same as MBC1)
@@ -2379,7 +2802,6 @@ void WriteMEM(WORD loc, BYTE b){
 	} else if ( ( loc >= 0xFE00 ) &&  ( loc <= 0xFE9F ) ) { // $FE00-$FE9F - Object Attribute Memory (OAM)
 		OAMRAM[loc - 0xFE00] = b;
 	} else if ( ( loc >= 0xFF00 ) &&  ( loc <= 0xFF7F ) ) { // $FF00-$FF7F - Hardware I/O Registers
-		if (loc >= 0xFF10 && loc <= 0xFF3F) APUFlush(); // catch the lazy APU up before a sound register changes
 		if (loc >= 0xFF30 && loc <= 0xFF3F) { // Wave RAM - writable regardless of APU power state
 			WAVERAM[loc - 0xFF30] = b;
 			return;
@@ -2432,14 +2854,35 @@ void WriteMEM(WORD loc, BYTE b){
 			case 0xFF05:
 				// BUG FIX: a write to TIMA while a reload from the
 				// previous overflow is still pending cancels that
-				// reload - the written value sticks instead of TMA's
-				// (Mooneye's tima_write_reloading.gb documents this
-				// precisely). Ordinary writes (no reload pending) are
-				// unaffected.
+				// reload - the written value sticks instead of TMA's.
+				// But a write during the *following* M-cycle - once
+				// TIMECNT has already become TMA and reads look
+				// perfectly ordinary again - is silently ignored
+				// instead (timaWriteBlocked's declaration comment has
+				// the full explanation). Confirmed empirically via
+				// Mooneye's tima_write_reloading.gb, which probes 4
+				// consecutive T-cycles around the reload boundary.
+				if (timaWriteBlocked > 0) {
+					break;
+				}
 				TIMECNT = b;
 				timaReloadPending = 0;
 				break; // Timer counter (R/W)
-			case 0xFF06: TIMEMOD = b; break; // Timer Modulo (R/W)
+			case 0xFF06:
+				TIMEMOD = b;
+				// BUG FIX: unlike a TIMA write (which is either
+				// cancel-and-override or fully ignored, see $FF05
+				// above), a TMA write during *either* half of the
+				// reload window is immediately reflected into TIMA
+				// too - real hardware's reload circuitry reads TMA
+				// live while it's active, so a new TMA value written
+				// mid-reload takes effect right away rather than
+				// waiting for the next overflow. Confirmed empirically
+				// via Mooneye's tma_write_reloading.gb.
+				if (timaReloadPending > 0 || timaWriteBlocked > 0) {
+					TIMECNT = b;
+				}
+				break; // Timer Modulo (R/W)
 			case 0xFF07: TIMCONT = b;
 							// BUG FIX: MAXTIME (the old, independent timer-period
 							// model) is no longer used - the real, unified-counter
@@ -2540,31 +2983,58 @@ void WriteMEM(WORD loc, BYTE b){
 				break;
 
 			// VIDEO
-			case 0xFF40:
-				// LCD power transitions (LCDC bit 7). Previously the PPU
-				// clock ran unconditionally, so a game that switched the LCD
-				// off (very common during screen transitions) saw LY keep
-				// counting and VBlank keep firing. Real hardware: switching
-				// the LCD off resets LY to 0 and the STAT mode to 0 and
-				// freezes the PPU (no VBlank/STAT interrupts); switching it
-				// on restarts the PPU at the beginning of line 0. Found via
-				// Kirby's Pinball Land, whose VBlank handler waits for
-				// LY==$91 and then turns the LCD off.
-				if ((LCDCONTROL & 0x80) && !(b & 0x80)) {
+			case 0xFF40: {
+				BYTE oldLCDC = LCDCONTROL;
+				LCDCONTROL = b;
+				// BUG FIX: turning the LCD off/on (bit 7) needs its own
+				// explicit transition - see the freeze/resume comment in
+				// cycleLength() for why the state machine alone isn't
+				// enough. Powering off resets LY and the STAT mode bits to
+				// 0 immediately but deliberately leaves the STAT
+				// LYC-coincidence bit (bit 2) untouched - real hardware
+				// stops recomputing it the instant the comparison clock
+				// stops, so it just keeps whatever value it last had.
+				// Powering back on resets LY to 0 and mode to 0 (the real
+				// first-line state, before OAM search actually begins a
+				// little later) and immediately recomputes the
+				// coincidence bit against the fresh LY=0. Confirmed via
+				// Mooneye's stat_lyc_onoff.gb.
+				if ((oldLCDC & 0x80) && !(b & 0x80)) {
 					LCDY = 0;
 					videoMode = HBLANKMODE;
-					LCDSTATUS = (LCDSTATUS & 0xF8);
-					statLine = 0;
-				} else if (!(LCDCONTROL & 0x80) && (b & 0x80)) {
+					LCDSTATUS = (LCDSTATUS & 0xFC) | (videoMode & 0x03); // mode bits only - bit 2 (coincidence) frozen
+					// While powered off, UpdateStatLine() never runs (see
+					// its gate in cycleLength()), so statLineActive would
+					// otherwise stay stuck reflecting whatever combination
+					// of conditions (possibly mode-based) was live the
+					// instant before power-off. Only the frozen coincidence
+					// bit can still meaningfully contribute while off -
+					// resync statLineActive to just that, so the power-on
+					// branch's UpdateStatLine() call correctly detects a
+					// rising edge only when it's a genuine one.
+					statLineActive = ((LCDSTATUS >> 2) & 0x01) && ((LCDSTATUS >> 6) & 0x01);
+					lcdOnLine0Phase = 0;
+					lcdOnLine1ExtraPending = 0;
+				} else if (!(oldLCDC & 0x80) && (b & 0x80)) {
 					LCDY = 0;
-					videoMode = OAMMODE;
+					videoMode = HBLANKMODE;
 					VideoCyclesLeft = OAM_CYCLES;
+					// BUG FIX: line 0 right after power-on isn't a normal
+					// scanline - see lcdOnLine0Phase's declaration comment.
+					// This flags the state machine to skip mode 2 and end
+					// with an 8T-short HBlank once this phase's 80T (the
+					// same length as normal mode 2/OAM search, just
+					// reported as mode 0 and not OAM/VRAM-blocking) expire.
+					lcdOnLine0Phase = 1;
 					LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
-					LCDCONTROL = b;
-					StatUpdate();
+					// Powering on restarts the comparison at LY=0 and
+					// immediately recomputes the composite STAT line
+					// (coincidence against the fresh LY=0, mode=0) -
+					// see UpdateStatLine()'s declaration comment.
+					UpdateStatLine(0);
 				}
-				LCDCONTROL = b;
 				break; // LCD Control (R/W)
+			}
 			case 0xFF41:
 				// BUG FIX: bits 0-2 (mode + LYC-coincidence) are read-only,
 				// hardware-maintained status bits on real hardware - only
@@ -2573,12 +3043,48 @@ void WriteMEM(WORD loc, BYTE b){
 				// mode/coincidence bits directly, which then never got
 				// corrected by the PPU state machine (see cycleLength).
 				LCDSTATUS = (LCDSTATUS & 0x07) | (b & 0xF8);
-				StatUpdate();
+				// BUG FIX: newly *enabling* a STAT interrupt source while
+				// its underlying condition is already true (e.g. writing
+				// bit 4 while already in VBlank) is itself a rising edge
+				// of the composite STAT signal on real hardware, and needs
+				// to fire right here - UpdateStatLine() is otherwise only
+				// called from mode transitions, which don't happen just
+				// because an enable bit changed. Confirmed via Mooneye's
+				// stat_irq_blocking.gb, whose very first round enables the
+				// mode=1 source while *already* in VBlank and expects an
+				// immediate interrupt. Gated on LCD-on for the same reason
+				// as the LYC write handler below - the comparator (and the
+				// modes themselves) are frozen while off.
+				if (LCDCONTROL & 0x80) {
+					UpdateStatLine(0);
+				}
 				break; // LCDC Status   (R/W)
 			case 0xFF42: SCRY = b; break; // Scroll Y   (R/W)
 			case 0xFF43: SCRX = b; break; // Scroll X   (R/W)
 			case 0xFF44: LCDY = 0x00; break; // LCDC Y-Coordinate (R)
-			case 0xFF45: LYC = b; LCDSTATUS = (LCDSTATUS & 0xFB) | ((LCDY == LYC) ? 0x04 : 0x00); StatUpdate(); break; // LY Compare  (R/W)
+			case 0xFF45:
+				// BUG FIX: the STAT LYC-coincidence bit (bit 2) was only
+				// ever recomputed once per PPU mode transition (every
+				// 80-456 cycles, inside cycleLength()) - real hardware's
+				// comparator is effectively live, so a software write to
+				// LYC while the LCD is on needs to update the coincidence
+				// bit immediately, not wait for the next mode boundary.
+				// Only while the LCD is actually on - the comparison
+				// clock is frozen otherwise (see the LCDC/$FF40 handler).
+				// Confirmed via Mooneye's stat_lyc_onoff.gb, which sets
+				// LYC immediately before turning the LCD off and expects
+				// the freshly-recomputed bit to already be in effect.
+				LYC = b;
+				if (LCDCONTROL & 0x80) {
+					LCDSTATUS = (LCDSTATUS & 0xFB) | ((LCDY == LYC) ? 0x04 : 0x00);
+					// BUG FIX: same reasoning as the $FF41 handler above -
+					// a LYC write can itself create a fresh LY==LYC match
+					// (or clear an existing one), which needs to go
+					// through the same rising-edge check as any other
+					// live coincidence change.
+					UpdateStatLine(0);
+				}
+				break; // LY Compare  (R/W)
 			case 0xFF46: doDMA(b); break; // DMA Transfer and Start Address (W)
 			case 0xFF47: BGPAL = b; break; // BG Palette Data  (W)
 			case 0xFF48: OBJPAL0 = b; break; // Object Palette 0 Data (W)
@@ -2857,8 +3363,21 @@ void OP17(void){ // case  0x17:
 reg_A = RLA(reg_A);cycleLength(4); } // 17    RLA
 
 void OP18(void){ // case  0x18:
-	reg_PC = jr(reg_PC, ReadMEM(reg_PC++));
-	cycleLength(12);
+	// BUG FIX (sub-instruction timing): split into its real 3 M-cycles
+	// (fetch, read displacement byte, internal delay for the PC add)
+	// instead of one lump cycleLength(12) after - see OPC2/OPC3's
+	// comment for why this matters generally. Found this specific one
+	// unsplit while investigating why the intr_2_0_timing.gb busy-loop
+	// measurement (`inc b; jr -`) couldn't observe a STAT-interrupt-
+	// timing change landing inside this exact instruction's own window
+	// (ultimately a dead end for that specific test - see STATUS.md -
+	// but this split is independently correct real-hardware timing
+	// either way, so kept).
+	cycleLength(4); // M1: fetch
+	BYTE off = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read displacement byte
+	reg_PC = jr(reg_PC, off);
+	cycleLength(4); // M3: internal delay (PC add)
 } // 18    JR   disp
 
 void OP19(void){ // case  0x19:
@@ -2897,12 +3416,16 @@ void OP1F(void){ // case  0x1F:
 }  // 1F    RRA
 
 void OP20(void){ // case  0x20:
+	// BUG FIX (sub-instruction timing): split into its real M-cycles
+	// (fetch, read displacement byte, then an internal delay only when
+	// the branch is actually taken) instead of one lump cycleLength()
+	// after - see OP18/OPC2's comments for why this matters generally.
+	cycleLength(4); // M1: fetch
+	BYTE off = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read displacement byte
 	if (!getZ()) {
-		reg_PC = jr(reg_PC, ReadMEM(reg_PC++));
-		cycleLength(12);
-	} else {
-		ReadMEM(reg_PC++);
-		cycleLength(8);
+		reg_PC = jr(reg_PC, off);
+		cycleLength(4); // M3: internal delay (branch taken)
 	} // 20    JR   NZ,disp
 }
 
@@ -2957,12 +3480,13 @@ void OP27(void){ // DAA - decimal-adjust A after a BCD add/subtract.
 } // 27    DAA
 
 void OP28(void){ // case  0x28:
+	// BUG FIX (sub-instruction timing): see OP20's comment.
+	cycleLength(4); // M1: fetch
+	BYTE off = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read displacement byte
 	if (getZ()) {
-		reg_PC = jr(reg_PC, ReadMEM(reg_PC++));
-		cycleLength(12);
-	} else {
-		ReadMEM(reg_PC++);
-		cycleLength(8);
+		reg_PC = jr(reg_PC, off);
+		cycleLength(4); // M3: internal delay (branch taken)
 	}
 }// 28    JR   Z,disp
 
@@ -3003,11 +3527,13 @@ void OP2F(void){ // case  0x2F:
 } // 2F    CPL
 
 void OP30(void){ // case  0x30:
+	// BUG FIX (sub-instruction timing): see OP20's comment.
+	cycleLength(4); // M1: fetch
+	BYTE off = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read displacement byte
 	if (getC() != 1) {
-		reg_PC = jr(reg_PC, ReadMEM(reg_PC++));
-		cycleLength(12);
-	} else { ReadMEM(reg_PC++);
-		cycleLength(8);
+		reg_PC = jr(reg_PC, off);
+		cycleLength(4); // M3: internal delay (branch taken)
 	}
 } // 30    JR   NC,disp
 
@@ -3051,12 +3577,13 @@ void OP37(void){ // case  0x37:
 } // 37    SCF
 
 void OP38(void){ // case  0x38:
+	// BUG FIX (sub-instruction timing): see OP20's comment.
+	cycleLength(4); // M1: fetch
+	BYTE off = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read displacement byte
 	if (getC() != 0) {
-		reg_PC = jr(reg_PC, ReadMEM(reg_PC++));
-		cycleLength(12);
-	} else {
-		ReadMEM(reg_PC++);
-		cycleLength(8);
+		reg_PC = jr(reg_PC, off);
+		cycleLength(4); // M3: internal delay (branch taken)
 	}
 } // 38    JR   C,disp
 
@@ -3240,28 +3767,40 @@ void OP76(void){// 76 HALT
 	// fail to increment PC afterwards (the following opcode byte gets
 	// executed twice). A handful of commercial games and test ROMs rely on
 	// this exact quirk; left as a known follow-up.
-	while (!(IFLAG & IER)) {
-		// Fast-forward: skip ahead in multiples of 4 cycles, but never past
-		// the next PPU mode change or a possible TIMA overflow, so the wake-up
-		// cycle stays exact (halt_* timing tests).
-		int skip = 4;
-		if (!(GBC_MODE && (KEY1 & 0x80)) && timaReloadPending == 0) {
-			int lim = 1 << 20;
-			if (LCDCONTROL & 0x80) lim = VideoCyclesLeft - 8;
-			if ((TIMCONT >> 2) & 0x01) {
-				int per = 1 << (TIMER_BIT_POS[TIMCONT & 0x03] + 1);
-				int t = (255 - TIMECNT) * per - 8;
-				if (t < lim) lim = t;
-			}
-			if (lim >= 8) skip = lim & ~3;
-		}
-		cycleLength(skip);
-	}
+	// BUG FIX: HALT's own decode M-cycle was being charged *after* the
+	// wait loop, unconditionally, on top of whatever the loop itself
+	// already charged waiting for IF&IE to become true - every HALT that
+	// actually waited (i.e. almost every one) cost 4 T-cycles more than
+	// real hardware. Charge that one M-cycle up front instead (matching
+	// every other opcode's own decode cost), then wait in 4-cycle steps
+	// only for as long as the condition is still false, resuming exactly
+	// on the boundary where it becomes true with no extra delay tacked
+	// on. Confirmed via Mooneye's halt_ime1_timing2-GS.gb, which checks
+	// HALT's total elapsed time against a NOP-based wait down to the
+	// exact DIV value afterward.
 	cycleLength(4);
+	while (!(IFLAG & IER)) {
+		cycleLength(4);
+	}
 }// 76 HALT
 
 void OP77(void){ // case  0x77:
-WriteMEM(reg_HL, reg_A); cycleLength(8); } // 77    LD   (HL),A
+	// BUG FIX (sub-instruction timing): split into its real 2 M-cycles
+	// (fetch, write) instead of one lump cycleLength(8) after the write -
+	// see the comment above push()/pop() for why this matters generally,
+	// and STATUS.md's "concrete next step" entry for the specific,
+	// empirically-traced bug this fixes: a WriteMEM() side effect (an
+	// OAM DMA trigger, a DIV reset) triggered mid-instruction was being
+	// credited with this whole instruction's cost as "time after the
+	// trigger", including the fetch cycle that actually happened
+	// *before* the write - over-crediting real hardware's actual delay
+	// by one M-cycle for every opcode structured this way. Confirmed via
+	// Mooneye's pop_timing.gb (DIV-reset case) and the push/pop_timing-
+	// style OAM-DMA tests.
+	cycleLength(4); // M1: fetch
+	WriteMEM(reg_HL, reg_A);
+	cycleLength(4); // M2: write
+} // 77    LD   (HL),A
 void OP78(void){ // case  0x78:
 reg_A = reg_B; cycleLength(4); } //	78    LD   A,B
 void OP79(void){ // case  0x79:
@@ -3282,8 +3821,13 @@ void OP7D(void){ // case  0x7D:
 } //	7D    LD   A,L
 
 void OP7E(void){ // case  0x7E:
+	// BUG FIX (sub-instruction timing): split into its real 2 M-cycles
+	// (fetch, read) - see the comment on OP77/OPE0/OPF0. Confirmed via
+	// Mooneye's div_timing.gb, which reads DIV back through HL right at
+	// a precisely-timed boundary.
+	cycleLength(4); // M1: fetch
 	reg_A = ReadMEM(reg_HL);
-	cycleLength(8);
+	cycleLength(4); // M2: read
 } // 7E    LD   A,(HL)
 
 void OP7F(void){ // case  0x7F:
@@ -3510,18 +4054,34 @@ void OPC1(void){ // case  0xC1:
 } // C1    POP  BC
 
 void OPC2(void){ // case  0xC2:
+	// BUG FIX (sub-instruction timing): split into its real M-cycles
+	// (fetch, read address low byte, read address high byte, then an
+	// internal delay only when the branch is actually taken) instead of
+	// reading both address bytes atomically via ReadWord() and charging
+	// one lump cycleLength() after - see the comment on OP77/OPE0 for
+	// why this matters for any instruction whose memory access can
+	// observe DMA-blocked state mid-read. Matches Mooneye's own
+	// jp_timing.gb/jp_cc_timing.gb M-cycle diagram exactly.
+	cycleLength(4); // M1: fetch
+	BYTE lo = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read address low byte
+	BYTE hi = ReadMEM(reg_PC++);
+	cycleLength(4); // M3: read address high byte
 	if (!getZ()) {
-		reg_PC = jp(ReadWord(reg_PC));
-		cycleLength(16);
-	} else {
-		reg_PC += 2;
-		cycleLength(12);
+		reg_PC = jp((WORD)(lo | (hi << 8)));
+		cycleLength(4); // M4: internal delay (branch taken)
 	}
 } // C2    JP   NZ,nnnn
 
 void OPC3(void){ // case  0xC3:
-	reg_PC = jp(ReadWord(reg_PC));
-	cycleLength(16);
+	// BUG FIX (sub-instruction timing): see OPC2's comment.
+	cycleLength(4); // M1: fetch
+	BYTE lo = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read address low byte
+	BYTE hi = ReadMEM(reg_PC++);
+	cycleLength(4); // M3: read address high byte
+	reg_PC = jp((WORD)(lo | (hi << 8)));
+	cycleLength(4); // M4: internal delay
 } // C3    JP   nnnn
 
 void OPC4(void){ // case  0xC4:
@@ -3570,13 +4130,15 @@ void OPC9(void){ // case  0xC9:
 } // C9    RET
 
 void OPCA(void){ // case  0xCA:
+	// BUG FIX (sub-instruction timing): see OPC2's comment.
+	cycleLength(4); // M1: fetch
+	BYTE lo = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read address low byte
+	BYTE hi = ReadMEM(reg_PC++);
+	cycleLength(4); // M3: read address high byte
 	if (getZ()) {
-		reg_PC = jp(ReadWord(reg_PC));
-		cycleLength(16);
-	} else {
-		//ReadWord(reg_PC);
-		reg_PC += 2;
-		cycleLength(12);
+		reg_PC = jp((WORD)(lo | (hi << 8)));
+		cycleLength(4); // M4: internal delay (branch taken)
 	}
 }	// CA    JP   Z,nnnn
 
@@ -3643,13 +4205,15 @@ void OPD1(void){ // case  0xD1:
 } // D1    POP  DE
 
 void OPD2(void){ // case  0xD2:
+	// BUG FIX (sub-instruction timing): see OPC2's comment.
+	cycleLength(4); // M1: fetch
+	BYTE lo = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read address low byte
+	BYTE hi = ReadMEM(reg_PC++);
+	cycleLength(4); // M3: read address high byte
 	if (getC() != 1) {
-		reg_PC = jp(ReadWord(reg_PC));
-		//reg_PC += 2; // TODO: TEST
-		cycleLength(16); // BUG FIX: was 20, real hardware is 16 when taken
-	} else {
-		reg_PC += 2;
-		cycleLength(12); // BUG FIX: was 8, real hardware is 12 when not taken
+		reg_PC = jp((WORD)(lo | (hi << 8)));
+		cycleLength(4); // M4: internal delay (branch taken)
 	}
 }// D2    JP   NC,nnnn
 
@@ -3695,13 +4259,15 @@ void OPD9(void){ // case  0xD9:
 // timing reti_intr_timing.gb already depends on.
 cycleLength(4); reg_PC = ret(); IME = 1; cycleLength(4); } // D9    RETI
 void OPDA(void){ // case  0xDA:
+	// BUG FIX (sub-instruction timing): see OPC2's comment.
+	cycleLength(4); // M1: fetch
+	BYTE lo = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read address low byte
+	BYTE hi = ReadMEM(reg_PC++);
+	cycleLength(4); // M3: read address high byte
 	if (getC() != 0) {
-		reg_PC = jp(ReadWord(reg_PC));
-		//reg_PC += 2; // TODO: TEST
-		cycleLength(16);
-	} else {
-		reg_PC += 2;
-		cycleLength(12);
+		reg_PC = jp((WORD)(lo | (hi << 8)));
+		cycleLength(4); // M4: internal delay (branch taken)
 	}
 }// DA    JP   C,nnnn
 void OPDB(void){
@@ -3734,8 +4300,17 @@ void OPDF(void){ // case  0xDF:
 cycleLength(4); reg_PC = rst(0x0018); } // DF    RST  18H
 
 void OPE0(void){ // case  0xE0:
-	WriteMEM((0xFF00 + ReadMEM(reg_PC++)), reg_A);
-	cycleLength(12);
+	// BUG FIX (sub-instruction timing): split into its real 3 M-cycles
+	// (fetch, read operand n, write) - see the comment on OP77 for why.
+	// This is the opcode Mooneye's start_oam_dma macro actually uses to
+	// trigger OAM DMA (LDH ($FF46),A), so this fix is what the whole
+	// push_timing/add_sp_e_timing/call_timing-family cluster of
+	// remaining failures traced back to.
+	cycleLength(4); // M1: fetch
+	BYTE n = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read operand n
+	WriteMEM((0xFF00 + n), reg_A);
+	cycleLength(4); // M3: write
 } // E0    LD   ($FF00+nn),A
 
 void OPE1(void){ // case  0xE1:
@@ -3770,14 +4345,23 @@ void OPE8(void){ // case  0xE8:
 	// an *unsigned* 8-bit add of SP's low byte with the immediate (even
 	// though the actual addition to SP is sign-extended) - order matters:
 	// compute the flags from the pre-update SP before overwriting it.
+	// BUG FIX (sub-instruction timing): split into its real 4 M-cycles
+	// (fetch, read e, 2 internal delays) instead of one lump
+	// cycleLength(16) at the end - see the comment on OP77/OPE0 for why;
+	// Mooneye's add_sp_e_timing.gb specifically depends on the read of
+	// `e` landing on the correct M-cycle relative to a concurrent OAM
+	// DMA transfer.
+	cycleLength(4); // M1: fetch
 	BYTE e = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read e
 	int result = reg_SP + (signed char)e;
 	setH(((reg_SP & 0x0F) + (e & 0x0F)) > 0x0F);
 	setC(((reg_SP & 0xFF) + (e & 0xFF)) > 0xFF);
 	reg_SP = (WORD)(result & 0xFFFF);
 	setZ(0);
 	setN(0);
-	cycleLength(16);
+	cycleLength(4); // M3: internal delay
+	cycleLength(4); // M4: internal delay
 } // E8    ADD  SP,dd
 
 void OPE9(void){ // case  0xE9:
@@ -3806,8 +4390,21 @@ reg_PC = rst(0x0028);
 } // EF    RST  28H
 
 void OPF0(void){ // case  0xF0:
-	reg_A = ReadMEM( 0xFF00 | ReadMEM(reg_PC++));
-	cycleLength(12); // BUG FIX: was 8, real hardware is 12
+	// BUG FIX (sub-instruction timing): split into its real 3 M-cycles
+	// (fetch, read operand n, read value) instead of one lump
+	// cycleLength(12) after doing both reads at once - see the comment
+	// on OP77/OPE0 for the general reasoning. This specific opcode is
+	// what Mooneye's tim00.gb (and siblings) use to read TIMA back after
+	// a precisely-timed wait: reading TIMA too early (before this
+	// instruction's own fetch+operand-read M-cycles have elapsed) missed
+	// counting those 8T toward the threshold, silently regressing this
+	// whole test family the moment the *write* side (OPE0) got its own
+	// correct, reduced timing - the two need to move together.
+	cycleLength(4); // M1: fetch
+	BYTE n = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read operand n
+	reg_A = ReadMEM(0xFF00 | n);
+	cycleLength(4); // M3: read value
 } // F0    LD   A,($FF00+nn)
 
 void OPF1(void){ // case  0xF1:
@@ -3821,8 +4418,15 @@ void OPF2(void){ // case  0xF2:
 }// F2    LD   A,(C)
 
 void OPF3(void){ // case  0xF3:
+	// BUG FIX: DI must also cancel a still-pending EI delay, not just
+	// clear IME - otherwise a DI executed one instruction after EI (before
+	// EI_PENDING's countdown reaches 0) doesn't actually prevent EI's
+	// effect from landing a moment later. Real hardware's DI is
+	// immediate and unconditional (Mooneye's rapid_di_ei.gb tests
+	// exactly this: "ei; di; ei; di" and "ei; di; nop; nop" must both
+	// produce zero interrupts).
 	IME = 0;
-	EI_PENDING = 0; // DI cancels a pending EI (rapid_di_ei)
+	EI_PENDING = 0;
 	cycleLength(4);
 } // F3    DI
 
@@ -3849,14 +4453,18 @@ void OPF8(void){ // case  0xF8:
 	// BUG FIX: previously set no flags at all. Same H/C computation as
 	// ADD SP,e8 above (this is really the same ALU operation, just written
 	// to HL instead of back to SP) - Z and N always clear.
+	// BUG FIX (sub-instruction timing): split into its real 3 M-cycles
+	// (fetch, read e, internal delay) - see the comment on OPE8/OP77.
+	cycleLength(4); // M1: fetch
 	BYTE e = ReadMEM(reg_PC++);
+	cycleLength(4); // M2: read e
 	int result = reg_SP + (signed char)e;
 	setH(((reg_SP & 0x0F) + (e & 0x0F)) > 0x0F);
 	setC(((reg_SP & 0xFF) + (e & 0xFF)) > 0xFF);
 	reg_HL = (WORD)(result & 0xFFFF);
 	setZ(0);
 	setN(0);
-	cycleLength(12);
+	cycleLength(4); // M3: internal delay
 } // F8    LD   HL,SP+dd
 
 void OPF9(void){ // case  0xF9:
@@ -3871,8 +4479,14 @@ void OPFA(void){ // case  0xFA:
 } // FA    LD   A,(nnnn)
 
 void OPFB(void){ // case  0xFB:
-	// A second EI while one is already pending must NOT restart the delay (ei_sequence).
-	if (EI_PENDING == 0 && !IME) EI_PENDING = 2;
+	// BUG FIX: don't restart the delay if one's already armed (EI_PENDING
+	// == 1, meaning IME becomes 1 at the end of *this* instruction) - a
+	// second EI executing as the very instruction after a first EI must
+	// not push IME's activation out by another instruction (Mooneye's
+	// ei_sequence.gb tests exactly this: 18 consecutive EIs with IE/IF
+	// already set should still fire the interrupt right after the
+	// second EI, not after the last one).
+	if (EI_PENDING == 0) EI_PENDING = 2;
 	cycleLength(4);
 } // FB    EI
 

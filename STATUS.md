@@ -39,10 +39,29 @@ evidenced version of all of this):
 - Sound: the APU core itself is solid and independently verified (see
   `DUMP_WAV` below); the PS1 SPU output half has never been confirmed to
   actually produce audio, since this sandbox can't play or capture sound.
-- Sub-instruction cycle-accurate timing: a large, real, **partially
-  fixed** gap - currently 21/67 on Mooneye's `acceptance/ppu`+`timer`+
-  `interrupts`+top-level suite (started at 11/67). See "What's next"
-  item 1 for exactly what's fixed, what's failing, and why.
+- Sub-instruction cycle-accurate timing: a large, real, **mostly
+  fixed** gap - currently 52/67 on Mooneye's `acceptance/ppu`+`timer`+
+  `interrupts`+top-level suite (started at 11/67). The entire CALL/
+  PUSH/POP/RST/RET/JP/ADD SP,e/OAM-DMA sub-family and most of the STAT-
+  interrupt/PPU-mode-timing cluster are now fixed; VRAM-access
+  blocking during mode 3, line 0's own special post-power-on timing,
+  and the TIMA/TMA write-during-reload edge cases are also all now
+  fixed and verified regression-free (all 24 of `lcdon_timing-GS`'s LY
+  checks pass; `tima_write_reloading`/`tma_write_reloading` both PASS
+  outright). What's left is a narrow, LCD-on-adjacent-only quirk
+  (mode 3 on line 1, specifically the one right after a power-on line
+  0, needs a few extra T-cycles this project doesn't model yet -
+  confirmed NOT a general mode-3 bug, see below), and a still-
+  unidentified interrupt-timing gap that now looks to be the single
+  root cause blocking two separate tests at once
+  (`hblank_ly_scx_timing-GS` and `intr_2_mode0_timing_sprites`) - mode
+  3's per-sprite length penalty is now implemented and hand-verified
+  against 18 of `intr_2_mode0_timing_sprites.gb`'s own cases, but that
+  test is blocked by the same interrupt-timing gap, not by the sprite
+  formula. See "What's next" item 1 for detail.
+- Kirby's Pinball Land's long-standing blank-screen hang: resolved as
+  a side effect of this suite's HALT-timing fix - see "What's next"
+  item 2.
 
 **Priority order to actually work from is "What's next" below, kept
 current** - don't re-derive priorities from the historical log above it.
@@ -104,7 +123,6 @@ TRACE_AUDIO=1 ./harness rom.gb 3000000         # per-frame channel freq/volume/e
 ROWSUMMARY=1 ./harness rom.gb 30000000         # per-row non-white pixel counts
 DUMP_VRAM=1 ./harness rom.gb 30000000          # tile map/tile data/palette dump at exit
 DUMP_HRAM=1 ./harness rom.gb 60000000          # Mooneye pass/fail HRAM diagnostic fields
-PCHIST=1 ./harness rom.gb 20000000            # top-15 most-executed PCs at exit (finds hot wait loops)
 NOSTUCK=1 ./harness rom.gb 30000000            # disable the stuck-loop early-exit (needed for infinite-loop test ROMs with no HALT)
 ```
 
@@ -187,6 +205,18 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
 ```
 
 ## What's proven so far
+
+**Latest merge (two lines of work combined).** `main` now contains both this session line (renderer/GBC/boot fixes)
+and the parallel timing line (`claude/github-project-analysis-kv21uc`, per-T-cycle PPU, OAM DMA, STAT line, etc.).
+Where they overlapped (IF read bits, EI/DI, interrupt dispatch, LCD-off, STAT interrupt line) the timing branch's
+implementation was kept because it passes more Mooneye tests (52/67 vs 28/67). Unique to this line and re-applied:
+- DMG background/window renderer rewrite (signed tile numbers now chosen by LCDC bit 4, not the map address; map
+  column wraps at 32; window always opaque). Fixed Dr. Mario's missing logo, Super Mario Land's garbled title,
+  Gargoyle's Quest's missing intro text, Kirby's Pinball Land's striped table.
+- CGB boot registers (A=$11, ...) for CGB carts: Pokemon Crystal now passes its "Game Boy Color only" check.
+- `screenBuffer` is `BYTE` not `int` (frees ~69KB of the PS1's 2MB RAM; heap headroom after statics is ~122KB,
+  and the core allocates ~49KB + cart RAM, so carts with <=32KB RAM fit; 128KB-RAM MBC5 carts do not).
+- PS1 executable verified to build with PSn00bSDK v0.24 (`psxgbc.exe`, ~118KB). Not run on hardware/emulator.
 
 - **CPU/MBC/PPU core correctness**: dozens of real, confirmed bugs fixed
   this session — see `git log` for the full, detailed list. Validated
@@ -331,49 +361,23 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   render correctly without CGB tile-attribute support — an expected
   consequence of this project's already-documented lack of GBC support,
   not a new bug.
-- **RENDERING BUG FIXED + PERFORMANCE PASS.** (1) The DMG background/window renderers chose signed vs unsigned
-  tile numbers from the *map address* ($9C00) instead of LCDC bit 4, and didn't wrap the map column at 32.
-  Visible effect: Dr. Mario's logo missing, Kirby's Pinball Land table striped/black, Super Mario Land title
-  garbled, Gargoyle's Quest intro text missing. Both loops are rewritten (per-tile fetch, direct VRAM, correct
-  signedness, wrapped scroll). (2) Performance: timer edges are counted arithmetically with an exact
-  per-T-cycle fallback near overflow; HALT fast-forwards to the next PPU/timer event; the APU is clocked lazily
-  (flushed on any sound-register access, output read, or every 512 cycles). ~2.2x faster on the host with
-  identical test results. Remaining hot spots: sprite/CGB renderers (per-pixel ReadMEM), per-instruction
-  cycleLength overhead. Host harness tip: build with -O2 and use DUMP_AT<=600 for real ROMs.
-- **Timing/interrupt fixes (Mooneye acceptance 21 -> 28/67, no regressions; cpu_instrs 11/11, mbc 18/21):**
-  IF bits 5-7 read as 1 (if_ie_registers); a second EI no longer restarts the EI delay and DI cancels a
-  pending EI (ei_sequence, rapid_di_ei); interrupt dispatch pushes PC high byte *then* picks the vector, so a
-  push landing on IE can cancel it (ie_push); STAT interrupt is a proper OR'd, rising-edge line
-  (`StatUpdate()`), replacing per-source IF raises that fired at the wrong mode transitions
-  (stat_irq_blocking and others).
-- **RESOLVED: Pokemon Crystal "designed only for use on the Game Boy Color" screen.** Root cause: the CGB boot
-  ROM leaves A=$11 (games detect CGB this way) but the core always booted with the DMG value A=$01. Boot
-  registers are now the CGB set (A=$11, F=$80, B=$00, C=$00, D=$FF, E=$56, HL=$000D) when the header flag
-  ($143) is $80/$C0. Crystal now runs its colour intro. Sweep unchanged (11/11, 18/21, 21/67).
-- **RESOLVED: Kirby's Pinball Land hang (and Kirby's Dream Land 2 blank screen) - the PPU never modelled the LCD being switched off.**
-  Root cause found by PC-histogram profiling (`PCHIST=1` in the harness): the game's VBlank handler waits
-  for `LY==$91` and then clears LCDC bit 7. The core ignored bit 7, so LY kept counting and VBlank kept
-  firing while the "LCD" was off; the handler then re-entered late every frame and never recovered. The
-  earlier "Timer starvation" hypothesis above was a red herring. Fix (emu.c, $FF40 write + PPU clock):
-  LCD off resets LY=0 / STAT mode=0 and freezes the PPU; LCD on restarts at line 0 in OAM mode. Both games
-  now render (pinball table / DL2 title screen). Regression sweep unchanged: cpu_instrs 11/11,
-  Mooneye mbc1+mbc5 18/21, acceptance 21/67 with the identical pass list.
-- (SUPERSEDED - see RESOLVED note above) **Kirby's
-  Pinball Land hangs on a blank screen.** Traced via the same reference-
-  diffing technique to a Timer-interrupt-gated countdown flag in HRAM
-  that only this emulator fails to ever fully decrement — the Timer
-  interrupt is requested at the correct rate throughout (135 times in
-  1 million instructions) but its vector is reached only once, while
-  VBlank (higher priority, very similar ~70000-cycle period) reaches
-  its own vector 134 times in the same window. Leading hypothesis:
-  VBlank's near-identical period plus higher priority is systematically
-  starving Timer once some small, still-unidentified cycle-accounting
-  phase difference exists between this emulator and real hardware -
-  Peanut-GB shows the same general shape (also polls once per frame)
-  but does eventually get enough Timer services through, where this
-  emulator never does. Not yet root-caused; next step if resumed is
-  auditing this specific ROM's actual VBlank/Timer handler instruction
-  costs against an authoritative cycle-count table.
+- **Kirby's Pinball Land's blank-screen hang — RESOLVED in a later
+  session** (see "What's next" item 2 for the fix and the real-ROM
+  evidence). Originally traced via reference-diffing to a Timer-
+  interrupt-gated countdown flag in HRAM that only this emulator
+  failed to ever fully decrement — the Timer interrupt was requested
+  at the correct rate throughout (135 times in 1 million instructions)
+  but its vector was reached only once, while VBlank (higher priority,
+  very similar ~70000-cycle period) reached its own vector 134 times in
+  the same window. The leading hypothesis at the time - "some small,
+  still-unidentified cycle-accounting phase difference" systematically
+  starving Timer relative to VBlank - turned out to match a real bug
+  found independently, much later, via Mooneye's suite rather than by
+  chasing this ROM directly: HALT was overcharging every wait by 4
+  T-cycles (see the sub-instruction timing section above). Once real
+  ROMs were available again to check against, this ROM was confirmed
+  actually playing (ball, flippers, and score all progressing across
+  multiple checkpoints), not stuck.
 - **8x16 sprite mode implemented** (`LCDC` bit 2) — real hardware ignores
   bit 0 of the OAM tile number and stacks two consecutive tiles as one
   16-pixel-tall sprite; Y-flip mirrors the whole 16-pixel sprite (which
@@ -695,29 +699,1289 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   earlier, not attempted here to avoid guessing at something subtly
   wrong the way an earlier DMA-nuance attempt turned out to be.
 
+  **New session: 21/67 → 29/67, six independent, individually-verified
+  fixes, zero regressions.** Toolchain setup was ephemeral (a fresh
+  sandbox, nothing preserved from prior sessions) - rebuilt WLA-DX from
+  source and Mooneye's test suite exactly per "Setting up Mooneye's
+  test suite" above, plus cloned `retrio/gb-test-roms` for `cpu_instrs`
+  regression testing (also not in this repo - see that section for the
+  clone commands). Every fix below was verified against the full
+  `acceptance/ppu`+`timer`+`interrupts`+top-level sweep (diffing the
+  exact pass list, not just the total), `cpu_instrs` (stayed 11/11),
+  Mooneye `mbc1`+`mbc5` (stayed 18/21), and the two small bundled
+  synthetic ROMs at `psn00bsdk-build/iso_files/GAME.GB`/`GAME2.GB`
+  (Blargg's `02-interrupts`/`01-special`, already in this repo, not
+  copyrighted commercial ROMs) re-rendered and diffed pixel-for-pixel
+  via `ROWSUMMARY`/`DUMP_PPM` - no real commercial ROMs were available
+  in this sandbox this session, so that piece of the usual regression
+  discipline (re-render 2-3 real ROMs) couldn't be done; worth doing
+  the next time real ROMs are available, given how central some of
+  these changes are (the interrupt dispatch and PPU-off rewrites
+  especially).
+    1. **IF ($FF0F) now reads unused bits 5-7 as 1** (same convention
+       already used for SIO control and the sound registers) - fixed
+       `if_ie_registers`.
+    2. **DI now cancels a still-pending EI delay, and EI no longer
+       re-arms an already-pending one.** DI only cleared IME, not
+       `EI_PENDING`'s countdown, so a DI executed right after EI didn't
+       actually stop IME from turning on a moment later; EI
+       unconditionally reset the delay to 2 even mid-countdown, pushing
+       IME's activation out an extra instruction whenever EI executed
+       twice in a row. Fixed `rapid_di_ei` and `ei_sequence`.
+    3. **HALT was overcharging 4 T-cycles on every single wait** - its
+       own one-M-cycle decode cost was charged *after* the wait loop,
+       on top of whatever the loop itself already charged, instead of
+       up front like every other opcode. Since a HALT-then-wait-for-
+       VBlank main loop is close to universal across the library, this
+       was a broad per-frame pacing bug, not an edge case. Fixed
+       `halt_ime1_timing2-GS` and two others.
+    4. **Interrupt dispatch now re-reads IE/IF live during the actual
+       PC push**, matching real hardware, instead of picking a vector
+       once up front and pushing PC via the ordinary push()/rst()
+       helpers. Games that deliberately point SP at $FFFF/$FF0F right
+       before an interrupt (a real, documented hardware quirk) can have
+       the push's own write to IE/IF redirect or cancel that exact
+       dispatch. The precise rule (derived and hand-verified against
+       all 4 rounds of the test before implementing): a change from the
+       PC-high-byte write (SP-1) can still redirect/cancel the vector;
+       a change from the PC-low-byte write (SP-2) is always too late,
+       since the vector is already committed by then; IME is cleared
+       either way, cancellation or not. Fixed `ie_push`.
+    5. **The PPU now actually freezes while LCDC bit 7 (LCD enable) is
+       0** - previously LY and the STAT mode/coincidence bits kept
+       advancing even with the display "off" (the entire PPU state
+       machine in `cycleLength()` had no gate on this at all). Real
+       hardware freezes LY at 0 and stops recomputing STAT's mode and
+       LYC-coincidence bits the instant the display turns off, resuming
+       only once turned back on; a coincidence bit that goes from
+       false to true (not "was already true") right as the display
+       turns back on fires the STAT interrupt if that source is
+       enabled. Also made the LYC-coincidence bit recompute immediately
+       on a software write to LYC while the LCD is on (previously only
+       recomputed once per 80-456-cycle PPU mode transition - too
+       coarse for real hardware's effectively-live comparator), and
+       fixed STAT's unused bit 7 to read as 1 (same convention as IF
+       above). Fixed `stat_lyc_onoff`.
+  **Follow-up in the same session, after the user supplied the real
+  ROMs this project's testing has always relied on**: with real ROMs
+  available to validate against, revisited the CALL/PUSH/POP/RST/RET/
+  OAM-DMA-boundary cluster this section originally deferred (see the
+  Kirby's Pinball Land entry above and in "What's next" item 2 for the
+  real-ROM re-verification setup - ROMs kept local only, never
+  committed). One more genuine, isolated fix came out of it:
+  **`oam_dma_start` - CPU bus-blocking ("reads outside HRAM return $FF
+  during an active transfer") was tied directly to `dmaActive`, which
+  `doDMA()` sets the instant the trigger write happens - real hardware
+  only starts blocking 2 M-cycles *after* that write** (the test's own
+  diagram: M=0 write, M=1 still accessible, M=2 blocking begins).
+  Tracked with its own delay, independent of the existing
+  `dmaPendingStart`/`dmaCyclesElapsed` pair (which govern the *byte
+  transfer's* own start, a related but different question) since they
+  need different answers for a restarted DMA (a second $FF46 write
+  while a transfer is already active): confirmed via the test's own
+  two rounds that the previous transfer's blocking is never interrupted
+  by a restart, even though the restart does immediately take over the
+  actual source/byte-progress - so the blocking-delay state only gets
+  (re)armed by a genuinely fresh start, never by a restart mid-transfer.
+  Derived and hand-verified against both rounds before implementing.
+  29/67 → 30/67; re-verified against all 6 real ROMs (Dr. Mario,
+  Kirby's Dream Land 2, Kirby's Pinball Land, Pokemon Red/Yellow/
+  Crystal) - all render identically to the pre-fix baseline.
+
+  Went on to empirically trace `push_timing.gb` (temporarily
+  instrumenting `push()`/`doDMA()`/`DMAClock()` to print exact
+  cycle counts, rather than trusting hand arithmetic after an earlier
+  hand-derivation attempt on this exact test turned out to have a
+  silent error) to understand the *end*-of-DMA-blocking boundary -
+  the counterpart to the start boundary just fixed. Found the actual
+  root cause, and it's bigger than a boundary-off-by-one: `doDMA()`
+  (and the DIV-register write handler, confirmed via the same kind of
+  trace on `pop_timing.gb`) both run as a *synchronous side effect
+  inside `WriteMEM()`*, called from partway through their triggering
+  opcode's implementation - but that opcode still charges its *entire*
+  cost as a single lump-sum `cycleLength()` call at the very end. For
+  an opcode whose write is its last M-cycle (`LDH (n),A`, `LD (HL),A`),
+  crediting that whole lump sum as "time after the trigger" silently
+  over-counts by however many M-cycles happened *before* the write
+  within that same instruction (the opcode fetch, and any operand
+  read) - a systematic few-T-cycle bias, not a simple constant, since
+  the previous session's own regression sweep would have to have had a
+  test sensitive to that exact instruction's split to ever catch it.
+  `dmaPendingStart`'s existing "eat one whole `cycleLength()` call"
+  convention happens to net out correctly for `LDH (n),A` specifically
+  (its write already is the last M-cycle) but not in general - and
+  `pop_timing.gb`'s failure (still failing, unchanged) traces to the
+  identical root cause on the DIV-reset side. Fixing this properly
+  means giving simple, single-cycleLength-call write opcodes the same
+  fetch-then-execute split PUSH/POP/CALL/RST/RET already got - a
+  broad, opcode-table-wide restructuring in its own right, not a
+  narrow DMA-specific fix, and **deliberately not attempted this
+  session**: this is exactly the class of change the existing
+  `dmaPendingEnd`/`push_timing` regression history above warns about,
+  and getting it right needs a dedicated pass with its own full
+  regression sweep, not a same-session bolt-on to the DMA-start fix
+  above. `push_timing`, `pop_timing`, `call_timing` (and its `_2`/`_cc`
+  variants), `ret_timing`/`ret_cc_timing`/`reti_timing`,
+  `jp_timing`/`jp_cc_timing`, `add_sp_e_timing`, `ld_hl_sp_e_timing`,
+  and `rst_timing` all remain failing for this reason.
+
+  **Second follow-up, same session, once the user finished uploading
+  all 6 real ROMs: did the "opcode-table-wide restructuring" pass this
+  entry originally deferred.** Split `OP77`/`OP7E`/`OPE0`/`OPF0` (the
+  `LD (HL),A`/`LD A,(HL)`/`LDH (n),A`/`LDH A,(n)` family) into their
+  real per-M-cycle fetch/operand-read/access charges, matching PUSH/
+  POP/CALL/RST/RET's existing pattern - the concrete fix the previous
+  entry's root-cause analysis called for. Also found and fixed OAM
+  DMA's end-of-transfer timing: the bus-blocking restriction doesn't
+  lift the instant the 160th byte's own transfer completes - it stays
+  active for one more M-cycle beyond that (644T, not 640T), the
+  teardown-side counterpart to the already-fixed 2-M-cycle startup
+  latency.
+
+  This round of hand-derivation was rougher than the first: initial
+  attempts at each of these produced **real, confirmed regressions**
+  (splitting `OP77`+`OPE0` alone broke `tim00`/`tim01`/`tim10`/`tim11`/
+  `div_write`/etc. by shifting exactly when a DIV/TAC write becomes
+  visible to the timer edge-detector relative to a *different*
+  precisely-timed instruction sequence; fixing that by also splitting
+  `OPF0` then broke `div_timing` until `OP7E` got the same treatment;
+  and the DMA end-timing fix went through several self-contradictory
+  hand-derived values before being found **empirically instead** -
+  scanning candidate delays against `push_timing.gb`, `oam_dma_timing.gb`,
+  and `oam_dma_restart.gb` together and taking the one value all three
+  independently-authored tests agree on, after hand arithmetic on the
+  same three tests kept producing answers that satisfied one while
+  contradicting another). Every fix was re-verified against the full
+  acceptance sweep, `cpu_instrs`, Mooneye `mbc1`+`mbc5`, and - for the
+  first time this session - re-rendered against all 6 real ROMs
+  (Dr. Mario, Kirby's Dream Land 2, Kirby's Pinball Land, Pokemon
+  Red/Yellow/Crystal): all still render correctly, including confirming
+  Pokemon Red's title-screen walk animation is still cycling normally
+  frame-to-frame (a snapshot mid-animation looked like a regression at
+  first glance - it wasn't, just a different frame of the same loop).
+
+  **Result of this round: 30/67 → 35/67** (`push_timing`, `pop_timing`,
+  `div_timing`, `call_timing2`, `call_cc_timing2`, `rst_timing`).
+
+  **The remaining 9 tests in this cluster - `call_timing`/
+  `call_cc_timing`, `ret_timing`/`ret_cc_timing`/`reti_timing`,
+  `jp_timing`/`jp_cc_timing`, `add_sp_e_timing`, `ld_hl_sp_e_timing` -
+  were also resolved, later in the same session, once the user finished
+  uploading all 6 ROMs and asked to continue.** These hung
+  (`UNKNOWN`, not a clean `$42` fail): the CPU parked forever
+  re-executing `RST $38` at `$0038` (SP draining every iteration, since
+  nothing in these ROMs defines a real handler there - the design
+  relies on the DMA-blocked-read byte landing *within* HRAM, e.g.
+  `call_timing.gb`'s "the read is blocked, so the call target becomes
+  $FFCA/$FFDA", both valid HRAM addresses with real handlers copied
+  there).
+
+  Traced `call_timing.gb` directly and found the real bug - not a
+  timing-constant tweak but a **scope** error: the bus-blocking
+  restriction ("CPU reads outside HRAM return `$FF` during an active
+  DMA transfer") had been modeled as covering everything except HRAM,
+  when it should be scoped to the actual OAM range (`$FE00`-`$FE9F`)
+  the transfer is writing to. Real hardware's DMA controller only
+  contends with the CPU on the bus(es) it's actively using - these
+  tests all source from VRAM (a separate bus) and write to OAM, so
+  WRAM/ROM/echo-RAM stay normally accessible throughout. `call_timing.gb`
+  deliberately places its copied test procedure's opcode byte at
+  `$FDFE` - two bytes *before* real OAM, specifically so it reads
+  normally regardless of DMA timing, with only a later, real-OAM byte
+  meant to be boundary-sensitive - and the old "blocks everything"
+  model was blocking that supposedly-safe byte too, derailing control
+  flow into the unhandled RST $38 vector. Verified the fix doesn't
+  regress `push_timing`/`pop_timing`/`oam_dma_timing`/`oam_dma_restart`/
+  `oam_dma_start` (all of which specifically target true-OAM addresses,
+  so are unaffected by the narrower scope) before trusting it - fixed
+  the entire remaining hang cluster outright: `call_timing`,
+  `call_cc_timing`, `ret_timing`, `ret_cc_timing`, `reti_timing` all
+  now pass. 35/67 → 40/67.
+
+  The last 4 - `jp_timing`/`jp_cc_timing`, `add_sp_e_timing`,
+  `ld_hl_sp_e_timing` - no longer hung after that fix, but still failed
+  cleanly: a genuinely separate, already-identified gap from an earlier
+  session's own audit note ("Checked JP nnnn too while auditing... it
+  still reads both address bytes atomically via ReadWord()... not
+  fixed in this pass"). Gave `JP nnnn`/`JP cc,nnnn` (all 5 opcodes:
+  C2/C3/CA/D2/DA) and `ADD SP,e`/`LD HL,SP+e` the same fetch-then-
+  execute M-cycle split as OP77/OPE0/etc earlier in this entry. 40/67
+  → 42/67 → 44/67.
+
+  **Total for this cluster, across the full session: 21/67 → 44/67,
+  eleven commits, zero regressions** - every fix re-verified against
+  the full acceptance sweep, `cpu_instrs`, Mooneye `mbc1`+`mbc5`, and
+  all 6 real ROMs at every step (most late-session diffs came back
+  byte-identical to the prior baseline, confirming these opcodes
+  genuinely aren't exercised differently by any of the 6 games during
+  normal play). This closes out the entire CALL/PUSH/POP/RST/RET/JP/
+  ADD SP,e/OAM-DMA sub-instruction-timing family this project's own
+  history had flagged as high-regression-risk - none of it remains
+  failing (only the boot-ROM-dependent tests, the separate PPU
+  mode-timing cluster below, and `tima_write_reloading`/
+  `tma_write_reloading` do).
+
+  **Third follow-up, same session: the PPU mode-timing cluster this
+  entry originally deferred as "a similarly-sized, separate dedicated
+  effort" got most of the way done too**, once the user asked to keep
+  going after the CALL/PUSH/etc. cluster closed out. Six more real,
+  independently-verified fixes, each checked against the full
+  acceptance sweep, `cpu_instrs`, `mbc1`+`mbc5`, and all 6 real ROMs
+  (Pokemon Red's and Pokemon Yellow's title-screen animations each
+  shifted which exact frame lands at the fixed instruction-count
+  snapshot at two points in this round - confirmed both times, by
+  dumping several consecutive frames, that the animation itself is
+  still progressing normally, not corrupted):
+    1. **STAT interrupt (bit 1) also fires at VBlank when the mode=2
+       source is enabled** - real hardware fires it at the same
+       T-cycle as the dedicated VBlank interrupt whenever bit 5 is
+       set, even though entering VBlank isn't literally "mode 2".
+       Fixed `vblank_stat_intr-GS`.
+    2. **The STAT interrupt is level-triggered, not edge-per-condition**
+       - real hardware ORs every currently-enabled AND currently-true
+       condition (LYC=LY with bit 6, modes 0/1/2 with bits 3/4/5) into
+       one internal signal, and only fires on that signal's rising
+       edge; if it's already high when a second condition also becomes
+       true, no second interrupt fires until the signal drops back to
+       low first ("STAT IRQ blocking"). The old code requested an
+       interrupt independently at each condition with no shared state,
+       which also hid two real, separate bugs: mode 2's interrupt was
+       requested a *second* time when OAM search ended (entering mode
+       3, which has no STAT source of its own), and mode 0's interrupt
+       was wired to the wrong bit entirely (checked when *entering*
+       OAM mode - backwards - instead of when entering HBlank, which
+       had no check at all). New `UpdateStatLine()` computes the
+       composite signal and fires only on the rising edge, called from
+       every mode transition. Fixed `intr_2_0_timing`,
+       `intr_2_mode0_timing`, `intr_2_mode3_timing`.
+    3. **`UpdateStatLine()` needed calling from STAT and LYC writes
+       too, not just mode transitions** - newly *enabling* a source
+       while its condition is already true (e.g. writing STAT with bit
+       4 set while already in VBlank) is itself a rising edge, and
+       nothing about LY or the PPU mode changes when that happens.
+       Fixed `stat_irq_blocking`.
+    4. **CPU access to OAM is blocked during PPU modes 2 and 3**,
+       separately from the OAM-DMA blocking fixed earlier this
+       session - the PPU itself has exclusive access to OAM while
+       actively searching it (mode 2) or fetching sprite data (mode
+       3), real hardware's CPU reads back `$FF` for OAM during both,
+       independent of whether a DMA transfer is also active. Nothing
+       modeled this before. Fixed `intr_2_oam_ok_timing`.
+    5. **Mode 3's length now varies with SCX** - the background pixel
+       FIFO discards `(SCX mod 8)` pixels from the first tile it
+       fetches each scanline, costing that many extra T-cycles
+       (sampled once from SCX at the moment mode 3 begins), which
+       correspondingly shortens that line's HBlank. Real, independently
+       verified behavior worth keeping (smooth, non-tile-aligned
+       scrolling is common in real games) but **didn't fully fix
+       `hblank_ly_scx_timing-GS`** - its very first check (SCX=0, where
+       this fix contributes nothing) already fails, pointing at a
+       separate, still-unidentified gap in the interrupt-dispatch-to-
+       polling-read latency chain that test depends on.
+  **Result: 45/67 → 50/67.**
+
+  Not attempted this round, each a distinct, bounded-but-substantial
+  gap rather than more of the same fix:
+    - `lcdon_timing-GS`/`lcdon_write_timing-GS` - read `lcdon_timing-GS.s`
+      in full: it needs a documented "the PPU is 2 T-cycles late on
+      line 0 specifically, lines 1+ are normal" quirk modeled precisely
+      enough to reproduce an exact 24-entry table of LY/STAT/OAM-access/
+      VRAM-access values at specific T-cycle offsets after LCDC is
+      written, checked 3 times at slightly different phase offsets -
+      and critically, also needs **VRAM access blocking during mode 3**,
+      a feature that doesn't exist at all yet (only OAM got blocked this
+      session) and is much more central to real games' rendering code
+      than the OAM edge cases fixed above, so wiring it in carries real
+      regression risk that deserves its own dedicated, carefully-
+      verified pass rather than a bolt-on here.
+    - `intr_2_mode0_timing_sprites` - needs mode 3's length to also
+      vary with the number/position of sprites on the current line (on
+      top of the SCX penalty above), a separate, larger penalty model
+      this project doesn't have yet.
+    - `tima_write_reloading`/`tma_write_reloading` remain unchanged
+      from the already-documented prior attempt (exactly which
+      T-cycle(s) within TIMA's 4-cycle reload window a write does or
+      doesn't cancel the reload).
+
+  **Fourth follow-up, same session: VRAM access blocking during PPU
+  mode 3.** The first, lower-risk half of what `lcdon_timing-GS`/
+  `lcdon_write_timing-GS` need (see above). Added the mirror of the
+  existing OAM-blocking checks in `ReadMEM`/`WriteMEM`: while the LCD
+  is on and `videoMode == TRANSFERMODE`, CPU reads of `$8000-$9FFF`
+  return `$FF` and CPU writes to that range are dropped, exactly as
+  real hardware's CPU-vs-PPU VRAM bus contention works (mode 2's OAM
+  search doesn't touch VRAM, so it's mode 3 only, unlike OAM which is
+  blocked across both modes 2 and 3). The PPU's own rendering code
+  (`DrawBGline` etc.) reads the `VRAM[]` array directly rather than
+  through `ReadMEM`, so rendering itself is unaffected - only CPU
+  program access is gated.
+
+  Verified as the highest-regression-risk change attempted this
+  session, given how central VRAM access is to virtually every real
+  game's tile-fetching code (unlike OAM, touched more narrowly):
+  full Mooneye acceptance/ppu+timer+interrupts sweep (50/67, byte-
+  identical PASS/FAIL composition to the pre-change sweep - zero
+  tests flipped either direction), mbc1/mbc5 (18/21, matching the
+  pre-existing known-failure baseline), `cpu_instrs.gb` (still
+  11/11), and all 6 real ROMs (Kirby's Dream Land 2, Kirby's Pinball
+  Land, Dr. Mario, Pokemon Crystal, Pokemon Yellow, Pokemon Red) -
+  every single one produced a byte-identical framebuffer to the prior
+  round's verified-clean dump at the same fixed 5M-instruction
+  snapshot. Zero regressions.
+
+  As expected, `lcdon_timing-GS`/`lcdon_write_timing-GS` still fail on
+  their own (confirmed directly, not just via the sweep) - VRAM
+  blocking alone was never going to be sufficient; the still-missing
+  "PPU is 2 T-cycles late on line 0" quirk documented above is the
+  other, harder half of that pair and remains unimplemented.
+  **Result: still 50/67, but VRAM blocking is now a safely-verified
+  building block for the line-0-quirk work.**
+
+  **Fifth follow-up, same session: line 0's special post-power-on
+  timing.** Reverse-engineered the qualitative schedule directly from
+  `lcdon_timing-GS.s`'s own 24-entry expectation table (all 3 passes,
+  cross-referencing LY/STAT/OAM-access/VRAM-access at every sampled
+  M-cycle - the test's own "nops XXX" comments turned out to label
+  M-cycle counts, not T-cycles, once cross-checked against the actual
+  instruction timings between reads) rather than trusting the `.s`
+  file's own paraphrased "PPU is late by 2 T-cycles" comment, which
+  didn't match the derived numbers closely enough to be usable
+  directly. The real schedule: right after LCDC's power-on write,
+  line 0 spends a normal 80T in a "fake mode 0" phase (STAT reads
+  mode 0, but OAM/VRAM stay unblocked - it behaves like mode 2's
+  length without being mode 2), then goes straight to mode 3
+  (TRANSFERMODE), *skipping mode 2 (OAM search) entirely* - skipping
+  the search itself is why OAM has real, uninitialized-looking data
+  on the very first frame after power-on on real hardware. Mode 3
+  then runs its normal 172T (plus the usual SCX penalty), and the
+  line's closing HBlank is shorter than normal before LY increments
+  to 1 and every following line proceeds completely normally.
+
+  The *exact* size of that HBlank shortening is where hand-derivation
+  from the table's absolute M-cycle offsets (matching this project's
+  established, repeatedly-learned lesson about this exact kind of
+  arithmetic) proved unreliable: a first symbolic derivation of the
+  alignment between the LCDC write and the table's own "M-cycle 0"
+  reference point predicted a 4T-short HBlank (200T HBlank, 452T
+  total), which the harness's own Mooneye DUMP_HRAM state (fail_round/
+  fail_expect/fail_actual, which the test conveniently writes to
+  fixed, dumpable HRAM addresses on the very first mismatch) showed
+  was wrong by exactly one M-cycle once actually tested. Corrected
+  empirically against that same feedback instead of re-deriving by
+  hand: the real deficit is 8T, not 4T (448T total, not 452T) -
+  attributed here entirely to the closing HBlank (196T instead of
+  204T) since that's the only unconstrained parameter that reproduces
+  the correct total; the exact internal mode0->mode3 and mode3->hblank
+  boundary *positions* within line 0 aren't independently confirmed
+  by any check that currently passes (see below).
+
+  Implemented as a small 3-state flag (`lcdOnLine0Phase`: 0 = normal,
+  1 = in the fake-mode-0 phase headed for mode 3, 2 = in the
+  shortened closing HBlank headed for LY++), set by the LCDC power-on
+  write handler and consumed by two small intercepts in `cycleLength()`'s
+  existing mode-transition state machine - no change to line 1 onward,
+  which already goes through the same, unmodified general-case code.
+  Verified directly against the DUMP_HRAM state described above:
+  **all 24 of the test's `LY` checks now pass exactly** (previously
+  wrong from the very first read after M-cycle 20). Full regression sweep unchanged
+  at 50/67 (byte-identical composition), mbc1/mbc5 at the known 18/21
+  baseline, `cpu_instrs.gb` still 11/11, and 5 of 6 real ROMs
+  byte-identical to the prior round's dumps; Pokemon Red's dump
+  differed, confirmed benign via a sequential run of dumps a few
+  thousand instructions apart (same title screen, coherent bobbing-
+  logo animation across the sequence - just a different animation
+  phase landing at the fixed 5M-instruction snapshot, the same
+  pattern already seen and verified benign for this exact ROM earlier
+  in this project's history), not a rendering regression.
+
+  `lcdon_timing-GS` as a whole still fails overall - past the LY
+  checks, its STAT sub-check fails next, on **line 1** (the ordinary
+  line immediately following the special power-on line 0, not line 0
+  itself): at M-cycle 176 (relative to the LCDC write), my
+  implementation has already left mode 3 for HBlank, while the test
+  expects mode 3 to still be active there, only yielding at M-cycle
+  177 - i.e. real hardware's mode 3 on *this specific line* lasts
+  176T, not the standard 172T my engine (correctly) produces.
+  **Correction to an initial misreading of this same data**: earlier
+  drafting of this entry had the direction backwards (claimed my
+  mode 3 was holding 4T *too long*, and speculated it was a general
+  bug shared with `hblank_ly_scx_timing-GS`). Re-checking the raw
+  fail_expect/fail_actual bytes directly shows the opposite: my mode 3
+  ends 4T *too early* here, and `hblank_ly_scx_timing-GS`'s own
+  documented expectations (SCX=0 => 51 M-cycles/204T of HBlank, which
+  only holds together with a standard 80T mode 2 and 172T mode 3 to
+  sum to a normal 456T line) actually *confirm* this project's
+  existing, general-case 172T mode 3 is correct - ruling out the
+  general-bug theory and the `hblank_ly_scx_timing-GS` connection
+  entirely. What's actually going on: line 1 - specifically the one
+  immediately after a power-on line 0, not ordinary line 1s in
+  general - needs a handful of extra T-cycles in mode 3 that this
+  project doesn't model, plausibly a residual settling effect from
+  line 0's own glitched mode 3 (skipped OAM search, no primed
+  fetcher/FIFO state to carry over cleanly into the very next line).
+  Given the size of this session's line-0 investigation already, this
+  narrow, LCD-on-adjacent-only quirk was deliberately left for its own
+  pass rather than chased further here - it's a much smaller, more
+  specific gap than initially (mis)framed above. **Result: still
+  50/67 (this fix doesn't flip `lcdon_timing-GS`'s own pass/fail,
+  since its STAT check still fails - just on line 1 now, for a
+  precisely-identified reason, rather than line 0 for a completely
+  unmodeled one), but line 0's own timing is now real, verified-
+  correct, hardware-accurate behavior.**
+
+  **Sixth follow-up, same session: `tima_write_reloading`/
+  `tma_write_reloading`.** Both fixed. A prior session had already
+  correctly modeled TIMA's basic overflow-reload delay (reads as $00
+  for one M-cycle, then TMA - `tima_reload.gb` already passed) and a
+  TIMA write during that same M-cycle correctly cancelled the pending
+  reload (the written value sticking instead), but a first attempt at
+  this session's own re-investigation (hand-derived, guessing the
+  boundary was exactly at `timaReloadPending==1`) had zero effect once
+  actually tested - a reminder, yet again, that this project's own
+  M-cycle-offset arithmetic keeps being too easy to get wrong by hand.
+  Rather than keep guessing, cross-checked against SameBoy's own
+  timer implementation (a known-accurate reference core, fetched and
+  read directly rather than trusted from memory): its
+  `tima_reload_state` machine has *two* consecutive M-cycles after
+  overflow, not one - the first (`RELOADING`, matching this project's
+  existing "$00 for one M-cycle" behavior) still lets a TIMA write
+  cancel the reload as before, but the *second* (`RELOADED`, once
+  TIMECNT has already silently become TMA and reads look completely
+  ordinary again) silently ignores any TIMA write instead. Added a
+  second countdown (`timaWriteBlocked`, 4T/one M-cycle, starting the
+  instant `timaReloadPending` reaches 0) that gates exactly this
+  extra, otherwise-invisible window. Also ported SameBoy's TMA-write
+  behavior, which this project hadn't modeled at all: a TMA write
+  during *either* of these two windows immediately updates TIMA to
+  match the newly-written value too (real hardware's reload circuitry
+  reads TMA live while a reload is in flight, rather than only
+  latching it at the moment of overflow).
+
+  Verified: both tests now PASS outright (previously both FAIL) -
+  Mooneye's own success signature, not just a partial-check
+  improvement. Full acceptance sweep **50/67 -> 52/67**, with every
+  other test's PASS/FAIL unchanged (only these two flipped). mbc1/mbc5
+  at the known 18/21 baseline, `cpu_instrs.gb` still 11/11, and all 6
+  real ROMs byte-identical to the prior round's dumps - this only
+  touches the narrow TIMA-write-during-reload edge case, which none
+  of these ROMs exercise in a way that shows up in a single
+  fixed-instruction-count snapshot, so a fully clean diff here is
+  expected rather than surprising.
+
+  **Seventh follow-up, same session: mode 3's SCX penalty was a real
+  bug, plus a promising-but-inconclusive interrupt-timing lead on
+  `hblank_ly_scx_timing-GS`.** Investigating that test's own
+  documented SCX-penalty table ("(SCX mod 8) = 0 => nothing, 1-4 =>
+  50 M-cycles of HBlank, 5-7 => 49") surfaced two real, independent
+  bugs in the existing SCX-length code from earlier this session:
+  1. **The penalty itself was linear (`SCX mod 8` T-cycles), not the
+     real step function.** The background pixel FIFO only ever
+     resumes output in 4-pixel-aligned chunks, so a non-multiple-of-4
+     discard still costs a full extra 4T slot - i.e. `SCX mod 8` of
+     1-4 costs a flat 4T, 5-7 costs a flat 8T, not a smooth per-value
+     gradient. Fixed via a small `Mode3ScxPenalty()` helper (round
+     `SCX mod 8` up to the next multiple of 4).
+  2. **The penalty was never subtracted back out of HBlank.**
+     `HBLANK_CYCLES` was added as an unconditional flat 204T every
+     line, regardless of whatever penalty mode 3 had just taken - so
+     any line with a non-zero `SCX mod 8` grew to 460T or 464T total
+     instead of staying at the real, fixed 456T. This is a genuine,
+     independent bug (verified by direct T-cycle tracing of mode 3's
+     actual start/end points against a synthetic SCX=1 case) that
+     would have caused real, silent frame-timing drift in any game
+     that scrolls to a non-8-aligned SCX value - which is most of
+     them. Fixed by caching the penalty when mode 3 begins
+     (`currentLineMode3Penalty`, since SCX can change again before
+     mode 3 ends) and subtracting the same amount back out of
+     `HBLANK_CYCLES` when it ends.
+
+  Both fixes verified regression-free on their own (full sweep
+  unchanged, mbc1/mbc5 at 18/21, `cpu_instrs.gb` 11/11, 5/6 real ROMs
+  byte-identical - Pokemon Red's dump differed, confirmed benign via
+  the same sequential-dump technique used earlier this session, same
+  title-screen animation just at a different phase).
+
+  Getting `hblank_ly_scx_timing-GS` to actually pass needed one more
+  piece: empirically, its SCX=0 case only passed with an *additional*
+  4T delay between mode 0's STAT bits becoming visible and the mode=0
+  STAT interrupt actually firing (measured via a HALT-based round
+  trip whose every other component - interrupt dispatch, `ADD SP,e`,
+  `RET`, `CALL`, `NOP`, `LD A,(HL)` - is independently pinned by other
+  already-passing tests, leaving this as the one unaccounted-for gap).
+  That delay is a real, measured finding, but applying it broke
+  `intr_2_0_timing` (which measures the interval between mode 2's and
+  mode 0's STAT interrupts, and had been passing): delaying mode 0's
+  interrupt alone stretches that interval by 4T. Delaying mode 2's
+  interrupt too, bundled with mode 0's, was tried as a same-round fix
+  and *appeared* to have zero effect on `intr_2_0_timing`'s result -
+  **that specific claim turned out to be wrong; see the ninth
+  follow-up further below, which re-tested mode 2's delay in isolation
+  and found it has a large, real effect (and made genuine progress on
+  a different test) - it just doesn't happen to fix `intr_2_0_timing`
+  either way.** Given
+  `intr_2_0_timing` was a currently-passing test, the interrupt-delay
+  change was reverted entirely (confirmed by re-running the full
+  regression sweep with it removed: byte-identical to the pre-this-
+  round baseline) rather than accepted as a net-zero trade with a
+  hidden regression. The two SCX fixes above were kept (independently
+  justified, zero regression risk on their own); `hblank_ly_scx_timing-GS`
+  itself remains failing, but with a precisely quantified, reproducible
+  4T gap and a documented dead end (delaying mode 2 too) for whoever
+  picks this up next - a considerably narrower unknown than "still-
+  unidentified gap in the interrupt-dispatch-to-polling-read latency
+  chain" was before this round. **Result: acceptance sweep unchanged
+  at 52/67 (no new pass, no regression), but the SCX-penalty
+  compensation bug fix is real, independently valuable progress kept
+  from this investigation, and the interrupt-timing dead end is now
+  on record instead of needing to be rediscovered.**
+
+  **Eighth follow-up, same session: mode 3's per-sprite (OBJ) length
+  penalty, previously entirely unmodeled.** Implemented real hardware's
+  documented "OBJ penalty algorithm" (Pan Docs, gbdev.io/pandocs/
+  Rendering.html#obj-penalty-algorithm - fetched and read directly
+  rather than hand-recalled, given how easy this project has found it
+  to get exactly this kind of detail subtly wrong from memory): OBJs
+  intersecting the current line are considered leftmost-to-rightmost
+  (capped at the first 10 in OAM order, then sorted by screen
+  position); each incurs a flat 6T fetch cost, plus - only for the
+  *first* OBJ landing in any given BG tile this line - up to 5 more T
+  for how far into that tile its leftmost pixel falls (tracked via a
+  small per-line "visited tiles" list); a second OBJ landing in an
+  already-considered tile skips that extra part. An OBJ with OAM X of
+  exactly 0 (fully off the left edge) is a documented exception,
+  always contributing a flat 11T - empirically found via Mooneye's
+  own `intr_2_mode0_timing_sprites.gb` (which sweeps sprite count,
+  position, and grouping in one ROM) that this exception *also*
+  participates in the same tile-sharing discount as everything else
+  (first off-screen OBJ costs 11T, a second one costs just the
+  ordinary 6T) - Pan Docs' wording doesn't make this explicit, and a
+  naive flat-11-per-sprite reading (which was tried first) matched
+  only the simplest single-sprite case, not the N=2..10-sprites-at-
+  X=0 block. Verified this whole formula by hand against all 10 of
+  that block's cases plus 8 more sweeping X=1..8 with 10 sprites each
+  (18 independent data points, all exactly matching once the right
+  T-cycle-to-test-unit relationship was found) before touching any
+  code - the same "verify precisely by hand against real ground truth
+  before implementing" discipline this project has repeatedly needed
+  after getting cycle arithmetic wrong from memory or a paraphrase.
+
+  Window tiles aren't modeled (this project has no window-fetch-timing
+  model at all yet, and this test never enables the window, so it
+  wasn't needed to pass this specific ROM).
+
+  `intr_2_mode0_timing_sprites.gb` itself still fails - but on its
+  very first, simplest case (a single sprite at X=0), which is
+  *unaffected* by whether the sprite-penalty formula is right at all
+  (confirmed directly: it fails identically with the sprite penalty
+  completely disabled, i.e. this project's pre-existing zero-sprite-
+  penalty baseline). This test catches its timing reference via the
+  exact same "HALT waiting on a mode=2 STAT interrupt" mechanism as
+  `hblank_ly_scx_timing-GS`/`intr_2_0_timing` from the follow-up
+  above, so this is very likely the *same*, not-yet-understood
+  interrupt-timing gap blocking it too, rather than anything specific
+  to sprites - consistent with, and adding a third data point to, the
+  dead end already on record. Verified regression-free regardless:
+  full acceptance sweep unchanged at 52/67, mbc1/mbc5 at 18/21,
+  `cpu_instrs.gb` 11/11, and all 6 real ROMs byte-identical to the
+  prior round's dumps (this time including Pokemon Red, which had
+  shifted in several previous rounds this session - a clean diff
+  across the board). **Result: acceptance sweep unchanged at 52/67,
+  but real, hand-verified sprite-penalty modeling is now in place for
+  when the underlying interrupt-timing gap is eventually found - at
+  which point this test (and likely `hblank_ly_scx_timing-GS`/
+  `intr_2_0_timing` alongside it) should just start passing without
+  further sprite-specific work.**
+
+  **Ninth follow-up, same session: revisited the interrupt-timing dead
+  end with a fresh angle, and corrected a wrong finding from earlier
+  in this session.** The seventh follow-up above claimed "delaying
+  mode 2's STAT interrupt by the same 4T as mode 0's measured zero
+  effect on `intr_2_0_timing`" - re-tested that in isolation this
+  round (mode 2 delayed, mode 0 left alone; the earlier round only
+  ever tested it bundled with mode 0's delay) and that claim was
+  simply wrong, apparently a testing mistake rather than a real
+  result: delaying mode 2 alone has a large, real effect. It **breaks**
+  `intr_2_0_timing` on its own (previously passing, now fails the same
+  way mode 0's delay alone does) - so the two delays are *not*
+  independent/additive the way the seventh follow-up assumed. It also
+  makes real, measurable progress on `intr_2_mode0_timing_sprites.gb`:
+  with mode 2 delayed, testcases #00-#09 (all ten of the "N sprites at
+  X=0" block) now pass outright (confirmed via the ROM's own on-screen
+  "TEST #NN FAILED" readout, the most direct ground truth available -
+  more reliable than guessing WLA-DX's `\@` numbering scheme, which
+  this round's investigation also found starts at 0, not 1, contrary
+  to an unstated assumption made while first reading the ROM's HRAM
+  state). Failure moves to testcase #0A (10, the first "10 sprites at
+  X=1" case) - real forward progress, not a wash, even though the test
+  as a whole still fails.
+
+  Combining both delays (mode 0 *and* mode 2, each independently
+  delayed by 4T) was tried too, on the theory that keeping them
+  matched might preserve whatever relationship `intr_2_0_timing`
+  depends on: it does *not* - `intr_2_0_timing` fails identically
+  (byte-for-byte the same wrong register state) whether mode 0 is
+  delayed alone or both are delayed together, and `intr_2_mode0_timing_sprites`
+  stops at the exact same testcase #0A either way (mode 0's delay has
+  no effect on it at all - consistent with that test's measurement
+  never touching mode 0's interrupt in the first place, see below).
+  So the two tests' requirements don't reconcile via any combination
+  of flat 4T delays tried so far.
+
+  The likely reason `intr_2_0_timing` resists both individually and
+  combined: unlike the other three tests here, its *second* half
+  (`setup_and_wait_mode0`) doesn't poll STAT directly or use HALT - it
+  arms mode 0's STAT interrupt and busy-loops ("xor a; ld b,a; -inc b;
+  jr -") waiting to be *interrupted* by it mid-loop, then reads
+  whatever B reached. That's a third distinct measurement mechanism
+  (HALT-catch, direct-STAT-poll, and now interrupt-mid-active-loop),
+  and it may have its own timing subtlety independent of the "STAT
+  bits visible vs. interrupt fires" gap the other three tests seem to
+  share. Given three separate flat-4T-delay combinations were tried
+  and none reconciles all four tests at once, further guessing wasn't
+  pursued this round - the delay experiment (all of it) was reverted
+  in full and confirmed byte-identical to this session's last clean
+  commit via a fresh regression sweep, so no code changes came out of
+  this follow-up. **Result: no code change, acceptance sweep unchanged
+  at 52/67, but a corrected and considerably more precise picture of
+  the interrupt-timing gap for whoever picks it up next** - mode 0
+  and mode 2 both plausibly need their own 4T interrupt-firing delay
+  (real, reproducible effects, not guesses), `intr_2_0_timing`'s
+  interrupt-mid-active-loop mechanism is the likely odd one out and a
+  good next place to look, and `intr_2_mode0_timing_sprites`'s
+  testcase #0A (10 sprites at X=1, not X=0) is now a precise, narrow
+  next data point once mode 2's delay is safe to apply.
+
+  **Tenth follow-up, same session: pinned down exactly why
+  `intr_2_0_timing` resists the delay fix, with hard cycle-level
+  data.** Added a trace at the actual interrupt-dispatch entry point
+  (not just the STAT rising-edge, which fires every line regardless of
+  whether anything is watching) to directly measure the T-cycle gap
+  between catching mode 2's interrupt and catching mode 0's, for both
+  of this test's two rounds (`test_iter 4` producing D, `test_iter 3`
+  producing E - the two nop-delay values differ by exactly one M-cycle
+  between them). **With no delay applied at all** (this test's own
+  currently-passing baseline), that gap is a fixed 252T for *both*
+  rounds regardless of their different nop counts - expected, since
+  mode 0's real firing instant is set entirely by the PPU's own
+  mode2+mode3 duration and doesn't care what the CPU is doing
+  in-between; the nop count only changes how much of that fixed window
+  is left for the measurement loop to run in, not the window itself.
+
+  **With both mode 2 and mode 0 delayed by 4T** (the combination
+  tried in the ninth follow-up), the gap does *not* shift by a uniform
+  amount for both rounds, which is the actual reason this test breaks:
+  round A's (`test_iter 4`, producing D) gap grew by 8T instead of the
+  expected net 4T (mode 0's own +4T, since mode 2's +4T dispatch delay
+  shifts the measurement loop's own start later by the same amount and
+  should cancel out) - checked directly against the ROM's actual D/E
+  register values via `setup_assertions`/`assert_d`/`assert_e`, not
+  inferred: D lands on $08 (one whole extra loop iteration beyond the
+  expected $07). Round B's (`test_iter 3`, producing E) gap shifted by
+  exactly the expected 4T, and E is still correctly $08 - **only round
+  A breaks**, and the two rounds differ from each other only in that
+  one-M-cycle nop-count. This rules out "the model is fundamentally
+  wrong" (a genuinely broken model would be expected to break both
+  rounds, or neither) and points at something alignment/parity-
+  sensitive: `intr_2_0_timing`'s own measurement loop ("inc b; jr -")
+  has two different check-points 4T apart in its 16T period, and
+  exactly which one a given delayed interrupt instant rounds up to
+  can flip depending on sub-4T-scale alignment this project's engine
+  has no way to represent - `cycleLength()` only ever advances in
+  whole CPU-instruction-cost chunks (4, 8, 12T...), never at finer
+  granularity, so two scenarios that differ by less than one CPU
+  M-cycle in when an event *conceptually* happens can't be told apart
+  here. This is a plausible, mechanically consistent explanation for
+  why three flat-4T-delay combinations all failed this one test while
+  helping the other two - not certain, but well-supported by the
+  round-A-breaks/round-B-doesn't asymmetry, which a purely-wrong-model
+  theory doesn't explain as cleanly. Reverted again in full (confirmed
+  byte-identical via a fresh sweep); this remains a genuine, currently
+  unimplementable-without-deeper-architecture-work gap rather than a
+  simple bug, so it's being set aside for now rather than continuing
+  to spend this session's remaining effort on it. **Result: no code
+  change, sweep still 52/67, but the interrupt-timing investigation
+  now has a concrete, falsifiable explanation on record (sub-4T
+  alignment sensitivity in `intr_2_0_timing`'s specific measurement
+  loop) instead of an open "doesn't reconcile" mystery - worth
+  revisiting if this project ever moves to finer-than-M-cycle PPU/CPU
+  interleaving, but not a good use of further effort at the current
+  architecture's resolution.**
+
+  **Eleventh follow-up, same session: real, verified progress on the
+  line-1-after-power-on mode-3-length quirk, plus a newly-found deeper
+  layer underneath it.** The eighth follow-up (this session) narrowed
+  `lcdon_timing-GS`'s remaining STAT-sub-check failure to line 1 -
+  specifically the one right after a power-on line 0 - needing mode 3
+  to hold 4T longer (176T, not the standard 172T) before yielding to
+  HBlank. Implemented directly: a one-shot flag
+  (`lcdOnLine1ExtraPending`) set the instant line 0's own special
+  handling finishes, adding the 4T to the very next line's mode 3
+  length and then clearing itself, so every line after that goes
+  through the ordinary, unmodified code path. Verified via Mooneye's
+  own `DUMP_HRAM`-readable failure state: the STAT sub-check's
+  previously-failing index (the line-1 mode-3-length check) now
+  matches exactly. Confirmed regression-free the usual way: full
+  acceptance sweep unchanged at 52/67 (this doesn't flip
+  `lcdon_timing-GS` to PASS outright, only moves its own internal
+  failure point further - see below), mbc1/mbc5 at 18/21,
+  `cpu_instrs.gb` 11/11, and all 6 real ROMs byte-identical to the
+  prior round's dumps.
+
+  Moving past that check exposed a **second, separate, deeper**
+  timing gap on line 0 itself, not line 1: right at the boundary
+  where line 0's initial "fake mode 0" phase hands off to mode 3 (the
+  M-cycle position the STAT test's pass2/pass3 straddle - see the
+  fifth follow-up earlier in this document for the schedule this
+  refers to), the transition needs to become visible one read-instant
+  earlier than the current, already-independently-verified-correct
+  80T fake-mode-0 duration places it. Tried shifting that duration
+  (compensating with an equal-and-opposite change to the immediately
+  following mode 3's own length, to keep its own already-correct end
+  point and the line's total length both unchanged) across several
+  candidate values (-1T, -2T, -3T, -4T, with matching compensation).
+  Only a full -4T/+4T pair actually moved the target boundary (matching
+  this project's now-familiar finding that `VideoCyclesLeft`'s
+  crossing point can only shift in whole-M-cycle steps when the CPU's
+  own instruction-cost charges are always multiples of 4T) - but doing
+  so unexpectedly broke the *next* boundary down the line (mode 3's
+  own end point, previously correct), even though the arithmetic
+  predicts it should cancel out exactly (shorter fake-mode-0 + longer
+  mode 3 = same total, same absolute end point). It doesn't, in
+  practice - almost certainly because the exact overshoot carried
+  across the first boundary (how far `VideoCyclesLeft` actually laps
+  past zero, which depends on precisely which CPU instruction's charge
+  causes the crossing, not just the arithmetic sum) differs between the
+  two threshold values, so the two boundaries don't shift as a clean,
+  independent pair the way flat algebra suggests. None of the
+  combinations tried get both boundaries right at once. Reverted this
+  specific piece back to the plain, original 80T/172T values (keeping
+  only the verified `lcdOnLine1ExtraPending` fix); confirmed via a
+  fresh full regression sweep and all 6 real ROMs that the kept state
+  is byte-identical to the fully-verified baseline. **Result: real,
+  net-positive, verified progress (the line-1 mode-3-length quirk is
+  fixed and kept), plus a precisely located next boundary to chase -
+  the fake-mode-0-to-mode-3 handoff within line 0 itself needs to
+  land 1 M-cycle earlier without disturbing mode 3's own already-
+  correct end point, which needs either finding the actual missing
+  ingredient (not just threshold-shifting) or accepting some overshoot-
+  tracking refinement this project's current `VideoCyclesLeft` model
+  doesn't yet carry.**
+
+  **Twelfth follow-up, same session: built Mooneye's *full* test suite
+  (`make all`) for the first time, rather than just the previously-
+  explored `acceptance/{ppu,timer,interrupts}` + top-level subset, and
+  fixed all 3 newly-discovered failures.** This surfaced three entirely
+  unexplored categories this project had never run before:
+  `acceptance/bits`, `acceptance/instr`, and `acceptance/oam_dma`. Of
+  the 7 tests in these categories, 4 were already passing
+  (`mem_oam`, `reg_f`, `daa`, `basic`) and 3 were failing:
+
+  - `reg_read.gb` - `$FF46` (the DMA register) had no `ReadMEM` case at
+    all and fell through to the generic I/O default, always reading
+    back `0x00` regardless of what was written. Real hardware's DMA
+    register is a plain write-then-read-back latch - always readable,
+    fully reflecting the last byte written, independent of any transfer
+    in progress. Fixed by adding a `DMAREG` state variable (set at the
+    top of `doDMA()`) and the missing `ReadMEM` case.
+
+  - `sources-GS.gb` - failed at its `test_fe00` case. Cross-referencing
+    the test's own data-setup (`ram_pattern_1` written to both `$C000`
+    and `$DE00`, `ram_pattern_2` to `$DF00`) against the adjacent
+    already-passing `test_e000` (source `$E000`, echoing WRAM `$C000`)
+    showed real hardware's OAM DMA source-address decoder doesn't fully
+    decode the `$FE00`-`$FFFF` range: source addresses there wrap down
+    to `$DE00`-`$DFFF` (subtract `$20` from the high byte) instead of
+    reading literal OAM/HRAM/IO. Fixed in `doDMA()`'s computation of
+    `dmaSourceBase`.
+
+  - `unused_hwio-GS.gb` - a DMG-mode-specific test (its own header notes
+    it's expected to pass on DMG/MGB/SGB/SGB2 and fail on CGB/AGB/AGS)
+    checking that every unused bit in implemented `$FFxx` I/O registers,
+    and every genuinely unmapped `$FFxx` address, reads back as `1`.
+    Found and fixed four separate gaps, each isolated via a fresh
+    `DUMP_HRAM` readout pinpointing exactly which register/mask the test
+    was currently parked on:
+    - `P1`/`$FF00`: the joypad-select write paths (`b==0x10`/`b==0x20`)
+      did `P1 &= 0x0F`, clobbering the always-1 unused bits 6-7 down to
+      0. Fixed by OR-ing `0xC0` into the read path (matching the
+      existing pattern already used for `SERIALCONTROL`/`$FF02`).
+    - `TAC`/`$FF07`: unused bits 3-7 read back as whatever `TIMCONT`
+      held (usually 0) instead of forced 1s. Fixed with a `| 0xF8` on
+      read.
+    - Genuinely unmapped `$FFxx` I/O (`$FF03`, `$FF08`-`$FF0E`, `$FF15`,
+      `$FF1F`, `$FF27`-`$FF29`, and most of `$FF4C`-`$FF7F`): the
+      switch's `default` case returned `0x00` (real open-bus behavior on
+      this hardware is `0xFF`). Fixed by changing the default to `0xFF`.
+    - The GBC-only registers in `$FF4C`-`$FF7F` (`KEY1`, `VBK`, `HDMA5`,
+      `BCPS`/`BCPD`, `OCPS`/`OCPD`, `SVBK`) had read handlers that
+      always exposed their backing state (OR'd with the documented
+      unused-bit mask) regardless of `GBC_MODE` - correct on real CGB
+      hardware, but wrong for this DMG-mode test ROM, where those
+      addresses are entirely unmapped on real hardware and must read
+      `0xFF` like any other unmapped address. Their write-side handlers
+      were already correctly gated on `GBC_MODE` (confirmed by reading
+      the surrounding code); only the read side needed the same gating,
+      falling back to `0xFF` when `!GBC_MODE`.
+
+  All 7 tests in the newly-discovered categories now pass (was 4/7).
+  Confirmed regression-free: full acceptance sweep byte-identical to the
+  prior round's baseline (52/67, diffed line-by-line against the saved
+  sweep file), mbc1/mbc5 at 18/21 (the 3 failures -
+  `multicart_rom_8Mb`/`rom_16Mb`/`rom_8Mb` - independently confirmed
+  pre-existing by rebuilding and re-running against a stashed pre-change
+  copy of `emu.c`, not something this round introduced), `cpu_instrs.gb`
+  11/11, and all 6 real ROMs re-dumped and visually compared against
+  this session's earlier dumps of the same ROMs at the same cycle count
+  - identical framebuffers throughout (including Pokemon Crystal's
+  "designed only for use on the Game Boy Color" splash screen at the
+  dump's cycle count, confirmed pre-existing via an earlier round's saved
+  dump rather than a new regression from the `GBC_MODE`-gating change
+  above, since that change only affects reads on a cart where `GBC_MODE`
+  is already 0).
+
+  **Thirteenth follow-up, same session: fixed MBC2's RAMG/ROMB address
+  decoding, found by running `emulator-only/mbc2` for the first time.**
+  With the full Mooneye suite now being built (twelfth follow-up above),
+  `emulator-only/mbc2` turned out to have two failures alongside its 5
+  existing passes: `bits_ramg.gb` and `bits_romb.gb`. Both write across
+  the *entire* `$0000`-`$3FFF` range (not just their own nominal half)
+  checking exactly which addresses in that range actually gate RAM
+  enable (RAMG) versus select the ROM bank (ROMB). Every other MBC this
+  project implements (MBC1/3/5) decodes that split the same way: address
+  bit 14 divides it cleanly into `$0000`-`$1FFF` (RAMG) and
+  `$2000`-`$3FFF` (ROMB), which is exactly how `WriteMEM`'s existing
+  `loc <= 0x1FFF` / `else if (loc <= 0x3FFF)` structure was written.
+  MBC2 is different at the hardware level: real MBC2 only has *one*
+  address line (A8, bit 8) wired into the mapper for this decision, not
+  the wider bit-14 split - so e.g. `$0100` (A8=1) is actually ROMB, and
+  `$2000` (A8=0) is actually RAMG, both the *opposite* of what the
+  generic bit-14 split would say. This project's existing MBC2 handling
+  sat inside that same generic split (RAMG only recognized in
+  `$0000`-`$1FFF`, ROMB only in `$2000`-`$3FFF`), so it was silently
+  wrong across roughly half the addresses a real game could use for
+  either register - it happened to still work for `$0000`-`$00FF` and
+  `$3F00`-`$3FFF` (the addresses actual games conventionally use), which
+  is presumably why this went unnoticed until a test ROM deliberately
+  swept the entire range. Fixed by giving MBC2 its own dedicated branch
+  ahead of the generic split, dispatching purely on `loc & 0x0100`
+  across the combined `$0000`-`$3FFF` range, keeping the already-correct
+  4-bit-bank/0-becomes-1 ROMB quirk and the RAMG enable/battery-save
+  logic exactly as they were - just gated on the right addresses now.
+  Verified via Mooneye's emulator-only/mbc2/bits_ramg.gb and
+  bits_romb.gb (both now PASS, `mbc2` category now 7/7, up from 5/7).
+  Confirmed regression-free: full acceptance sweep byte-identical to
+  the baseline (52/67), mbc1 unchanged (10/13, same 3 pre-existing
+  failures), mbc5 unchanged (8/8), `cpu_instrs.gb` 11/11, and all 6 real
+  ROMs (including Kirby's Pinball Land, the one MBC2 title in the local
+  real-ROM set) re-dumped and byte-identical to the prior round's
+  framebuffers at the same cycle count.
+
+  Also worth recording: building the full suite surfaced one more
+  category this round, `madness/mgb_oam_dma_halt_sprites.gb` (an
+  obscure HALT-bug/OAM-DMA/sprite-rendering edge case specific to the
+  Game Boy Pocket). It's pathologically slow in this project's
+  interpreter - roughly 30,000 instructions/second on this ROM
+  specifically, versus 400,000+/second on ordinary ROMs like
+  `cpu_instrs.gb` - to the point that reaching even a 1,000,000-
+  instruction cap doesn't complete in 30 real seconds, let alone the
+  usual 30,000,000-instruction cap. Confirmed via a throwaway git
+  worktree at the prior commit that this slowness (and the resulting
+  inability to reach a PASS/FAIL/hang verdict in any reasonable time)
+  already existed before this round's changes - not a regression, just
+  a previously-unbuilt, very obscure edge-case test this project has
+  never been able to evaluate. Not chased further this round: `madness/`
+  is an informal stress-test category (not `acceptance/`), and whatever
+  is making this specific ROM's HALT-heavy code path so slow would need
+  its own dedicated investigation separate from this round's DMA/HWIO/
+  MBC2 fixes.
+
+  **Fourteenth follow-up, same session: researched the still-stuck
+  `hblank_ly_scx_timing-GS`/`intr_2_mode0_timing_sprites`/`intr_2_0_timing`
+  interrupt-timing cluster against Mooneye GB's own reference emulator
+  source (the actual implementation these test ROMs were built from,
+  not just their black-box pass/fail behavior) - found a real, cited
+  mechanism, but the direct translation attempt didn't work and was
+  reverted; the investigation nonetheless narrowed the problem
+  considerably.** Fetched and read
+  `core/src/hardware/ppu.rs` from github.com/Gekkio/mooneye-gb directly
+  (not summarized secondhand). Its `emulate()` function contains this,
+  verbatim:
+  ```rust
+  self.cycles -= 1;
+  if self.cycles == 1 && self.mode == Mode::AccessVram {
+    // STAT mode=0 interrupt happens one cycle before the actual mode switch!
+    if self.stat.contains(Stat::HBLANK_INT) {
+      ctx.request_t34_interrupt(InterruptLine::STAT);
+    }
+  }
+  ```
+  Confirmation, straight from the authoritative source, that mode 0's
+  STAT interrupt is *requested* a full M-cycle before the STAT
+  register's visible mode bits actually flip to 0 - a genuine,
+  deliberate hardware quirk, not a simplification or a test-ROM
+  idiosyncrasy. This matters because Mooneye's own model can express
+  this exactly: `emulate()` is called once per single M-cycle, so
+  "1 cycle before the switch" is always a clean, unambiguous instant.
+
+  Implemented the closest analog in this project: added an `extraMode0`
+  parameter to `UpdateStatLine()` (mirroring the existing `extraMode2`
+  parameter already used for the analogous mode-2-at-VBlank-entry
+  quirk), and a check in `cycleLength()`, before `VideoCyclesLeft -=
+  sysCycle`, firing it when `videoMode == TRANSFERMODE && VideoCyclesLeft
+  > 4 && (VideoCyclesLeft - sysCycle) <= 4` - i.e. "this call's
+  consumption is about to carry the countdown from above 4 down to 4 or
+  less while still in mode 3," the closest this project's architecture
+  can get to Mooneye's exact single-M-cycle checkpoint.
+
+  Empirically, this **broke `intr_2_0_timing`** (a previously-passing
+  test) **while making zero observable difference to
+  `hblank_ly_scx_timing-GS`** (still fails, byte-identical `DUMP_HRAM`
+  output to before the change) - confirmed via temporary debug tracing
+  added to the new branch (`fprintf` on every firing, showing `LY`,
+  `LCDSTATUS`, `sysCycle`, and `VideoCyclesLeft`). The trace explains
+  why: at the exact point `hblank_ly_scx_timing-GS`'s critical mode-3
+  end falls, the instruction executing there has `sysCycle=12` (a
+  single 3-M-cycle-cost `cycleLength(12)` call, not split into
+  individual 4T chunks), and `VideoCyclesLeft` is 8 going into it - so
+  the new "1 M-cycle early" checkpoint (`VideoCyclesLeft` crossing 4)
+  and the real mode-switch checkpoint (`VideoCyclesLeft` crossing 0)
+  both fall *inside that same lumped call*, meaning the "early" fire
+  and the real transition's own `UpdateStatLine` call both run within
+  the same C function invocation - the same CPU-instruction boundary -
+  so nothing about when the interrupt becomes observable to a polling
+  loop actually moves. This is a precise, evidenced instance of the
+  architectural gap the whole cluster has been running into all
+  session: Mooneye's (and real hardware's) reference model evaluates
+  the PPU state machine at true single-M-cycle granularity, with no
+  exceptions, while this project's `cycleLength()` is called with a
+  single instruction's *entire* multi-M-cycle cost in one lump at most
+  call sites (`cycleLength(8)`, `cycleLength(12)`, `cycleLength(20)`,
+  etc. - a `grep` this round found dozens of these) - only the specific
+  instructions this session's earlier rounds already identified as
+  needing sub-instruction accuracy (`CALL`/`PUSH`/`POP`/`RST`/`JP`/
+  `ADD SP,e`/OAM-DMA) were ever split into individual `cycleLength(4)`
+  calls. Any timing event that needs to land strictly *inside* one of
+  the still-lumped instructions - exactly what "1 M-cycle before a
+  mode switch" needs whenever that boundary happens to fall inside one
+  of them - is structurally unable to produce an observable effect in
+  this architecture, no matter how correct the offset itself is.
+  `intr_2_0_timing` broke instead of showing zero effect only because
+  its own critical instant apparently falls on a *different*
+  instruction/timing alignment where the lumped call's boundaries
+  don't coincide the same way - not because the underlying idea is
+  wrong there and right elsewhere.
+
+  Reverted in full per this project's standing rule against keeping a
+  net-negative (here, actually net-negative, not merely net-zero:
+  broke one test, fixed none) trade - confirmed via a fresh full
+  regression sweep byte-identical to the pre-round baseline (52/67)
+  after `git checkout -- psx-gbc/emu.c`. **Result: no code change kept,
+  but the cluster's root cause is now far better understood and
+  precisely evidenced (not just suspected) - the fix isn't a threshold
+  or a direction to tune, it's identifying exactly which of this
+  project's still-lumped multi-M-cycle instruction opcodes fall on each
+  failing test's specific critical boundary and splitting *those*
+  particular `cycleLength(N)` call sites into individual `cycleLength(4)`
+  calls, the same mechanical treatment already proven to work for
+  `CALL`/`PUSH`/`POP`/`RST`/`JP`/`ADD SP,e` earlier this session - not
+  a blanket rewrite of every instruction, which would be both far
+  riskier and unnecessary (most instructions never execute at a
+  timing-critical PPU boundary). Whoever picks this up next should
+  start by identifying the exact opcode executing at each failing
+  test's critical instant (the debug-tracing technique used this round
+  - a temporary `fprintf` gated behind a `#if defined(DEBUG_*)` block,
+  triggered from inside `cycleLength()`'s existing boundary checks -
+  is a reusable way to find it) rather than guessing from the opcode
+  table alone.**
+
+  **Fifteenth follow-up, same session, on the experimental branch
+  `claude/ppu-per-mcycle-refactor`: did the per-M-cycle restructuring the
+  fourteenth follow-up called for, then re-tried the early-mode0-interrupt
+  fix with full precision - and got a conclusive, valuable negative
+  result, not the hoped-for fix.** Restructured `cycleLength()`'s entire
+  video/LY state machine from a single lumped `VideoCyclesLeft -=
+  sysCycle` + one-time boundary check into a `for` loop over `sysCycle`,
+  one T-cycle per iteration, re-running the full mode-transition check
+  every single iteration (every `return` inside that block became
+  `continue`). This is a pure restructuring - verified via a full
+  regression battery (67-test sweep byte-identical line-by-line, all 7
+  oam_dma/bits/instr tests, mbc1/mbc5/mbc2 at 25/28 with the same 3
+  pre-existing mbc1 failures, `cpu_instrs.gb` 11/11, all 6 real ROMs
+  byte-identical) showing genuinely zero behavioral change on its own -
+  committed as its own isolated checkpoint (`3e5a9bd`) specifically so
+  this architectural improvement is kept and usable regardless of what
+  happened next. It also fixes a latent bug as a side effect: a single
+  lumped call spanning *two* mode-transition boundaries at once used to
+  silently only process the first, leaving the second to be picked up
+  late by some unrelated later call - the per-T-cycle loop can no longer
+  do that, since it re-checks from scratch every iteration.
+
+  With that foundation in place, re-implemented the early-mode0-interrupt
+  fix from the fourteenth follow-up, this time as an *exact* check
+  (`videoMode == TRANSFERMODE && VideoCyclesLeft == 4`, firing precisely
+  once per mode-3 period, T-cycle-exact) rather than the previous fuzzy
+  range test that could get swallowed by a lumped multi-cycle call.
+  Also directly verified, by fetching and reading Mooneye GB's
+  `interrupts.rs`, that its `request_t34_interrupt` and
+  `request_t12_interrupt` are functionally *identical* in the actual
+  implementation (`*self |= interrupt` both ways) - the T1/T2 vs T3/T4
+  naming carries no separate sub-M-cycle delay in mooneye's own code, so
+  there was no hidden extra offset being missed; a straightforward "set
+  the IF bit at this exact tick" is genuinely the whole mechanism.
+
+  Result: **identical to the fourteenth follow-up's outcome, despite the
+  now-exact precision** - `intr_2_0_timing` (previously passing) still
+  breaks, and `hblank_ly_scx_timing-GS`'s own `DUMP_HRAM` failure state
+  is *byte-identical* to the completely-unmodified baseline (not just
+  "still fails" - literally the same bytes, meaning the fix changed
+  nothing observable about this test's outcome at all, even though the
+  new code path does demonstrably execute during its run). This is a
+  materially stronger, more conclusive result than the fourteenth
+  follow-up's: since imprecision/call-lumping is now ruled out as an
+  explanation (the check is exact, and mooneye's own mechanism has no
+  hidden sub-M-cycle wrinkle either), **the mode-0-STAT-interrupt-fires-
+  1-M-cycle-early quirk, while real, confirmed hardware behavior, is
+  conclusively *not* the source of `hblank_ly_scx_timing-GS`'s remaining
+  4T gap.** Whatever this project's own seventh/tenth follow-up
+  empirically measured earlier this session (finding that *delaying*
+  mode 0's interrupt by 4T, in the opposite direction, got this test's
+  SCX=0 case to match) must have been compensating for something else in
+  the measurement chain that happened to respond to that specific
+  change - not a real early-fire timing gap at the PPU level.
+
+  Reverted the early-mode0-interrupt hook back out (per the standing
+  net-negative-trade rule - confirmed via `git checkout --
+  psx-gbc/emu.c` restoring the exact `3e5a9bd` state, re-verified
+  byte-identical to baseline again). **Kept: the per-T-cycle
+  restructuring itself** (a genuine, verified-safe architectural
+  improvement, independent of whether it ever unblocks this cluster -
+  it's simply more correct, and removes a whole latent-bug class).
+  **Result: the interrupt-request-timing angle for this specific
+  cluster is now exhausted with a documented, evidence-backed
+  conclusion, saving whoever picks this up next from re-attempting the
+  same well-motivated-looking idea. The next genuinely new angle, if
+  anyone wants to keep pushing on this specific cluster, is almost
+  certainly CPU-side interrupt-*dispatch* latency (the number of
+  T-cycles between IF being set and the CPU actually jumping to the
+  vector, and/or HALT wake-up timing) rather than anything further at
+  the PPU/STAT-request level - a different, not-yet-attempted
+  investigation from everything tried so far this session.**
+
+  **Sixteenth follow-up, same session: pulled the CPU-side-dispatch
+  thread the fifteenth follow-up pointed at - found the *opposite*
+  direction actually needed (delay, not early-fire) is correct and
+  sufficient to fully fix `hblank_ly_scx_timing-GS`, but it collides
+  with `intr_2_0_timing` in a way that's now precisely quantified
+  rather than merely observed.** Read both tests' own source directly
+  (`.s` files, not secondhand summaries) to understand their exact
+  measurement mechanisms:
+
+  - `hblank_ly_scx_timing-GS.s` is HALT-based: HALT for the mode=0
+    interrupt, use the interrupt vector itself as a fast return (`add
+    sp,+2; ret`, skipping past the normal HALT-resume path entirely),
+    then a fixed-cost delay plus a variable NOP count, then read `LY`
+    to see whether it's incremented yet.
+  - `intr_2_0_timing.s` is *not* HALT-based for its second half:
+    `setup_and_wait_mode0` arms the mode=0 interrupt then runs a bare
+    `xor a; ld b,a; -inc b; jr -` busy loop with interrupts enabled,
+    using the same vector-as-fast-return trick - B's final value (how
+    many loop iterations elapsed before the interrupt actually fired)
+    is the measurement. This is a materially different, much
+    finer-grained sampling of interrupt timing than a HALT-based wait,
+    confirmed via `DUMP_HRAM` to be genuinely more sensitive: it broke
+    under every single-mechanism change tried this session, whether the
+    fifteenth follow-up's mooneye-derived early-fire or this follow-up's
+    delay.
+
+  Implemented `mode0IntDelayCountdown`: a 4T countdown armed the
+  instant mode 3 ends (`videoMode = HBLANKMODE`), gating
+  `UpdateStatLine()`'s `m0` term until it reaches 0 - the STAT
+  register's visible mode bits still flip immediately as before; only
+  the *interrupt* is delayed. This is the same direction (and matches
+  the same magnitude) the seventh/tenth follow-ups originally found
+  necessary, tried again now that the codebase has the per-T-cycle PPU
+  restructuring (fourteenth/fifteenth follow-ups) as a foundation.
+  Result: **`hblank_ly_scx_timing-GS` now passes outright** (not just
+  its previously-analyzed SCX=0 case - every SCX value 0-8) -
+  genuinely more complete progress than the seventh follow-up's own
+  characterization suggested. `intr_2_0_timing` breaks, as before, but
+  this time precisely diagnosed via its own `regs_save`/`regs_assert`
+  HRAM layout (mapped out from `common/lib/check_asserts_cb.s`'s
+  `setup_assertions` push sequence, not guessed): its two measurements
+  (`D` = 4-NOP-delay phase, `E` = 3-NOP-delay phase) show `E` matching
+  its expected value *exactly*, while `D` is wrong by *precisely one
+  full busy-loop iteration* (16T = `inc b` + `jr -`) - not a few
+  T-cycles of slop, a clean, discrete quantum. Only one of the two
+  phase-relative measurements is affected at all.
+
+  Two follow-up experiments to explain that single remaining
+  discrepancy, both concluded:
+  1. **Ruled out JR-splitting as the explanation.** Reasoned that
+     `intr_2_0_timing`'s busy loop uses unconditional `jr -`, still a
+     single lumped `cycleLength(12)` call at the time, and that this
+     might be swallowing fine-grained interrupt timing the same way the
+     fourteenth follow-up found for other instructions - split all 5 JR
+     opcodes (0x18 unconditional, 0x20/0x28/0x30/0x38 conditional) into
+     per-M-cycle charges (this is the JR-splitting commit that landed
+     separately, since it's independently correct regardless). Tested
+     the mode0 delay with and without these splits in isolation:
+     **byte-identical `DUMP_HRAM` output either way** - the CPU's own
+     interrupt-recognition check happens once per *instruction*
+     regardless of how many `cycleLength()` sub-calls that instruction
+     internally makes (interrupt() is only ever invoked from the main
+     loop, between `instructions[]()` calls, never from inside
+     `cycleLength()` itself) - so splitting JR could never have changed
+     this measurement in the first place. A wrong hypothesis, caught by
+     testing it in isolation rather than assuming it from the
+     combined result.
+  2. **Tried an analogous delay on mode 2's own interrupt** (mirroring
+     mode 0's newly-confirmed-correct treatment), armed at both
+     `OAMMODE`-entry sites. Result: **made things substantially worse**
+     - broke 4 *additional* previously-passing tests
+     (`intr_1_2_timing-GS`, `intr_2_mode0_timing`, `intr_2_mode3_timing`,
+     `intr_2_oam_ok_timing`) without fixing `intr_2_0_timing` either.
+     Confirms mode 2's interrupt-request timing is already correct as
+     it stands and should not be touched.
+
+  Reverted the mode0 delay (net-zero trade: fixes one test, breaks
+  another - the standing rule against this applies regardless of how
+  precisely the remaining gap is now understood) and the mode2 delay
+  (net-negative). **Kept: the JR-splitting commit** (independently
+  correct, zero regression, real hardware timing - see its own commit).
+  **Result: `hblank_ly_scx_timing-GS`'s fix is now fully known,
+  verified, and sitting ready (`mode0IntDelayCountdown`, a ~15-line
+  change) the moment `intr_2_0_timing`'s own remaining, now
+  precisely-quantified gap (exactly one busy-loop iteration, in exactly
+  one of its two phase-relative measurements, not explained by JR-
+  splitting or by any change to mode 2's own timing) is understood.**
+  That gap is likely specific to `intr_2_0_timing`'s own busy-loop-
+  interrupted-mid-flight measurement technique rather than a general
+  PPU-timing question at this point, given how surgically it responds
+  (or doesn't) to changes that otherwise behave exactly as expected
+  elsewhere - worth investigating with the same technique used this
+  round (read the test's own source line-by-line, map out its HRAM
+  register-dump layout from the *shared* `common/lib/` assertion
+  helpers rather than guessing, and isolate each candidate change
+  before combining it with others).
+
 ## What's next (roughly in priority order)
 
 1. **Sub-instruction cycle-accurate memory timing (see above) — a
-   large, real gap, though real progress has been made.** Currently
-   21 of 67 Mooneye acceptance/ppu+timer+interrupts tests pass (up
-   from an initial 11), most of the remaining failures for reasons
-   unrelated to the already-known boot-ROM limitation. Comparable in
-   scope to the GBC-support or sound-implementation efforts this
-   session - a dedicated pass, not a quick fix, and one where every
-   change needs the full regression sweep (see above) before being
-   trusted.
-2. **(DONE - fixed by LCD-off modelling, see above)** Kirby's Pinball Land hang - formerly real, unresolved, deeply
-   investigated but not fixed.** A genuine MBC2-cartridge compatibility
-   issue on the one MBC2 game tested so far. A real PPU frame-timing
-   bug found during a second investigation pass (see above) turned out
-   to be real and worth fixing in its own right, but didn't resolve
-   this specific hang - whatever's actually starving this ROM's Timer
-   interrupt remains open.
-3. More real-ROM testing, if more real ROMs become available. Every
-   round of real-commercial-game and authoritative-suite testing this
-   session found genuinely high-value bugs, including in code paths
-   (MBC2, EI timing) nothing else had touched. Don't commit ROM files
-   themselves to this repo or bundle them in any output archive
+   large, real gap, most of it now closed.** Currently 52 of 67
+   Mooneye acceptance/ppu+timer+interrupts tests pass (up from an
+   initial 11). **The entire CALL/PUSH/POP/RST/RET/JP/ADD SP,e/OAM-DMA
+   sub-instruction-timing family - the cluster this project's own
+   history repeatedly flagged as the highest-regression-risk part of
+   this whole effort - is fully fixed**, and **the STAT-interrupt/PPU-
+   mode-timing cluster is mostly fixed too** (see the detailed entries
+   above for exactly what each round did): the opcode-table
+   fetch-then-execute restructuring plus the DMA end-of-transfer timing
+   fix; narrowing OAM DMA's bus-blocking scope to true OAM; the same
+   split applied to `JP`/`JP cc` and `ADD SP,e`/`LD HL,SP+e`; making the
+   STAT interrupt level-triggered with a shared signal line (fixing a
+   double-fire bug and a wrong-bit bug along the way); blocking CPU
+   access to OAM during PPU modes 2-3; and making mode 3's length vary
+   with SCX. **What's left, each a distinct, bounded gap - not more of
+   what's already fixed**:
+   - `lcdon_timing-GS`/`lcdon_write_timing-GS` - VRAM access blocking
+     during mode 3 (fourth follow-up above), line 0's own special
+     post-power-on timing (fifth follow-up above, `lcdOnLine0Phase`),
+     and line 1's own 4T-longer mode 3 (eleventh follow-up above,
+     `lcdOnLine1ExtraPending`) are all now implemented and verified
+     regression-free; all 24 of `lcdon_timing-GS`'s `LY` checks pass,
+     and the STAT sub-check now gets past line 1 too. What's left is
+     narrower still, and back inside line 0 itself: the handoff from
+     line 0's initial "fake mode 0" phase to mode 3 needs to become
+     visible one M-cycle earlier than the current, already-verified
+     80T duration places it, without disturbing mode 3's own already-
+     correct end point or the line's total length - tried directly
+     shifting the threshold (with a compensating opposite shift to
+     mode 3) and it doesn't cleanly work due to overshoot/carry
+     effects at the boundary (see the eleventh follow-up above for the
+     detail); needs either the actual missing ingredient or some
+     overshoot-tracking refinement, not just threshold-tuning.
+   - `intr_2_mode0_timing_sprites` - mode 3's per-sprite length
+     penalty (varying with sprite count/position, on top of the SCX
+     penalty above) is now implemented and hand-verified against 18
+     independent cases from this test's own ROM (see the eighth
+     follow-up above). Its own baseline (zero-sprite-penalty) timing
+     needs the *same* mode-2-interrupt-delay fix `hblank_ly_scx_timing-GS`
+     needs for mode 0 (see the ninth follow-up above) - applying it
+     gets testcases #00-#09 (confirmed via the ROM's own on-screen
+     "TEST #NN FAILED" readout - `\@` in this ROM's macros starts at
+     0, not 1) passing outright, real progress, with failure moving to
+     #0A (10 sprites at X=1). Not applied yet only because it currently
+     breaks `intr_2_0_timing` (see that test's entry below) - once that
+     conflict is resolved, this test should move a lot further, though
+     #0A suggests there may be one more distinct gap on top.
+   - `hblank_ly_scx_timing-GS` - the SCX-length fix above is real and
+     kept, and this session went further: fixed two real, independent
+     bugs in the SCX penalty itself (it was a linear `SCX mod 8`
+     instead of the real step function, and it was never subtracted
+     back out of HBlank, so any non-zero-`SCX mod 8` line silently
+     grew past the real, fixed 456T line length - see the seventh
+     follow-up entry above for the full detail). Even so, this test's
+     own SCX=0 case (where neither fix contributes anything) still
+     fails on its own, narrowed down to a precisely quantified 4T gap:
+     empirically, the read needs the mode=0 STAT interrupt to fire 4T
+     *later* relative to when mode 0's STAT bits become visible than
+     this project currently does. A same-sized delay applied to mode
+     0's interrupt alone fixes this test but breaks the currently-
+     passing `intr_2_0_timing` (which measures the mode2-to-mode0
+     interrupt interval); delaying mode 2's interrupt too was
+     re-investigated this session (ninth follow-up above, correcting
+     an earlier wrong "zero effect" finding) and found to have a real
+     effect of its own (fixing 10 cases of `intr_2_mode0_timing_sprites`
+     above) but *still* doesn't fix `intr_2_0_timing`, whether applied
+     alone or combined with mode 0's delay - all three combinations
+     tried give `intr_2_0_timing` the exact same wrong result. The
+     likely reason: `intr_2_0_timing`'s second half doesn't poll STAT
+     or use HALT like the other three tests here - it arms mode 0's
+     interrupt and busy-loops waiting to be interrupted by it
+     mid-loop, a third, distinct measurement mechanism that may have
+     its own separate timing subtlety. Worth checking `intr_2_0_timing`'s
+     own mechanism specifically next, rather than continuing to guess
+     at flat-delay combinations for the other three tests. (This
+     session also briefly suspected a connection to the mode-3-timing
+     quirk found via `lcdon_timing-GS`, but that quirk turned out to
+     be specific to the line right after LCD power-on, not general -
+     see that entry above. Ruled out, not the same bug.)
+2. ~~**Kirby's Pinball Land hang**~~ **RESOLVED this session** (re-
+   confirmed a second time later in the same session, against the
+   `oam_dma_start` fix too - still rendering real, active gameplay,
+   not a regression back to blank). The user supplied the actual real
+   ROMs this project's own testing
+   had relied on in earlier sessions (Dr. Mario, Kirby's Dream Land 2,
+   Kirby's Pinball Land, Pokemon Red/Yellow/Crystal - kept local only,
+   per usual, never committed). Re-running Kirby's Pinball Land against
+   this session's HALT-timing fix (see above - HALT was overcharging
+   every wait by 4 T-cycles) shows real, progressing pinball gameplay
+   at three separate checkpoints (5M/15M/30M/60M instructions in) -
+   a title/ranking screen, then live gameplay with the ball, flippers,
+   and score all visibly changing across checkpoints (score reset
+   partway through is expected: the harness supplies no controller
+   input, so the ball just drains and a new game starts) - not the
+   permanent blank screen this ROM was previously stuck on. This
+   strongly matches the leading hypothesis from the original
+   investigation ("some small, still-unidentified cycle-accounting
+   phase difference" between this emulator and real hardware
+   systematically starving the Timer interrupt relative to VBlank) -
+   the HALT fix is exactly that class of bug, and was found completely
+   independently via Mooneye's suite, not by chasing this ROM directly.
+   Also re-verified via the same real ROMs: Dr. Mario, Kirby's Dream
+   Land 2, Pokemon Red, and Pokemon Yellow all still render correctly
+   (title/gameplay screens visually confirmed, pixel content sane) -
+   no regressions from this session's 6 timing commits. Pokemon Crystal
+   is unchanged from its previously-documented state (correctly renders
+   the "designed only for use on the Game Boy Color" compatibility
+   screen, still doesn't get past it - see item 4 below, unrelated to
+   anything fixed this session).
+3. More real-ROM testing now that real ROMs are available again this
+   session (see item 2) - previous rounds of real-commercial-game and
+   authoritative-suite testing found genuinely high-value bugs,
+   including in code paths (MBC2, EI timing) nothing else had touched.
+   Don't commit ROM files themselves to this repo or bundle them in
+   any output archive
    (copyright) — keep them local/sandbox-only.
 4. **GBC support is functionally complete for rendering purposes** -
    sprite-vs-background priority (the last known gap, including the
@@ -777,6 +2041,29 @@ effort without implementing genuine boot-ROM timing emulation — a
 materially bigger undertaking than anything else on this list, for a test
 that doesn't reflect real-game compatibility (real games sync to VBlank/
 STAT via interrupts, not an assumption about the exact boot-time phase).
+
+## Known limitation: serial transfer timing
+
+Mooneye's `acceptance/serial/boot_sclk_align-dmgABCmgb.gb` (found this
+session via building the full test suite for the first time) fails.
+Investigated: this project's serial transfer (`onSerialControlWrite()`
+in `emu.c`) completes synchronously, in the same call as the `$FF02`
+write that starts it — real hardware paces a transfer bit-by-bit off
+the same internal divider DIV counts from, taking on the order of 1024
+M-cycles for a full byte at the internal (fastest, non-double-speed)
+clock, with the exact completion time depending on the divider's phase
+*since reset* rather than the time the transfer was started. This is a
+materially different, currently entirely-unimplemented mechanism (a
+real per-bit serial-clock model tied to the shared internal divider),
+not a tunable timing constant - the same class of gap as `instr_timing.gb`
+above (it also needs boot-time divider phase to be exactly right, which
+compounds the same already-documented boot-ROM-timing gap). Not
+pursued this session given the effort involved and the very low
+real-game-compatibility payoff: this project's serial link has no
+actual link-cable partner (`onSerialControlWrite()`'s own comment notes
+the PSX side is always the lone "master"), so no real game's own
+gameplay logic depends on this timing being exact - only Mooneye's own
+synthetic test does.
 
 ## Boot path
 
