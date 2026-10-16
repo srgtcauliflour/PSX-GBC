@@ -223,6 +223,10 @@ implementation was kept because it passes more Mooneye tests (52/67 vs 28/67). U
   cycles); per-cycle audio-hook/DMA calls skipped unless needed (`g_audioHookEnabled`, `dmaActive`). Host speed:
   Pokemon Red 300 frames 10.9s -> 2.6s, identical test results (52/67, 18/21, 11/11) and identical frames.
   Host harness tip: build with -O2 and use DUMP_AT<=600 for real ROMs.
+- PS1 video output is now the GB picture scaled 1.5x (240x216, nearest neighbour, centred in 320x240), uploaded in
+  8-row bands through a 3.8KB staging buffer; the old 46KB full-frame buffer is gone (heap headroom after statics
+  is now ~165KB). Verified on a PS1 emulator by the user (boots, loads from disc, runs Blargg 01-special and
+  02-interrupts to "Passed") BEFORE this scaling change; the scaled output itself is unverified.
 - PS1 executable verified to build with PSn00bSDK v0.24 (`psxgbc.exe`, ~118KB). Not run on hardware/emulator.
 
 - **CPU/MBC/PPU core correctness**: dozens of real, confirmed bugs fixed

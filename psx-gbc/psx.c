@@ -62,7 +62,6 @@ static int db = 0;
 // needed for a plain, non-animated blit like this) and then flipping
 // which half is displayed is what actually eliminates the tearing the
 // single-buffer version had.
-static uint16_t gb_framebuffer[GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT];
 
 // BGR555 grayscale shades, brightest (0) to darkest (3).
 static const uint16_t gb_shade_colors[4] = {
@@ -94,35 +93,49 @@ void PresentFrame(void) {
 	db = !db;
 }
 
-void Draw_Buffer(unsigned char *screenBuffer, unsigned short *screenBufferColor, int gbcMode) {
-	int i;
-	if (gbcMode) {
-		// CGB colors are already stored 15-bit RGB555, little-endian,
-		// bits 14-10/9-5/4-0 = B/G/R - the exact same layout the PS1 GPU
-		// itself uses for direct 16bpp color, so no conversion is needed
-		// at all, just a straight copy.
-		for (i = 0; i < GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT; i++) {
-			gb_framebuffer[i] = screenBufferColor[i];
-		}
-	} else {
-		for (i = 0; i < GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT; i++) {
-			gb_framebuffer[i] = gb_shade_colors[screenBuffer[i] & 0x03];
-		}
-	}
+// Output is the 160x144 GB picture scaled 1.5x (nearest neighbour) to
+// 240x216, centred in the 320x240 display. Scaled in 8-row bands through a
+// small staging buffer (instead of a full-frame buffer) to spare the PS1's
+// 2MB of RAM; each band is uploaded and DrawSync'd before the buffer is reused.
+#define SCALE_OUT_W 240
+#define SCALE_OUT_H 216
+#define SCALE_BAND  8
+static uint16_t scale_band[SCALE_OUT_W * SCALE_BAND];
 
+void Draw_Buffer(unsigned char *screenBuffer, unsigned short *screenBufferColor, int gbcMode) {
 	int offsetX, offsetY;
 	BeginFrame(&offsetX, &offsetY);
 
 	// draw_env[db] points at the half of VRAM currently NOT being shown
 	// (disp_env[db] shows the other half) - safe to write into without
 	// tearing whatever is currently on screen.
-	RECT rect;
-	rect.x = offsetX + (SCREEN_XRES - GB_SCREEN_WIDTH) / 2;
-	rect.y = offsetY + (SCREEN_YRES - GB_SCREEN_HEIGHT) / 2;
-	rect.w = GB_SCREEN_WIDTH;
-	rect.h = GB_SCREEN_HEIGHT;
-	LoadImage(&rect, (const uint32_t *) gb_framebuffer);
-	DrawSync(0);
+	int baseX = offsetX + (SCREEN_XRES - SCALE_OUT_W) / 2;
+	int baseY = offsetY + (SCREEN_YRES - SCALE_OUT_H) / 2;
+	int dy0, r, dx;
+	for (dy0 = 0; dy0 < SCALE_OUT_H; dy0 += SCALE_BAND) {
+		for (r = 0; r < SCALE_BAND; r++) {
+			int sy = ((dy0 + r) * 2) / 3;
+			uint16_t *out = &scale_band[r * SCALE_OUT_W];
+			int rowBase = sy * GB_SCREEN_WIDTH;
+			if (gbcMode) {
+				// CGB colours are already RGB555 in the GPU's own 16bpp layout.
+				for (dx = 0; dx < SCALE_OUT_W; dx++) {
+					out[dx] = screenBufferColor[rowBase + (dx * 2) / 3];
+				}
+			} else {
+				for (dx = 0; dx < SCALE_OUT_W; dx++) {
+					out[dx] = gb_shade_colors[screenBuffer[rowBase + (dx * 2) / 3] & 0x03];
+				}
+			}
+		}
+		RECT rect;
+		rect.x = baseX;
+		rect.y = baseY + dy0;
+		rect.w = SCALE_OUT_W;
+		rect.h = SCALE_BAND;
+		LoadImage(&rect, (const uint32_t *) scale_band);
+		DrawSync(0);
+	}
 
 	PresentFrame();
 }
