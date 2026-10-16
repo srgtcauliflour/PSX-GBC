@@ -279,6 +279,13 @@ void reset_Z80() {
 		reg_D = 0x00;
 		reg_E = 0xD8;
 		reg_F = 0xB0;
+		// CGB boot ROM leaves A=$11 (this is how games detect a Game Boy
+		// Color; Pokemon Crystal shows its "designed only for use on the
+		// Game Boy Color" screen otherwise), B bit 0 = 0 (not GBA).
+		if (ROM[0x143] == 0x80 || ROM[0x143] == 0xC0) {
+			reg_A = 0x11; reg_F = 0x80; reg_B = 0x00; reg_C = 0x00;
+			reg_D = 0xFF; reg_E = 0x56; reg_HL = 0x000D;
+		}
 		IFLAG = 0x01;
 		IER = 0x00;
 		IME = 0x00;

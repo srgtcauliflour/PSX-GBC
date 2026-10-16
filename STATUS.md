@@ -331,6 +331,10 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   render correctly without CGB tile-attribute support — an expected
   consequence of this project's already-documented lack of GBC support,
   not a new bug.
+- **RESOLVED: Pokemon Crystal "designed only for use on the Game Boy Color" screen.** Root cause: the CGB boot
+  ROM leaves A=$11 (games detect CGB this way) but the core always booted with the DMG value A=$01. Boot
+  registers are now the CGB set (A=$11, F=$80, B=$00, C=$00, D=$FF, E=$56, HL=$000D) when the header flag
+  ($143) is $80/$C0. Crystal now runs its colour intro. Sweep unchanged (11/11, 18/21, 21/67).
 - **RESOLVED: Kirby's Pinball Land hang (and Kirby's Dream Land 2 blank screen) - the PPU never modelled the LCD being switched off.**
   Root cause found by PC-histogram profiling (`PCHIST=1` in the harness): the game's VBlank handler waits
   for `LY==$91` and then clears LCDC bit 7. The core ignored bit 7, so LY kept counting and VBlank kept
