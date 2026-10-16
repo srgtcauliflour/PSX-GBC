@@ -74,6 +74,8 @@ int IME;
 // EI dispatches; IME only becomes 1 once it reaches 0, in the main
 // dispatch loop below (not here) - see runEmu().
 int EI_PENDING = 0;
+void StatUpdate(void);
+int statLine = 0;
 int EMULATING;
 BYTE *VRAM, *EXTRNRAM, *RAM, *OAMRAM, *HIRAM;
 int temp;
@@ -1097,7 +1099,6 @@ void cycleLength(int cycle) {
 				// carries the overshoot forward into the new mode's
 				// countdown, losing nothing.
 				VideoCyclesLeft += OAM_CYCLES;
-				if ((LCDSTATUS >> 5) & 0x01) { IFLAG |= 0x02; }
 			} else if (LCDY < 0x90) {
 				hblank();
 				videoMode = OAMMODE;
@@ -1105,7 +1106,6 @@ void cycleLength(int cycle) {
 				// case) for the full explanation - same overshoot-losing
 				// bug, same fix.
 				VideoCyclesLeft += OAM_CYCLES;
-				if ((LCDSTATUS >> 3) & 0x01) { IFLAG |= 0x02; } // LCD 3
 			} else {
 				videoMode = VBLANKMODE;
 				VideoCyclesLeft += VBLANK_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
@@ -1136,10 +1136,8 @@ void cycleLength(int cycle) {
 					// relied on before now happened not to exercise this
 					// exact, extremely common pattern.
 					IFLAG |= 0x01;
-					if ((LCDSTATUS >> 4) & 0x01) { IFLAG |= 0x02; }
 				}
 			}
-			if (LCDY == LYC) { IFLAG |= 0x02; } // 3
 			// BUG FIX: STAT's mode bits (0-1) and LYC-coincidence bit (2)
 			// were never synced with the actual PPU state anywhere - only
 			// ever set by a direct software write to $FF41, which then sat
@@ -1149,19 +1147,21 @@ void cycleLength(int cycle) {
 			// bits. Bits 3-7 (interrupt-source enables + unused) are left
 			// exactly as software last set them.
 			LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
+			StatUpdate();
 			return;
 		} else {
 			if (videoMode == OAMMODE) {
 				videoMode = TRANSFERMODE;
 				VideoCyclesLeft += TRANSFER_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
-				if ((LCDSTATUS >> 5) & 0x01) { IFLAG |= 0x02; } //3
 				LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
+				StatUpdate();
 				return;
 			}
 			if (videoMode == TRANSFERMODE) {
 				videoMode = HBLANKMODE;
 				VideoCyclesLeft += HBLANK_CYCLES; // BUG FIX: see the overshoot comment above OAM_CYCLES
 				LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
+				StatUpdate();
 				return;
 			}
 		}
@@ -1172,6 +1172,22 @@ void doCycles(){
 
 
 }
+// STAT interrupt line: the OR of every enabled source (mode 0/1/2 and
+// LY==LYC). IF bit 1 is requested only on a rising edge of that line, so
+// a source that becomes active while another is still holding the line
+// high is "blocked" (acceptance/ppu/stat_irq_blocking).
+
+void StatUpdate(void) {
+	int line = 0, mode = videoMode & 0x03;
+	if (!(LCDCONTROL & 0x80)) { statLine = 0; return; }
+	if ((LCDSTATUS & 0x08) && mode == 0) line = 1;
+	if ((LCDSTATUS & 0x10) && mode == 1) line = 1;
+	if ((LCDSTATUS & 0x20) && mode == 2) line = 1;
+	if ((LCDSTATUS & 0x40) && (LCDY == LYC)) line = 1;
+	if (line && !statLine) IFLAG |= 0x02;
+	statLine = line;
+}
+
 int CyclesLeft(){
 	cyclesLeft = 1000000; // Big Number
 
@@ -2496,11 +2512,14 @@ void WriteMEM(WORD loc, BYTE b){
 					LCDY = 0;
 					videoMode = HBLANKMODE;
 					LCDSTATUS = (LCDSTATUS & 0xF8);
+					statLine = 0;
 				} else if (!(LCDCONTROL & 0x80) && (b & 0x80)) {
 					LCDY = 0;
 					videoMode = OAMMODE;
 					VideoCyclesLeft = OAM_CYCLES;
 					LCDSTATUS = (LCDSTATUS & 0xF8) | (videoMode & 0x03) | ((LCDY == LYC) ? 0x04 : 0x00);
+					LCDCONTROL = b;
+					StatUpdate();
 				}
 				LCDCONTROL = b;
 				break; // LCD Control (R/W)
@@ -2512,11 +2531,12 @@ void WriteMEM(WORD loc, BYTE b){
 				// mode/coincidence bits directly, which then never got
 				// corrected by the PPU state machine (see cycleLength).
 				LCDSTATUS = (LCDSTATUS & 0x07) | (b & 0xF8);
+				StatUpdate();
 				break; // LCDC Status   (R/W)
 			case 0xFF42: SCRY = b; break; // Scroll Y   (R/W)
 			case 0xFF43: SCRX = b; break; // Scroll X   (R/W)
 			case 0xFF44: LCDY = 0x00; break; // LCDC Y-Coordinate (R)
-			case 0xFF45: LYC = b; break; // LY Compare  (R/W)
+			case 0xFF45: LYC = b; LCDSTATUS = (LCDSTATUS & 0xFB) | ((LCDY == LYC) ? 0x04 : 0x00); StatUpdate(); break; // LY Compare  (R/W)
 			case 0xFF46: doDMA(b); break; // DMA Transfer and Start Address (W)
 			case 0xFF47: BGPAL = b; break; // BG Palette Data  (W)
 			case 0xFF48: OBJPAL0 = b; break; // Object Palette 0 Data (W)

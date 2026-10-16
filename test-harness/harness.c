@@ -300,6 +300,7 @@ int main(int argc, char **argv) {
 
     long i;
     static long pcHistBuf[65536];
+    int traceEnv = getenv("TRACE") != NULL;
     long *pcHist = getenv("PCHIST") ? pcHistBuf : NULL;  // PCHIST=1: print top-15 executed PCs at exit
     WORD lastPC = 0xFFFF;
     int stuckCount = 0;
@@ -326,7 +327,7 @@ int main(int argc, char **argv) {
         }
         lastPC = reg_PC;
 
-        if (getenv("TRACE") && (i % 500000 == 0)) {
+        if (traceEnv && (i % 500000 == 0)) {
             fprintf(stderr, "[trace] i=%ld PC=%04X SP=%04X A=%02X op=%02X IME=%d IE=%02X IF=%02X LY=%02X dmaActive=%d dmaBytesDone=%d\n",
                     i, reg_PC, reg_SP, reg_A, ReadMEM(reg_PC), IME, IER, IFLAG, LCDY, dmaActive, dmaBytesDone);
         }
