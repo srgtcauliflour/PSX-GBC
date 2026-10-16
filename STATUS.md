@@ -2163,3 +2163,8 @@ Not yet verified on a PS1 or by ear.
 - Core hook: g_romBankLoader / romBankPtr() in emu.c; bank 0 and the 1.5MB-and-under path are unchanged.
 - Host harness: STREAM=n runs any ROM through the streaming path with an n-slot cache. With 2 and 5 slots mbc1/mbc5 stays 18/21 (same as unstreamed) and 8 real ROMs render identically at 3 slots.
 - Untested on hardware: CD read latency (a miss stalls the frame while 8 sectors load; expect a hitch on bank switches that miss).
+
+## Autosave
+- Cart RAM (and RTC) is now saved automatically: 3 seconds after the last write, or after 30 seconds of continuous writes, as well as when the game disables cart RAM. "GAME SAVED"/"SAVE FAILED" shows in the OSD box; a failed save (no card) backs off for a minute.
+- Save buffers are clamped to 32KB: carts with 128KB RAM save only their first four banks (a full 128KB would not fit a memory card anyway).
+- Verified on the host harness with a synthetic MBC1+battery boot-counter ROM (counter 1,2,3 across reloads). Real memory-card behaviour is untested.
