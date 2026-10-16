@@ -897,6 +897,21 @@ void DMAClock(int cycles) {
 // correct behavior for the vast majority of real games, not a
 // cycle-exact reproduction of every corner of real hardware.
 
+#ifndef WAVE_K
+#define WAVE_K 6
+#endif
+#ifndef WAVE_W
+#define WAVE_W 2
+#endif
+#ifndef WAVE_P
+#define WAVE_P 0
+#endif
+#ifndef WAVE_KD
+#define WAVE_KD 8
+#endif
+#ifndef WAVE_W2
+#define WAVE_W2 2
+#endif
 static const int APU_DIVISORS[8] = {8, 16, 32, 48, 64, 80, 96, 112};
 
 int APUDacEnabled12(BYTE nrX2) {
@@ -914,11 +929,17 @@ void APUSetNR52Status(void) {
 		| (apuCh4.enabled ? 0x08 : 0);
 }
 
+// The frame sequencer's NEXT step clocks length on even steps. A length-enable
+// write (or a trigger with a zero length) landing when the next step will NOT
+// clock length gets an immediate extra length clock (Blargg dmg_sound 03).
+static int APUNextStepClocksLength(void) { return (apuFrameSeqStep & 1) == 0; }
+
 void APUTriggerPulse(APUChannel *ch, int hasSweep) {
 	ch->dacEnabled = APUDacEnabled12(ch->nrX2);
 	ch->enabled = ch->dacEnabled;
 	if (ch->lengthCounter == 0) {
 		ch->lengthCounter = 64;
+		if ((ch->nrX4 & 0x40) && !APUNextStepClocksLength()) ch->lengthCounter--;
 	}
 	int freq = ch->nrX3 | ((ch->nrX4 & 0x07) << 8);
 	ch->freqTimer = (2048 - freq) * 4;
@@ -930,7 +951,9 @@ void APUTriggerPulse(APUChannel *ch, int hasSweep) {
 		int sweepShift = ch->nrX0 & 0x07;
 		ch->sweepTimer = sweepPace ? sweepPace : 8;
 		ch->sweepEnabled = (sweepPace != 0) || (sweepShift != 0);
+		ch->sweepNegateUsed = 0;
 		if (sweepShift != 0) {
+			if (ch->nrX0 & 0x08) ch->sweepNegateUsed = 1;
 			// Real hardware performs one sweep overflow check
 			// immediately on trigger, using the shift but not actually
 			// committing the new frequency anywhere - it only matters
@@ -944,14 +967,27 @@ void APUTriggerPulse(APUChannel *ch, int hasSweep) {
 	}
 }
 
+// True if channel 3 fetched a sample within the last `w` T-cycles.
+int APUWaveInWindow(int w) {
+	int period = (2048 - (apuCh3.nrX3 | ((apuCh3.nrX4 & 0x07) << 8))) * 2;
+	return apuCh3.freqTimer > period - w - WAVE_P && apuCh3.freqTimer <= period - WAVE_P;
+}
+
 void APUTriggerWave(void) {
+	// DMG: retriggering while the channel is fetching corrupts wave RAM.
+	if (apuCh3.enabled && !GBC_MODE && APUWaveInWindow(WAVE_W2)) {
+		int offset = ((apuCh3.wavePos + 1) >> 1) & 0x0F;
+		if (offset < 4) { WAVERAM[0] = WAVERAM[offset]; }
+		else { int k; for (k = 0; k < 4; k++) WAVERAM[k] = WAVERAM[(offset & ~3) + k]; }
+	}
 	apuCh3.dacEnabled = (apuCh3.nrX0 & 0x80) != 0;
 	apuCh3.enabled = apuCh3.dacEnabled;
 	if (apuCh3.lengthCounter == 0) {
 		apuCh3.lengthCounter = 256;
+		if ((apuCh3.nrX4 & 0x40) && !APUNextStepClocksLength()) apuCh3.lengthCounter--;
 	}
 	int freq = apuCh3.nrX3 | ((apuCh3.nrX4 & 0x07) << 8);
-	apuCh3.freqTimer = (2048 - freq) * 2;
+	apuCh3.freqTimer = (2048 - freq) * 2 + (GBC_MODE ? WAVE_K : WAVE_KD);
 	apuCh3.wavePos = 0;
 }
 
@@ -960,6 +996,7 @@ void APUTriggerNoise(void) {
 	apuCh4.enabled = apuCh4.dacEnabled;
 	if (apuCh4.lengthCounter == 0) {
 		apuCh4.lengthCounter = 64;
+		if ((apuCh4.nrX4 & 0x40) && !APUNextStepClocksLength()) apuCh4.lengthCounter--;
 	}
 	apuCh4.envelopeTimer = (apuCh4.nrX2 & 0x07) ? (apuCh4.nrX2 & 0x07) : 8;
 	apuCh4.currentVolume = (apuCh4.nrX2 >> 4) & 0x0F;
@@ -967,6 +1004,22 @@ void APUTriggerNoise(void) {
 	int shift = (apuCh4.nrX3 >> 4) & 0x0F;
 	int divisor = APU_DIVISORS[apuCh4.nrX3 & 0x07];
 	apuCh4.freqTimer = divisor << shift;
+}
+
+// Shared NRx4 write: stores the byte, applies the extra length clock when length
+// gets enabled at a moment the next frame step will not clock it, then triggers.
+void APUWriteNRx4(APUChannel *ch, BYTE b, int hasSweep, int kind) {
+	int wasLenEn = ch->nrX4 & 0x40;
+	ch->nrX4 = b;
+	if (!wasLenEn && (b & 0x40) && !APUNextStepClocksLength() && ch->lengthCounter > 0) {
+		ch->lengthCounter--;
+		if (ch->lengthCounter == 0 && !(b & 0x80)) { ch->enabled = 0; }
+	}
+	if (b & 0x80) {
+		if (kind == 0) APUTriggerPulse(ch, hasSweep);
+		else if (kind == 1) APUTriggerWave();
+		else APUTriggerNoise();
+	}
 }
 
 void APUStepLength(APUChannel *ch, int lengthEnableBit) {
@@ -988,6 +1041,7 @@ void APUStepSweep(void) {
 		int sweepShift = apuCh1.nrX0 & 0x07;
 		if (apuCh1.sweepEnabled && sweepPace != 0) {
 			int newFreq = apuCh1.shadowFreq >> sweepShift;
+			if (apuCh1.nrX0 & 0x08) apuCh1.sweepNegateUsed = 1;
 			newFreq = (apuCh1.nrX0 & 0x08) ? (apuCh1.shadowFreq - newFreq) : (apuCh1.shadowFreq + newFreq);
 			if (newFreq > 2047) {
 				apuCh1.enabled = 0;
@@ -998,6 +1052,7 @@ void APUStepSweep(void) {
 				// Second overflow check with the new value, matching
 				// real hardware performing the calculation twice.
 				int checkFreq = apuCh1.shadowFreq >> sweepShift;
+				if (apuCh1.nrX0 & 0x08) apuCh1.sweepNegateUsed = 1;
 				checkFreq = (apuCh1.nrX0 & 0x08) ? (apuCh1.shadowFreq - checkFreq) : (apuCh1.shadowFreq + checkFreq);
 				if (checkFreq > 2047) {
 					apuCh1.enabled = 0;
@@ -1073,10 +1128,13 @@ void APUClock(int cycles) {
 		return; // master sound off - real hardware halts all APU clocking
 	}
 
-	apuFrameSeqCounter += cycles;
-	while (apuFrameSeqCounter >= 8192) {
-		apuFrameSeqCounter -= 8192;
-		APUStepFrameSequencer();
+	// The 512Hz frame sequencer is clocked by the falling edge of bit 12 of the
+	// free-running 16-bit divider (so DIV resets and the APU's phase interact).
+	// `cycles` is the span that just elapsed, ending at the current counter value.
+	{
+		unsigned int startDiv = (unsigned int)((internalDivCounter16 - cycles) & 0xFFFF);
+		int edges = (int)(((startDiv + (unsigned int)cycles) >> 13) - (startDiv >> 13));
+		while (edges-- > 0) APUStepFrameSequencer();
 	}
 
 	apuCh1.freqTimer -= cycles;
@@ -2440,6 +2498,12 @@ BYTE ReadMEM(WORD loc) {
 			if (loc >= 0xFF10 && loc <= 0xFF3F) APUFlush(); // catch the lazy APU up before any sound register is observed
 
 			if (loc >= 0xFF30 && loc <= 0xFF3F) { // Wave RAM
+				if ((NR52 & 0x80) && apuCh3.enabled) {
+					// While channel 3 plays, the CPU sees the byte the channel is reading:
+					// CGB always, DMG only in the brief window right after a fetch.
+					if (GBC_MODE || APUWaveInWindow(WAVE_W)) return WAVERAM[apuCh3.wavePos / 2];
+					return 0xFF;
+				}
 				return WAVERAM[loc - 0xFF30];
 			}
 
@@ -2774,6 +2838,10 @@ void WriteMEM(WORD loc, BYTE b){
 	} else if ( ( loc >= 0xFF00 ) &&  ( loc <= 0xFF7F ) ) { // $FF00-$FF7F - Hardware I/O Registers
 		if (loc >= 0xFF10 && loc <= 0xFF3F) APUFlush(); // catch the lazy APU up before a sound register changes
 		if (loc >= 0xFF30 && loc <= 0xFF3F) { // Wave RAM - writable regardless of APU power state
+			if ((NR52 & 0x80) && apuCh3.enabled) {
+				if (GBC_MODE || APUWaveInWindow(WAVE_W)) WAVERAM[apuCh3.wavePos / 2] = b;
+				return;
+			}
 			WAVERAM[loc - 0xFF30] = b;
 			return;
 		}
@@ -2808,6 +2876,8 @@ void WriteMEM(WORD loc, BYTE b){
 			case 0xFF01: SERIALDATA = b; break; // Serial transfer data (R/W)
 			case 0xFF02: SERIALCONTROL = b; onSerialControlWrite(); break; // SIO control (R/W)
 			case 0xFF04:
+				APUFlush();
+				if ((NR52 & 0x80) && (internalDivCounter16 & 0x1000)) APUStepFrameSequencer(); // bit 12 falls on reset
 				// BUG FIX: any write resets the real, unified 16-bit
 				// counter to 0 (not just the visible DIVREG byte) - and
 				// since resetting it can itself cause the watched timer
@@ -2874,8 +2944,15 @@ void WriteMEM(WORD loc, BYTE b){
 			// SOUND - $FF10-$FF25 writes are ignored while the master
 			// APU switch (NR52 bit 7) is off, matching real hardware;
 			// NR52 itself and Wave RAM remain writable regardless.
-			case 0xFF10: if (NR52 & 0x80) { apuCh1.nrX0 = b; } break; // NR10 sweep
-			case 0xFF11: if (NR52 & 0x80) { apuCh1.nrX1 = b; apuCh1.lengthCounter = 64 - (b & 0x3F); } break; // NR11
+			case 0xFF10: if (NR52 & 0x80) {
+					// Leaving negate mode after a negate-mode sweep calculation disables the channel.
+					if ((apuCh1.nrX0 & 0x08) && !(b & 0x08) && apuCh1.sweepNegateUsed) { apuCh1.enabled = 0; }
+					apuCh1.nrX0 = b;
+				} break; // NR10 sweep
+			case 0xFF11:
+				if (NR52 & 0x80) { apuCh1.nrX1 = b; apuCh1.lengthCounter = 64 - (b & 0x3F); }
+				else if (!GBC_MODE) { apuCh1.lengthCounter = 64 - (b & 0x3F); } // DMG: length writable while off
+				break; // NR11
 			case 0xFF12: // NR12 envelope - writing the DAC-off pattern immediately silences the channel
 				if (NR52 & 0x80) {
 					apuCh1.nrX2 = b;
@@ -2884,13 +2961,13 @@ void WriteMEM(WORD loc, BYTE b){
 				break;
 			case 0xFF13: if (NR52 & 0x80) { apuCh1.nrX3 = b; } break; // NR13 freq lo
 			case 0xFF14: // NR14 freq hi/trigger/length-enable
-				if (NR52 & 0x80) {
-					apuCh1.nrX4 = b;
-					if (b & 0x80) { APUTriggerPulse(&apuCh1, 1); }
-				}
+				if (NR52 & 0x80) { APUWriteNRx4(&apuCh1, b, 1, 0); }
 				break;
 
-			case 0xFF16: if (NR52 & 0x80) { apuCh2.nrX1 = b; apuCh2.lengthCounter = 64 - (b & 0x3F); } break; // NR21
+			case 0xFF16:
+				if (NR52 & 0x80) { apuCh2.nrX1 = b; apuCh2.lengthCounter = 64 - (b & 0x3F); }
+				else if (!GBC_MODE) { apuCh2.lengthCounter = 64 - (b & 0x3F); }
+				break; // NR21
 			case 0xFF17:
 				if (NR52 & 0x80) {
 					apuCh2.nrX2 = b;
@@ -2899,10 +2976,7 @@ void WriteMEM(WORD loc, BYTE b){
 				break;
 			case 0xFF18: if (NR52 & 0x80) { apuCh2.nrX3 = b; } break; // NR23
 			case 0xFF19:
-				if (NR52 & 0x80) {
-					apuCh2.nrX4 = b;
-					if (b & 0x80) { APUTriggerPulse(&apuCh2, 0); }
-				}
+				if (NR52 & 0x80) { APUWriteNRx4(&apuCh2, b, 0, 0); }
 				break;
 
 			case 0xFF1A: // NR30 DAC on/off
@@ -2912,17 +2986,20 @@ void WriteMEM(WORD loc, BYTE b){
 					if (!apuCh3.dacEnabled) { apuCh3.enabled = 0; }
 				}
 				break;
-			case 0xFF1B: if (NR52 & 0x80) { apuCh3.nrX1 = b; apuCh3.lengthCounter = 256 - b; } break; // NR31 (full 8-bit length)
+			case 0xFF1B:
+				if (NR52 & 0x80) { apuCh3.nrX1 = b; apuCh3.lengthCounter = 256 - b; }
+				else if (!GBC_MODE) { apuCh3.lengthCounter = 256 - b; }
+				break; // NR31 (full 8-bit length)
 			case 0xFF1C: if (NR52 & 0x80) { apuCh3.nrX2 = b; } break; // NR32 output level
 			case 0xFF1D: if (NR52 & 0x80) { apuCh3.nrX3 = b; } break; // NR33
 			case 0xFF1E:
-				if (NR52 & 0x80) {
-					apuCh3.nrX4 = b;
-					if (b & 0x80) { APUTriggerWave(); }
-				}
+				if (NR52 & 0x80) { APUWriteNRx4(&apuCh3, b, 0, 1); }
 				break;
 
-			case 0xFF20: if (NR52 & 0x80) { apuCh4.nrX1 = b; apuCh4.lengthCounter = 64 - (b & 0x3F); } break; // NR41
+			case 0xFF20:
+				if (NR52 & 0x80) { apuCh4.nrX1 = b; apuCh4.lengthCounter = 64 - (b & 0x3F); }
+				else if (!GBC_MODE) { apuCh4.lengthCounter = 64 - (b & 0x3F); }
+				break; // NR41
 			case 0xFF21:
 				if (NR52 & 0x80) {
 					apuCh4.nrX2 = b;
@@ -2931,27 +3008,31 @@ void WriteMEM(WORD loc, BYTE b){
 				break;
 			case 0xFF22: if (NR52 & 0x80) { apuCh4.nrX3 = b; } break; // NR43
 			case 0xFF23:
-				if (NR52 & 0x80) {
-					apuCh4.nrX4 = b;
-					if (b & 0x80) { APUTriggerNoise(); }
-				}
+				if (NR52 & 0x80) { APUWriteNRx4(&apuCh4, b, 0, 2); }
 				break;
 
 			case 0xFF24: if (NR52 & 0x80) { NR50 = b; } break;
 			case 0xFF25: if (NR52 & 0x80) { NR51 = b; } break;
-			case 0xFF26: // NR52 - only the master power bit is actually writable
+			case 0xFF26: { // NR52 - only the master power bit is actually writable
+				int wasOn = (NR52 & 0x80) != 0;
 				NR52 = (NR52 & 0x0F) | (b & 0x80);
-				if (!(b & 0x80)) {
+				if (!(b & 0x80) && wasOn) {
 					// Real hardware clears every sound register (but not
 					// Wave RAM) when powered off this way, and channels
-					// immediately stop.
+					// immediately stop. DMG keeps the length counters across
+					// power-off; CGB clears them too.
+					int l1 = apuCh1.lengthCounter, l2 = apuCh2.lengthCounter, l3 = apuCh3.lengthCounter, l4 = apuCh4.lengthCounter;
 					apuCh1 = (APUChannel){0};
 					apuCh2 = (APUChannel){0};
 					apuCh3 = (APUChannel){0};
 					apuCh4 = (APUChannel){0};
+					if (!GBC_MODE) { apuCh1.lengthCounter = l1; apuCh2.lengthCounter = l2; apuCh3.lengthCounter = l3; apuCh4.lengthCounter = l4; }
 					NR50 = 0; NR51 = 0;
+				} else if ((b & 0x80) && !wasOn) {
+					apuFrameSeqStep = 0; // frame sequencer restarts at step 0 on power-on
 				}
 				break;
+			}
 
 			// VIDEO
 			case 0xFF40: {

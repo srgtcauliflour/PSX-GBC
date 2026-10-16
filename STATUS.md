@@ -2143,3 +2143,12 @@ Built both from source (rgbds v0.4.2 + the mgblib submodule) and compared frame 
 - Window: internal line counter, WY trigger latched per frame, WX<7 and WX>166 handled, CGB window writes bounds-checked.
 - DMG with LCDC bit 0 clear shows BGP colour 0 and no window (was leaving the previous frame's pixels).
 Also: harness reports Blargg cart-RAM results (dmg_sound/cgb_sound: DMG 4/12, CGB 7/12 right now, not yet worked on), `DUMP_EXIT=1` with `DUMP_AT=n` stops after dumping frame n, `DUMP_PAL=1` prints CGB palettes. Pokemon Crystal now shows correct colours through its intro. Acceptance still 58/67, cpu_instrs 11/11, mbc 18/21.
+
+### APU accuracy pass (Blargg dmg_sound / cgb_sound)
+Results: **cgb_sound 12/12** (was 7/12), **dmg_sound 10/12** (was 4/12). Changes:
+- Frame sequencer is now clocked by the falling edge of bit 12 of the 16-bit divider (so DIV writes and power-on interact with it correctly); reset to step 0 on APU power-on; DIV write ticks it when bit 12 falls.
+- Length: extra length clock when length-enable is set while the next frame step would not clock it; same rule for a zero-length trigger; DMG keeps length counters across power-off and lets NRx1 length be written while off (CGB does neither).
+- Sweep: negate-mode tracking (leaving negate after a negate calculation disables ch1).
+- Wave channel: CPU reads/writes of wave RAM while ch3 plays go to the byte being played (CGB always; DMG only just after a fetch, otherwise reads FF / writes ignored); DMG retrigger-while-fetching corrupts wave RAM; trigger startup delay.
+Still failing: dmg_sound 09 (wave read while on) and 12 (wave write while on) - they need the exact DMG wave-fetch phase relative to the CPU access (a 198-point scan of delay/window/phase parameters found no passing combination, so the model is missing something structural). Very obscure; games don't depend on it.
+Not yet verified on a PS1 or by ear.

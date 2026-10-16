@@ -69,6 +69,7 @@ typedef struct {
 	int shadowFreq;
 	int wavePos;
 	int lfsr;
+	int sweepNegateUsed;
 } APUChannel;
 extern APUChannel apuCh1, apuCh2, apuCh3, apuCh4;
 extern BYTE WAVERAM[16];
