@@ -331,6 +331,21 @@ unzip sdk.zip -d /opt/psn00bsdk/sdk
   render correctly without CGB tile-attribute support — an expected
   consequence of this project's already-documented lack of GBC support,
   not a new bug.
+- **RENDERING BUG FIXED + PERFORMANCE PASS.** (1) The DMG background/window renderers chose signed vs unsigned
+  tile numbers from the *map address* ($9C00) instead of LCDC bit 4, and didn't wrap the map column at 32.
+  Visible effect: Dr. Mario's logo missing, Kirby's Pinball Land table striped/black, Super Mario Land title
+  garbled, Gargoyle's Quest intro text missing. Both loops are rewritten (per-tile fetch, direct VRAM, correct
+  signedness, wrapped scroll). (2) Performance: timer edges are counted arithmetically with an exact
+  per-T-cycle fallback near overflow; HALT fast-forwards to the next PPU/timer event; the APU is clocked lazily
+  (flushed on any sound-register access, output read, or every 512 cycles). ~2.2x faster on the host with
+  identical test results. Remaining hot spots: sprite/CGB renderers (per-pixel ReadMEM), per-instruction
+  cycleLength overhead. Host harness tip: build with -O2 and use DUMP_AT<=600 for real ROMs.
+- **Timing/interrupt fixes (Mooneye acceptance 21 -> 28/67, no regressions; cpu_instrs 11/11, mbc 18/21):**
+  IF bits 5-7 read as 1 (if_ie_registers); a second EI no longer restarts the EI delay and DI cancels a
+  pending EI (ei_sequence, rapid_di_ei); interrupt dispatch pushes PC high byte *then* picks the vector, so a
+  push landing on IE can cancel it (ie_push); STAT interrupt is a proper OR'd, rising-edge line
+  (`StatUpdate()`), replacing per-source IF raises that fired at the wrong mode transitions
+  (stat_irq_blocking and others).
 - **RESOLVED: Pokemon Crystal "designed only for use on the Game Boy Color" screen.** Root cause: the CGB boot
   ROM leaves A=$11 (games detect CGB this way) but the core always booted with the DMG value A=$01. Boot
   registers are now the CGB set (A=$11, F=$80, B=$00, C=$00, D=$FF, E=$56, HL=$000D) when the header flag
