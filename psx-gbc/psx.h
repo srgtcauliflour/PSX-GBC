@@ -30,6 +30,7 @@ void Draw_Buffer(unsigned char *screenBuffer, unsigned short *screenBufferColor,
 void PrepScreen(void);
 void FramePace(void);
 void ShowSpeedOSD(int mul);
+void ShowMessageOSD(const char *text);  // short (<=11 chars) message in the top-left box
 // Called once per frame from vblank() - reads the core's current APU
 // channel state (see emu.h's APUChannel externs) and drives the PS1
 // SPU's hardware voices to approximate it. See psx.c for the full

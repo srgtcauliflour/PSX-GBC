@@ -246,6 +246,7 @@ int LoadCartRAM(const char *saveId, unsigned char *buf, int size) {
 }
 void FramePace(void) {}
 void ShowSpeedOSD(int mul) { (void)mul; }
+void ShowMessageOSD(const char *t) { if (getenv("TRACE_OSD")) fprintf(stderr, "[OSD] %s\n", t); }
 void PrepScreen(void) {}
 void RenderWorld(BYTE re, BYTE gr, BYTE bl) { (void)re; (void)gr; (void)bl; }
 

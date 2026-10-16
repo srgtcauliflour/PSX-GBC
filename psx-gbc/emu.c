@@ -246,6 +246,8 @@ int ROMBANKNUMBER = 1;// Bank register powers on selecting bank 1 (MBC1/2/3/5)
 int RAMBANKNUMBER = 0;
 int MBCMODE = 0;
 int RAMENABLED = 0; // Cart RAM $A000-$BFFF gate: enabled by writing 0x0A to $0000-$1FFF
+int ramIdleFrames = 0;   // frames since the last cart RAM write while dirty (autosave debounce)
+int ramDirtyFrames = 0;  // frames spent dirty without a save (forces a save eventually)
 int RAM_DIRTY = 0; // Set on any cart RAM write; cleared once a save completes.
 // BUG FIX: DIV ($FF04) was a complete no-op stub on both read and write.
 // Real hardware free-runs an internal 16-bit divider at the base clock
@@ -2087,6 +2089,24 @@ void vblank(void){
 //	if(curframe < 0) {
 //		curframe = frameskip;
 		FRAMECOUNT++;
+		// Autosave: many games never disable cart RAM after writing, so the
+		// "RAM disabled" save trigger alone would never fire for them. Save
+		// once writes have been quiet for ~3s, or after 30s of continuous
+		// dirtiness. A failed save (no card) backs off for a minute.
+		if (RAM_DIRTY && CartHasBattery()) {
+			ramIdleFrames++; ramDirtyFrames++;
+			if (ramIdleFrames >= 180 || ramDirtyFrames >= 1800) {
+				if (SaveCartRAMAndRTC((const char *)CARTTITLE)) {
+					RAM_DIRTY = 0; ramIdleFrames = 0; ramDirtyFrames = 0;
+					ShowMessageOSD("GAME SAVED");
+				} else {
+					ramIdleFrames = -3600; ramDirtyFrames = -3600 + 180;
+					ShowMessageOSD("SAVE FAILED");
+				}
+			}
+		} else {
+			ramIdleFrames = 0; ramDirtyFrames = 0;
+		}
 		int present = 1;
 		if (g_speedMul > 1) { speedCnt++; if (speedCnt < g_speedMul) present = 0; else speedCnt = 0; } else { speedCnt = 0; }
 		g_skipRender = (g_speedMul > 1) && (speedCnt + 1 < g_speedMul);
@@ -2287,6 +2307,14 @@ int CartHasRTC(void) {
 // piece of save state - no wall-clock/elapsed-time math involved.
 #define RTC_SAVE_BYTES 5
 
+// The save buffers hold 32KB of cart RAM; carts with more (128KB) save only
+// their first four banks rather than overrunning the buffer (and a 128KB
+// save would not fit a 120KB memory card anyway).
+static int SaveRamBytes(void) {
+	int r = GetCartRAMSize();
+	return r > 32 * 1024 ? 32 * 1024 : r;
+}
+
 int GetCartSaveSize(void) {
 	return GetCartRAMSize() + (CartHasRTC() ? RTC_SAVE_BYTES : 0);
 }
@@ -2299,8 +2327,8 @@ int GetCartSaveSize(void) {
 // RTC to power-on defaults on every single boot regardless of whether
 // the cartridge actually has a battery-backed clock chip.
 int SaveCartRAMAndRTC(const char *saveId) {
-	int ramSize = GetCartRAMSize();
-	int totalSize = GetCartSaveSize();
+	int ramSize = SaveRamBytes();
+	int totalSize = ramSize + (CartHasRTC() ? RTC_SAVE_BYTES : 0);
 	// static, not stack-local: 32KB covers the largest real MBC3 RAM size,
 	// but that's a substantial chunk to put on the stack on a platform
 	// with as little RAM as the PS1, especially since this can be called
@@ -2320,8 +2348,8 @@ int SaveCartRAMAndRTC(const char *saveId) {
 }
 
 int LoadCartRAMAndRTC(const char *saveId) {
-	int ramSize = GetCartRAMSize();
-	int totalSize = GetCartSaveSize();
+	int ramSize = SaveRamBytes();
+	int totalSize = ramSize + (CartHasRTC() ? RTC_SAVE_BYTES : 0);
 	static BYTE buf[32 * 1024 + RTC_SAVE_BYTES]; // see SaveCartRAMAndRTC above
 	int ok = LoadCartRAM(saveId, buf, totalSize);
 	if (!ok) {
@@ -2865,7 +2893,7 @@ void WriteMEM(WORD loc, BYTE b){
 			// RAM would never trigger a save at all, even though there
 			// is now real RTC state worth persisting (see
 			// SaveCartRAMAndRTC/CartHasRTC above).
-			RAM_DIRTY = 1;
+			RAM_DIRTY = 1; ramIdleFrames = 0;
 			switch (RTCSELECT) {
 				case 0x08: RTC_S  = b; break;
 				case 0x09: RTC_M  = b; break;
@@ -2874,7 +2902,7 @@ void WriteMEM(WORD loc, BYTE b){
 				case 0x0C: RTC_DH = b; break;
 			}
 		} else if (RAMENABLED) {
-			RAM_DIRTY = 1;
+			RAM_DIRTY = 1; ramIdleFrames = 0;
 			if (( CARTTYPE == 0x01 ) || ( CARTTYPE == 0x02) || ( CARTTYPE == 0x03 )) {
 				if (MBCMODE) { EXTRNRAM[loc - 0xA000 + (WORD)((RAMBANKNUMBER % GetCartRAMBankCount()) * 0x2000)] = b; }
 				else { EXTRNRAM[loc - 0xA000] = b; }

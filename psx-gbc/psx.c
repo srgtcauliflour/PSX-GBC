@@ -118,11 +118,17 @@ void FramePace(void) {
 }
 
 static int osdFrames = 0;
-static int osdSpeed = 1;
+static char osdText[16] = "";
 static int osdStream = -1;
-void ShowSpeedOSD(int mul) {
-	osdSpeed = mul;
+void ShowMessageOSD(const char *text) {
+	strncpy(osdText, text, sizeof(osdText) - 1);
+	osdText[sizeof(osdText) - 1] = '\0';
 	osdFrames = 90; // presented frames
+}
+void ShowSpeedOSD(int mul) {
+	char t[16];
+	sprintf(t, "SPEED %dX", mul);
+	ShowMessageOSD(t);
 }
 static void DrawSpeedOSD(void) {
 	static uint32_t ot[1];
@@ -138,7 +144,7 @@ static void DrawSpeedOSD(void) {
 	addPrim(ot, p);
 	DrawOTag(ot);
 	DrawSync(0);
-	FntPrint(osdStream, "SPEED %dX", osdSpeed);
+	FntPrint(osdStream, "%s", osdText);
 	FntFlush(osdStream);
 }
 
