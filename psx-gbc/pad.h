@@ -26,6 +26,8 @@ typedef unsigned long u_long;
 #define Pad1x           (1<< 6)
 #define Pad1Start       (1<<11)
 #define Pad1Select      (1<<8)
+#define Pad1L3          (1<< 9)
+#define Pad1R3          (1<<10)
 
 /* Controller Pad 2 Defines */
 #define Pad2Up          (1<<28)

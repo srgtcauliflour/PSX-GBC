@@ -244,6 +244,8 @@ int LoadCartRAM(const char *saveId, unsigned char *buf, int size) {
     if (getenv("TRACE")) fprintf(stderr, "[LoadCartRAM] read %s (%d bytes)\n", path, size);
     return (int)got == size;
 }
+void FramePace(void) {}
+void ShowSpeedOSD(int mul) { (void)mul; }
 void PrepScreen(void) {}
 void RenderWorld(BYTE re, BYTE gr, BYTE bl) { (void)re; (void)gr; (void)bl; }
 
@@ -311,6 +313,7 @@ int main(int argc, char **argv) {
     long i;
     static long pcHistBuf[65536];
     int traceEnv = getenv("TRACE") != NULL;
+    if (getenv("SPEED")) { extern int g_speedMul; g_speedMul = atoi(getenv("SPEED")); }
     g_audioHookEnabled = getenv("DUMP_WAV") != NULL;
     long *pcHist = getenv("PCHIST") ? pcHistBuf : NULL;  // PCHIST=1: print top-15 executed PCs at exit
     WORD lastPC = 0xFFFF;

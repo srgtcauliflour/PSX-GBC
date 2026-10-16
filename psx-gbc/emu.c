@@ -273,6 +273,9 @@ int DIVCOUNTER = 0;
 // actually be detected when either input changes.
 int internalDivCounter16 = 0;
 int TIMER_BIT_ANDED = 0;
+int g_speedMul = 1;      // game speed multiplier 1..10 (L3/R3 cycle it)
+int g_skipRender = 0;    // set for frames that will not be presented (speed > 1)
+static int speedCnt = 0;
 int FRAMECOUNT = 0; // Incremented once per vblank(); used by debug tracing below.
 BYTE DIVREG = 0;
 BYTE SERIALDATA = 0xFF;   // $FF01 SB - Serial transfer data
@@ -1768,6 +1771,7 @@ void hblank(){
 		HDMA_REMAINING -= 16;
 	}
 
+ 	if (g_skipRender) { return; } // frame won't be shown (speed boost): skip drawing
  	if ((LCDCONTROL >> 6) & 0x01) { WINaddr = 0x9C00;  } else { WINaddr = 0x9800; }
  	if ((LCDCONTROL >> 3) & 0x01) { BGaddr = 0x9C00;   } else { BGaddr = 0x9800;}
  	if ((LCDCONTROL >> 4) & 0x01) { TILEaddr = 0x8000; } else { TILEaddr = 0x9000; }
@@ -2039,6 +2043,10 @@ void vblank(void){
 //	if(curframe < 0) {
 //		curframe = frameskip;
 		FRAMECOUNT++;
+		int present = 1;
+		if (g_speedMul > 1) { speedCnt++; if (speedCnt < g_speedMul) present = 0; else speedCnt = 0; } else { speedCnt = 0; }
+		g_skipRender = (g_speedMul > 1) && (speedCnt + 1 < g_speedMul);
+		if (!present) return;
 		// Audio update runs every frame regardless of LCD state - sound
 		// is independent of the display, and a game with the LCD off
 		// but sound playing (rare but real) should still be heard.
@@ -2057,6 +2065,7 @@ void vblank(void){
 			PrepScreen();
 			DrawBG();
 			RenderWorld(0,0,0);
+			FramePace();
 
 				//if(((LCDCONTROL >> 5) & 0x01) == 0x01) {
 				//	DrawWindow();
@@ -2096,6 +2105,13 @@ void runEmu(){
 		}
 		//if (reg_PC == 0x3E6) { runto = 1; }
 		pad = PadRead(0);
+		{
+			static unsigned long speedPadLast = 0;
+			unsigned long edge = pad & ~speedPadLast & (Pad1L3 | Pad1R3);
+			speedPadLast = pad;
+			if (edge & Pad1R3) { g_speedMul = (g_speedMul >= 10) ? 1 : g_speedMul + 1; ShowSpeedOSD(g_speedMul); }
+			if (edge & Pad1L3) { g_speedMul = (g_speedMul <= 1) ? 10 : g_speedMul - 1; ShowSpeedOSD(g_speedMul); }
+		}
 		if ((pad & Pad1R1) && (pad & Pad1R2) && (pad  & Pad1L1) && (pad  & Pad1L2) && (pad  & Pad1Select) && (pad  & Pad1Start)){
 		//	// User wants to QUIT Emulation
 			EMULATING=0;

@@ -2152,3 +2152,8 @@ Results: **cgb_sound 12/12** (was 7/12), **dmg_sound 10/12** (was 4/12). Changes
 - Wave channel: CPU reads/writes of wave RAM while ch3 plays go to the byte being played (CGB always; DMG only just after a fetch, otherwise reads FF / writes ignored); DMG retrigger-while-fetching corrupts wave RAM; trigger startup delay.
 Still failing: dmg_sound 09 (wave read while on) and 12 (wave write while on) - they need the exact DMG wave-fetch phase relative to the CPU access (a 198-point scan of delay/window/phase parameters found no passing combination, so the model is missing something structural). Very obscure; games don't depend on it.
 Not yet verified on a PS1 or by ear.
+
+## Speed boost (1x-10x)
+- R3 cycles speed up (wraps 10x -> 1x), L3 cycles down (wraps 1x -> 10x); an on-screen "SPEED NX" OSD shows for ~1.5s.
+- Implemented by emulating N frames per presented frame; skipped frames also skip scanline rendering. FramePace() keeps 1x at 60/50 Hz.
+- Verified on the host harness (SPEED env var); real PS1 speed and audio at >1x are untested on hardware.

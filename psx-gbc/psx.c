@@ -102,6 +102,46 @@ void PresentFrame(void) {
 #define SCALE_BAND  8
 static uint16_t scale_band[SCALE_OUT_W * SCALE_BAND];
 
+// ---- Frame pacing and on-screen speed indicator ------------------------
+// FramePace(): called once per presented frame. Guarantees at least one
+// vertical blank has passed since the previous call (so a fast console
+// doesn't run the game too fast) without ever waiting when emulation is
+// already slower than that (so a slow frame isn't stretched to two).
+void FramePace(void) {
+	static int lastVs = 0;
+	int now = VSync(-1);
+	if (now - lastVs < 1) {
+		VSync(0);
+		now = VSync(-1);
+	}
+	lastVs = now;
+}
+
+static int osdFrames = 0;
+static int osdSpeed = 1;
+static int osdStream = -1;
+void ShowSpeedOSD(int mul) {
+	osdSpeed = mul;
+	osdFrames = 90; // presented frames
+}
+static void DrawSpeedOSD(void) {
+	static uint32_t ot[1];
+	static char prim[sizeof(POLY_F4)];
+	if (osdFrames <= 0) return;
+	osdFrames--;
+	if (osdStream < 0) osdStream = FntOpen(10, 10, 100, 12, 0, 32);
+	ClearOTagR(ot, 1);
+	POLY_F4 *p = (POLY_F4 *) prim;
+	setPolyF4(p);
+	setRGB0(p, 0, 0, 0);
+	setXY4(p, 4, 4, 100, 4, 4, 22, 100, 22);
+	addPrim(ot, p);
+	DrawOTag(ot);
+	DrawSync(0);
+	FntPrint(osdStream, "SPEED %dX", osdSpeed);
+	FntFlush(osdStream);
+}
+
 void Draw_Buffer(unsigned char *screenBuffer, unsigned short *screenBufferColor, int gbcMode) {
 	int offsetX, offsetY;
 	BeginFrame(&offsetX, &offsetY);
@@ -137,6 +177,7 @@ void Draw_Buffer(unsigned char *screenBuffer, unsigned short *screenBufferColor,
 		DrawSync(0);
 	}
 
+	DrawSpeedOSD();
 	PresentFrame();
 }
 
@@ -478,6 +519,8 @@ unsigned long PadRead(int pad_num) {
 	if (raw & PAD_CROSS)    result |= Pad1x;
 	if (raw & PAD_START)    result |= Pad1Start;
 	if (raw & PAD_SELECT)   result |= Pad1Select;
+	if (raw & PAD_L3)       result |= Pad1L3;
+	if (raw & PAD_R3)       result |= Pad1R3;
 	return result;
 }
 
