@@ -2134,3 +2134,12 @@ The core steps the PPU after each instruction, so a read of $FF44 sees the PPU o
 
 ### intr_2_mode0_timing_sprites passes (acceptance 58/67)
 Two changes: STAT reads show mode 0 when mode 3 ends within 3T (same one-M-cycle read lag as the LY fix), and sprites at OAM X>=168 add no fetch penalty. All DMG-applicable Mooneye acceptance tests now pass; the 9 remaining failures are boot tests for other hardware (dmg0, mgb, sgb, sgb2, S).
+
+### PPU renderer rework: dmg-acid2 and cgb-acid2 are pixel-exact
+Built both from source (rgbds v0.4.2 + the mgblib submodule) and compared frame 100 of the harness output against the reference images: 0 differing pixels for each. Changes in emu.c:
+- **CGB BG/window bitplanes were swapped** (colours 1 and 2 exchanged in every CGB game); now `(B2<<1)|B1`.
+- Scanlines are rendered at the end of mode 3 (previously at the start of the line, before that line's LYC/STAT handlers could change registers).
+- OBJ: 10-per-line limit (X=0 and X>=168 sprites still count), DMG priority = lowest X then lowest OAM index, CGB priority = OAM index; OBJ-vs-BG priority uses the raw BG colour index (`bgIdx[]`), not the palette-mapped shade; CGB master priority (LCDC bit 0) and BG-attribute priority kept.
+- Window: internal line counter, WY trigger latched per frame, WX<7 and WX>166 handled, CGB window writes bounds-checked.
+- DMG with LCDC bit 0 clear shows BGP colour 0 and no window (was leaving the previous frame's pixels).
+Also: harness reports Blargg cart-RAM results (dmg_sound/cgb_sound: DMG 4/12, CGB 7/12 right now, not yet worked on), `DUMP_EXIT=1` with `DUMP_AT=n` stops after dumping frame n, `DUMP_PAL=1` prints CGB palettes. Pokemon Crystal now shows correct colours through its intro. Acceptance still 58/67, cpu_instrs 11/11, mbc 18/21.

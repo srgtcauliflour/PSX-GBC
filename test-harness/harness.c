@@ -76,6 +76,7 @@ void Draw_Buffer(unsigned char *screenBuffer, unsigned short *screenBufferColor,
                 }
             }
             fclose(f);
+        if (getenv("DUMP_EXIT") && dump_at >= 0) { exit(0); }
         }
     }
 }
@@ -371,6 +372,7 @@ int main(int argc, char **argv) {
     }
 
     printf("\n");
+    if (getenv("DUMP_PAL")) { extern BYTE BGPALRAM[64], OBJPALRAM[64]; int q; fprintf(stderr,"BGPAL:"); for(q=0;q<64;q+=2) fprintf(stderr,"%s%04X",(q%8)?" ":"\n",BGPALRAM[q]|(BGPALRAM[q+1]<<8)); fprintf(stderr,"\nOBJPAL:"); for(q=0;q<64;q+=2) fprintf(stderr,"%s%04X",(q%8)?" ":"\n",OBJPALRAM[q]|(OBJPALRAM[q+1]<<8)); fprintf(stderr,"\n"); }
     if (getenv("DUMP_VRAM")) {
         int r, c, i;
         fprintf(stderr, "[VRAM] tile map at $9800, all 32 rows x 20 cols:\n");
@@ -408,6 +410,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "%d ", ReadMEM(0xC200 + 256 + i));
         }
         fprintf(stderr, "\n");
+    }
+    if (EXTRNRAM && iRAMSIZE >= 4 && EXTRNRAM[1] == 0xDE && EXTRNRAM[2] == 0xB0 && EXTRNRAM[3] == 0x61 && EXTRNRAM[0] != 0x80) {
+        // Blargg's newer shell (dmg_sound/cgb_sound/oam_bug...) reports in cart RAM:
+        // $A001-3 = DE B0 61 signature, $A000 = result code (0 = pass).
+        if (EXTRNRAM[0] == 0) { printf("[harness] RESULT: PASS (cart RAM status 0)\n"); return 0; }
+        printf("[harness] RESULT: FAIL (cart RAM status %02X: %s)\n", EXTRNRAM[0], (char *)&EXTRNRAM[4]);
+        return 1;
     }
     if (strstr(serial_log, "Passed")) {
         printf("[harness] RESULT: PASS\n");

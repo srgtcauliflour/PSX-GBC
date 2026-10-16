@@ -112,6 +112,10 @@ WORD screenBufferColor[160*144];
 // for what this means and how it combines with the sprite's own OAM
 // priority bit and LCDC bit 0's CGB-specific reinterpretation.
 BYTE bgAttrPriority[160*144];
+// Raw BG/window colour index (0-3, pre-palette) for the line being drawn, used for OBJ priority.
+BYTE bgIdx[160];
+int windowLine = 0;      // window's internal line counter
+int windowWyTrigger = 0; // WY==LY seen this frame with window enabled
 int runto = 0;
 
 int Voff;
@@ -1509,7 +1513,6 @@ void cycleLength(int cycle) {
 				// rendered framebuffer (not just serial/register state, as
 				// every prior test in this project relied on) showed real
 				// text reduced to a few stray pixels until this was fixed.
-				hblank();
 				videoMode = OAMMODE;
 				// BUG FIX: was a plain assignment, discarding whatever
 				// this line's HBlank/VBlank countdown had already
@@ -1530,7 +1533,6 @@ void cycleLength(int cycle) {
 				VideoCyclesLeft += OAM_CYCLES;
 				UpdateStatLine(0);
 			} else if (LCDY < 0x90) {
-				hblank();
 				videoMode = OAMMODE;
 				// BUG FIX: see the identical fix a few lines up (line 0's
 				// case) for the full explanation - same overshoot-losing
@@ -1634,6 +1636,7 @@ void cycleLength(int cycle) {
 			}
 			if (videoMode == TRANSFERMODE) {
 				videoMode = HBLANKMODE;
+				if (LCDY < 144) hblank(); // render the line from the register state at the end of mode 3
 				if (lcdOnLine0Phase == 2) {
 					// BUG FIX: line 0's own final HBlank (after its mode 3,
 					// entered via the fake-mode-0 skip above) is 8T shorter
@@ -1713,19 +1716,22 @@ void hblank(){
 
 
 	if ((LCDCONTROL >> 7) & 0x01) {
-		if(LCDCONTROL & 0x01) {
- 			DrawBGline(LCDY, BGaddr, TILEaddr);
+		if (LCDCONTROL & 0x01) {
+			DrawBGline(LCDY, BGaddr, TILEaddr);
+		} else if (!GBC_MODE) {
+			// DMG with LCDC bit 0 clear: background (and window) off, the
+			// line shows colour 0 through BGP.
+			int k;
+			for (k = 0; k < 160; k++) { screenBuffer[LCDY * 160 + k] = BGPAL & 0x3; bgIdx[k] = 0; }
+		} else {
+			DrawBGline(LCDY, BGaddr, TILEaddr);
 		}
 
- 		if((LCDCONTROL >> 5) & 0x01){
-			if(!(WNDX > 166 || WNDY > LCDY)) {
-				DrawWINline(LCDY, WINaddr, TILEaddr);
-			}
+		if (((LCDCONTROL >> 5) & 0x01) && LCDY == WNDY) { windowWyTrigger = 1; }
+		if (((LCDCONTROL >> 5) & 0x01) && windowWyTrigger && WNDX <= 166 && (GBC_MODE || (LCDCONTROL & 0x01))) {
+			DrawWINline(LCDY, WINaddr, TILEaddr);
+			windowLine++;
 		}
-		// BUG FIX: sprites were rendered unconditionally, with no check of
-		// LCDC bit 1 (OBJ display enable) at all. Real hardware shows no
-		// sprites whatsoever when this bit is clear, regardless of what's
-		// in OAM.
 		if ((LCDCONTROL >> 1) & 0x01) {
 			DrawOBJline(LCDY, 0x8000);
 		}
@@ -1784,16 +1790,12 @@ void DrawBGline(int line, int BGaddr, int TILEaddr) {
 			}
 			int xflip = (attr >> 5) & 0x01;
 			int bitPos = xflip ? (i % 8) : (7 - (i % 8));
-			int colorNum;
-			if (((B1 >> bitPos) & 0x01) == 1) {
-				colorNum = ((B2 >> bitPos) & 0x01) == 1 ? 3 : 2;
-			} else {
-				colorNum = ((B2 >> bitPos) & 0x01) == 1 ? 1 : 0;
-			}
+			int colorNum = (((B2 >> bitPos) & 0x01) << 1) | ((B1 >> bitPos) & 0x01); // B1 = low plane, B2 = high plane
 			int paletteNum = attr & 0x07;
 			screenBufferColor[(LCDY * 160) + i] = GetCGBColor(BGPALRAM, paletteNum, colorNum);
 			screenBuffer[(LCDY * 160) + i] = colorNum;
 			bgAttrPriority[(LCDY * 160) + i] = (attr >> 7) & 0x01;
+			bgIdx[i] = colorNum;
 		}
 		return;
 	}
@@ -1816,7 +1818,7 @@ void DrawBGline(int line, int BGaddr, int TILEaddr) {
 			BYTE t1 = VRAM[da], t2 = VRAM[da + 1];
 			for (; inTile < 8 && px < 160; inTile++, px++) {
 				int bp = 7 - inTile;
-				dst[px] = ((BGPAL >> ((((t2 >> bp) & 1) << 1 | ((t1 >> bp) & 1)) * 2)) & 0x3);
+				{ int ci = (((t2 >> bp) & 1) << 1 | ((t1 >> bp) & 1)); bgIdx[px] = ci; dst[px] = ((BGPAL >> (ci * 2)) & 0x3); }
 			}
 		}
 	}
@@ -1831,7 +1833,7 @@ void DrawWINline(int line, int WINaddr, int TILEaddr) {
 	int oldtileNo = -1;
 	BYTE B1, B2;
 	int Transparency = LCDCONTROL & 0x1;
-	by = LCDY - WNDY;
+	by = windowLine;
 
 	if (GBC_MODE) {
 		// Same treatment as DrawBGline's CGB path - see its comments for
@@ -1858,16 +1860,16 @@ void DrawWINline(int line, int WINaddr, int TILEaddr) {
 			}
 			int xflip = (attr >> 5) & 0x01;
 			int bitPos = xflip ? (i % 8) : (7 - (i % 8));
-			int colorNum;
-			if (((B1 >> bitPos) & 0x01) == 1) {
-				colorNum = ((B2 >> bitPos) & 0x01) == 1 ? 3 : 2;
-			} else {
-				colorNum = ((B2 >> bitPos) & 0x01) == 1 ? 1 : 0;
-			}
+			int colorNum = (((B2 >> bitPos) & 0x01) << 1) | ((B1 >> bitPos) & 0x01); // B1 = low plane, B2 = high plane
 			int paletteNum = attr & 0x07;
-			screenBufferColor[(LCDY * 160) + i + WNDX - 7] = GetCGBColor(BGPALRAM, paletteNum, colorNum);
-			screenBuffer[(LCDY * 160) + i + WNDX - 7] = colorNum;
-			bgAttrPriority[(LCDY * 160) + i + WNDX - 7] = (attr >> 7) & 0x01;
+			{
+				int wx = i + WNDX - 7;
+				if (wx < 0 || wx >= 160) continue;
+				screenBufferColor[(LCDY * 160) + wx] = GetCGBColor(BGPALRAM, paletteNum, colorNum);
+				screenBuffer[(LCDY * 160) + wx] = colorNum;
+				bgAttrPriority[(LCDY * 160) + wx] = (attr >> 7) & 0x01;
+				bgIdx[wx] = colorNum;
+			}
 		}
 		return;
 	}
@@ -1891,6 +1893,7 @@ void DrawWINline(int line, int WINaddr, int TILEaddr) {
 				int idx = ((t2 >> bp) & 1) << 1 | ((t1 >> bp) & 1);
 				int x = wi + WNDX - 7;
 				if (x < 0 || x >= 160) continue;
+				bgIdx[x] = idx;
 				screenBuffer[(LCDY * 160) + x] = (BGPAL >> (idx * 2)) & 0x3;
 			}
 		}
@@ -1898,221 +1901,81 @@ void DrawWINline(int line, int WINaddr, int TILEaddr) {
 }
 
 void DrawOBJline(int line, int TILEaddr) {
-
-	BYTE by;  // Byte0  Y position on the screen
-	BYTE bx;  // Byte1  X position on the screen
-	BYTE tileNo = 0x00; // Byte2  Pattern number 0-255
-	BYTE bflag = 0x00; 	/* Byte3  Flags:
-
-	         Bit7  Priority
-	               If this bit is set to 0, sprite is displayed
-	               on top of background & window. If this bit
-	               is set to 1, then sprite will be hidden behind
-	               colors 1, 2, and 3 of the background & window.
-	               (Sprite only prevails over color 0 of BG & win.)
-	         Bit6  Y flip
-	               Sprite pattern is flipped vertically if
-	               this bit is set to 1.
-	         Bit5  X flip
-	               Sprite pattern is flipped horizontally if
-	               this bit is set to 1.
-	         Bit4  Palette number
-	               Sprite colors are taken from OBJ1PAL if
-	               this bit is set to 1 and from OBJ0PAL
-	               otherwise.
-*/
-	int iflipx = 0;
-	int iflipy = 0;
-	int ipal   = 0;
-	BYTE B1, B2;
-	int colour;
-	int pos;
-	// BUG FIX (severe): the inner per-pixel loop used the OUTER sprite-index
-	// variable `i` for its own condition/increment instead of `j` - meaning
-	// every iteration of what should have been an independent 0-7 pixel
-	// loop was instead corrupting the outer 0-39 sprite loop's counter
-	// directly. Combined with the missing OBJ-enable check and uninitialized
-	// OAM below, this produced essentially random garbage sprite pixels
-	// wherever OAM happened to contain non-zero bytes - confirmed to be the
-	// real cause of stray/incoherent pixels found while visually verifying
-	// this project's rendering output for the first time this session
-	// (every previous test only ever checked serial output or CPU/flag
-	// state, never the actual rendered pixels).
-	//
-	// Also fixed while rewriting this loop: the "color 1" branch checked
-	// bit position `i` directly instead of `7-i` like the other three
-	// branches - inconsistent with the MSB-first bit ordering every other
-	// tile decoder in this file uses, so it was reading the wrong pixel's
-	// bit for all but one column position.
-	//
-	// Sprite X/Y flipping (iflipx/iflipy, computed above but never actually
-	// applied to the pixel indexing here) remains a known, separate gap -
-	// out of scope for this fix, tracked in STATUS.md.
-	int i, j;
-	// BUG FIX: 8x16 sprite mode (LCDC bit 2) was never supported - the
-	// bounding-box check and row lookup both hardcoded an 8-pixel-tall
-	// sprite. In 8x16 mode, real hardware ignores bit 0 of the OAM tile
-	// number and uses two consecutive tiles (N with bit0 forced to 0,
-	// then N+1) stacked as one 16-pixel-tall sprite; Y-flip mirrors the
-	// whole 16-pixel sprite (which also swaps which physical tile ends
-	// up "on top"), not each 8-pixel half independently.
+	// Hardware behaviour: the first 10 sprites (OAM order) whose Y range
+	// covers the line are selected - including ones with X=0 or X>=168,
+	// which are selected but invisible. For each pixel the opaque sprite
+	// pixel with the highest priority wins: on DMG the lowest X (ties:
+	// lowest OAM index), on CGB the lowest OAM index. BG priority is then
+	// applied against the raw BG colour index.
 	int spriteHeight = ((LCDCONTROL >> 2) & 0x01) ? 16 : 8;
-	for ( i = 0; i < 40; i++) {
-		pos = i * 4;
-		by = OAMRAM[pos] & 0xFF;
-		bx = OAMRAM[pos + 1] & 0xFF;
-		tileNo = OAMRAM[pos + 2] & 0xFF;
-		bflag = OAMRAM[pos + 3] & 0xFF;
-		if (( bx != 0x00 && by != 0x00) && (by <=line + 16) && (by > line + (16 - spriteHeight))) {  // 8/16
-			// BUG FIX (severe): this always fetched row 0 of the tile
-			// (offset +0/+1) no matter which of the sprite's 8 scanlines
-			// was actually being drawn - every row of every sprite showed
-			// the same top row repeated, instead of each scanline showing
-			// its own row of the tile. Real hardware picks the row from
-			// how far into the sprite's height the current scanline
-			// (`line`) is; Y-flip (iflipy, computed below) just mirrors
-			// which row that ends up being.
-			iflipy = (bflag & 0x40) == 0x40;
-			int spriteRow = line - (by - 16); // 0..(spriteHeight-1)
-			if (iflipy) {
-				spriteRow = (spriteHeight - 1) - spriteRow;
+	int sel[10];
+	int nsel = 0;
+	int i, x;
+	for (i = 0; i < 40 && nsel < 10; i++) {
+		int by = OAMRAM[i * 4];
+		if ((by <= line + 16) && (by > line + (16 - spriteHeight))) {
+			sel[nsel++] = i;
+		}
+	}
+	// Pixel winner bookkeeping for this line.
+	int winKey[160];      // priority key of current winner (lower wins), large = none
+	int winSprite[160];   // OAM index of winner
+	int winColor[160];    // colour index 1-3 of winner
+	for (x = 0; x < 160; x++) { winKey[x] = 0x7FFFFFFF; }
+	for (int n = 0; n < nsel; n++) {
+		i = sel[n];
+		int pos = i * 4;
+		int by = OAMRAM[pos];
+		int bx = OAMRAM[pos + 1];
+		int tileNo = OAMRAM[pos + 2];
+		int bflag = OAMRAM[pos + 3];
+		int spriteRow = line - (by - 16);
+		if (bflag & 0x40) spriteRow = (spriteHeight - 1) - spriteRow;
+		int effTile = tileNo;
+		if (spriteHeight == 16) {
+			effTile = (tileNo & 0xFE) + (spriteRow >= 8 ? 1 : 0);
+			spriteRow &= 7;
+		}
+		BYTE B1, B2;
+		if (GBC_MODE) {
+			int bank = (bflag >> 3) & 1;
+			B1 = ReadVRAMBank(bank, TILEaddr + effTile * 16 + spriteRow * 2);
+			B2 = ReadVRAMBank(bank, TILEaddr + effTile * 16 + spriteRow * 2 + 1);
+		} else {
+			B1 = VRAM[TILEaddr + effTile * 16 + spriteRow * 2 - 0x8000];
+			B2 = VRAM[TILEaddr + effTile * 16 + spriteRow * 2 + 1 - 0x8000];
+		}
+		int key = GBC_MODE ? i : (bx * 64 + i);
+		for (int j = 0; j < 8; j++) {
+			int sx = bx - 8 + j;
+			if (sx < 0 || sx >= 160) continue;
+			int bit = (bflag & 0x20) ? j : (7 - j);
+			int c = (((B2 >> bit) & 1) << 1) | ((B1 >> bit) & 1);
+			if (c == 0) continue;
+			if (key < winKey[sx]) { winKey[sx] = key; winSprite[sx] = i; winColor[sx] = c; }
+		}
+	}
+	for (x = 0; x < 160; x++) {
+		if (winKey[x] == 0x7FFFFFFF) continue;
+		int bflag = OAMRAM[winSprite[x] * 4 + 3];
+		int c = winColor[x];
+		int px = line * 160 + x;
+		if (GBC_MODE) {
+			if (LCDCONTROL & 0x01) {
+				if (bgAttrPriority[px] && bgIdx[x] != 0) continue;
+				if ((bflag & 0x80) && bgIdx[x] != 0) continue;
 			}
-			int effectiveTileNo = tileNo;
-			if (spriteHeight == 16) {
-				effectiveTileNo = (tileNo & 0xFE) + (spriteRow >= 8 ? 1 : 0);
-				spriteRow = spriteRow % 8;
-			}
-			B1 = (unsigned char)ReadMEM(TILEaddr + ((effectiveTileNo) * 16) + spriteRow * 2 );
-			B2 = (unsigned char)ReadMEM(TILEaddr + ((effectiveTileNo) * 16) + spriteRow * 2 + 1 );
-
-			iflipx = (bflag & 0x20) == 0x20;
-			ipal   = (bflag & 0x10) == 0x10;
-
-			// Sprite-vs-background priority (bflag bit 7, "OBJ-to-BG
-			// priority"): real hardware never actually hides a sprite
-			// pixel outright for this - it only affects whether the
-			// sprite draws on top of or behind BG/window colors 1-3 (BG
-			// color 0 never hides a sprite, on DMG or CGB, regardless of
-			// this bit). On CGB, LCDC bit 0 changes meaning entirely (it
-			// stops being "BG/window enable" and becomes "BG/Window
-			// Master Priority" instead) - when clear, sprites always
-			// draw on top of everything regardless of any other
-			// priority bit at all; when set, per-tile CGB BG-priority
-			// (bgAttrPriority, set in DrawBGline/DrawWINline) can
-			// additionally force specific BG/window tiles to draw over
-			// sprites even where the sprite's own priority bit says it
-			// should be on top. This was never implemented at all
-			// before - the comment previously here just said "Hidden
-			// (Priority Bit 7)" with no actual code reading that bit
-			// anywhere, so every sprite always drew on top of
-			// everything unconditionally.
-
-			if (GBC_MODE) {
-				// CGB sprites use a 3-bit palette index (bflag bits 0-2,
-				// selecting one of OBJPALRAM's 8 palettes) instead of
-				// DMG's 1-bit OBJPAL0/OBJPAL1 selector, and bit3 selects
-				// which VRAM bank the tile data itself comes from - same
-				// idea as the BG/window attribute byte in DrawBGline/
-				// DrawWINline, just packed into the sprite's own OAM
-				// flags byte instead of a separate per-tile attribute.
-				int tileBank = (bflag >> 3) & 0x01;
-				B1 = ReadVRAMBank(tileBank, TILEaddr + effectiveTileNo * 16 + spriteRow * 2);
-				B2 = ReadVRAMBank(tileBank, TILEaddr + effectiveTileNo * 16 + spriteRow * 2 + 1);
-				int paletteNum = bflag & 0x07;
-				for (j = 0; j < 8; j++) {
-					int bit = iflipx ? j : (7 - j);
-					int colorNum;
-					if (((B1 >> bit) & 0x01) == 1) {
-						colorNum = ((B2 >> bit) & 0x01) == 1 ? 3 : 2;
-					} else {
-						colorNum = ((B2 >> bit) & 0x01) == 1 ? 1 : 0;
-					}
-					// BUG FIX: sprite color 0 is always transparent on
-					// real hardware (shows whatever's underneath) - this
-					// was never actually skipped, just drawn like any
-					// other color. Much more visually obvious for CGB,
-					// where OBJPALRAM's color 0 has no reason to happen
-					// to match the background the way DMG's usual
-					// white-ish color 0 often visually does.
-					if (colorNum == 0) {
-						continue;
-					}
-					// BUG FIX: real hardware's OAM X coordinate is the
-					// sprite's screen column plus 8 (X=8 means the
-					// sprite's left edge sits at screen column 0) - this
-					// was subtracting 7 instead of 8, shifting every
-					// single sprite one pixel to the right of where it
-					// should be, in every game, the whole time. Found
-					// via a synthetic priority test whose sprite and
-					// background pixels landed at different screen
-					// columns than intended, which made two deliberately
-					// different test cases produce identical output
-					// until this was found and fixed.
-					if ((bx - 8 + j < 160) && (bx - 8 + j >= 0)) {
-						int px = (line * 160) + bx - 8 + j;
-						int bgColorNum = screenBuffer[px];
-						// LCDC bit 0 as CGB Master Priority: sprites
-						// always win when it's clear, full stop.
-						if (LCDCONTROL & 0x01) {
-							if (bgAttrPriority[px] && bgColorNum != 0) {
-								continue; // BG tile's own priority wins
-							}
-							if ((bflag & 0x80) && bgColorNum != 0) {
-								continue; // sprite's own priority bit: behind BG 1-3
-							}
-						}
-						screenBufferColor[px] = GetCGBColor(OBJPALRAM, paletteNum, colorNum);
-						screenBuffer[px] = colorNum;
-					}
-				}
-				continue;
-			}
-
-			for (j = 0; j < 8; j++) {
-
-				// BUG FIX: X-flip was computed above but never actually
-				// applied anywhere - reading bit (7-j) unconditionally
-				// always drew sprites in their normal orientation
-				// regardless of the flip flag. Flipping horizontally
-				// just means reading bit j itself instead of its mirror.
-				int bit = iflipx ? j : (7 - j);
-				int colorNum;
-				if (((B1 >> bit) & 0x01) == 0x01) {
-					colorNum = ((B2 >> bit) & 0x01) == 0x01 ? 3 : 2;
-				} else {
-					colorNum = ((B2 >> bit) & 0x01) == 0x01 ? 1 : 0;
-				}
-				// BUG FIX: see the CGB branch above - color 0 is always
-				// transparent on real hardware, never drawn at all.
-				if (colorNum == 0) {
-					continue;
-				}
-				if (ipal) { // Use OBJPAL1
-					colour = (OBJPAL1 >> (colorNum * 2)) & 0x3;
-				} else {
-					colour = (OBJPAL0 >> (colorNum * 2)) & 0x3;
-				}
-				// BUG FIX: see the CGB branch above - same X-coordinate
-				// off-by-one (subtracting 7 instead of 8).
-				if ((bx - 8 + j < 160) && (bx - 8 + j >= 0)) {
-					int px = (line * 160) + bx - 8 + j;
-					// DMG sprite-vs-BG priority (bflag bit 7): see the
-					// comment above the CGB branch - this hides the
-					// sprite behind BG/window colors 1-3 specifically,
-					// never behind BG color 0.
-					if ((bflag & 0x80) && screenBuffer[px] != 0) {
-						continue;
-					}
-					screenBuffer[px] = colour;
-				}
-			}
+			screenBufferColor[px] = GetCGBColor(OBJPALRAM, bflag & 0x07, c);
+			screenBuffer[px] = c;
+		} else {
+			if ((bflag & 0x80) && bgIdx[x] != 0) continue;
+			screenBuffer[px] = (((bflag & 0x10) ? OBJPAL1 : OBJPAL0) >> (c * 2)) & 0x3;
 		}
 	}
 }
 
-
-
 void vblank(void){
+	windowLine = 0; windowWyTrigger = 0;
 
 //	curframe--;
 //	if(curframe < 0) {
